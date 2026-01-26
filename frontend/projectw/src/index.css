@@ -1,0 +1,173 @@
+@import "tailwindcss";
+
+/* Only keep essential custom styles */
+:root {
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #535bf2;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: #646cff;
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #a381bc;
+  }
+}
+
+/* Add this to your CSS */
+.integration-tooltip {
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  max-height: 200px;
+  overflow-y: auto;
+  /* Ensures the tooltip stays in view */
+  z-index: 50;
+}
+
+/* Prevent the tooltip from going off-screen on smaller screens */
+@media (max-width: 768px) {
+  .integration-tooltip {
+    width: 200px;
+  }
+}
+
+/* Add this to your existing CSS */
+.animate-loading-bar {
+  animation: loading-bar 1.5s ease-in-out infinite;
+  background: linear-gradient(90deg, #3b82f6 0%, #93c5fd 50%, #3b82f6 100%);
+  background-size: 200% 100%;
+}
+
+@keyframes loading-bar {
+  0% { background-position: 0% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Add these styles for the document renderer */
+.prose {
+  color: inherit;
+  max-width: 65ch;
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.prose h1 {
+  color: inherit;
+  font-weight: 800;
+  font-size: 2.25em;
+  margin-top: 0;
+  margin-bottom: 0.8888889em;
+  line-height: 1.1111111;
+}
+
+.prose h2 {
+  color: inherit;
+  font-weight: 700;
+  font-size: 1.5em;
+  margin-top: 2em;
+  margin-bottom: 1em;
+  line-height: 1.3333333;
+}
+
+.prose h3 {
+  color: inherit;
+  font-weight: 600;
+  font-size: 1.25em;
+  margin-top: 1.6em;
+  margin-bottom: 0.6em;
+  line-height: 1.6;
+}
+
+.prose p {
+  margin-top: 1.25em;
+  margin-bottom: 1.25em;
+}
+
+.prose ul {
+  margin-top: 1.25em;
+  margin-bottom: 1.25em;
+  list-style-type: disc;
+  padding-left: 1.625em;
+}
+
+.prose ol {
+  margin-top: 1.25em;
+  margin-bottom: 1.25em;
+  list-style-type: decimal;
+  padding-left: 1.625em;
+}
+
+.prose li {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose strong {
+  font-weight: 600;
+}
+
+.dark .prose {
+  color: #e5e7eb;
+}
+
+.document-renderer {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* Add this to your existing CSS to handle button styles in message export */
+.export-button {
+  padding: 0.3em 0.6em !important;
+  border-color: transparent !important;
+}
+
+/* Make sure PDF content renders correctly */
+.message-content {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.3s ease-out forwards;
+}
