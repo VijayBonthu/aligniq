@@ -1,4 +1,4 @@
-from fastapi import File, UploadFile, Form, Depends, APIRouter, HTTPException, status, Request, Security, BackgroundTasks
+from fastapi import File, UploadFile, Form, Depends, APIRouter, HTTPException, status, Request, Security, BackgroundTasks, Body
 from fastapi.responses import HTMLResponse
 from typing import Optional
 import os
@@ -33,6 +33,7 @@ from agents import (
     PresalesTimeoutError,
     PresalesAgentError
 )
+from agents.presales_workflow import generate_report_with_assumptions
 import asyncio
 from utils.helper_utils import save_file, upload_to_s3
 from vectordb import vector_db, chunking
@@ -72,10 +73,19 @@ from database_scripts import (
     update_analysis_link_with_full_report,
     save_user_answers,
     mark_risk_relevance,
-    get_user_presales_history
+    get_user_presales_history,
+    # Question Management Functions
+    create_presales_questions,
+    get_presales_questions,
+    update_question_answers,
+    update_question_status,
+    restore_question,
+    update_presales_readiness,
+    save_analysis_history,
+    get_presales_with_questions
 )
 from agents.agentic_workflow import main_report_summary, regenerate_report_sections
-
+import models
 
 
 router = APIRouter()
@@ -490,10 +500,11 @@ async def _run_presales_analysis(
         presales_data = {
             "document_id": document_id,
             "user_id": user_id,
-            "extracted_requirements": result.get("scanned_requirements"),
+            "scanned_requirements": result.get("scanned_requirements"),
             "blind_spots": result.get("blind_spots"),
+            "p1_blockers": result.get("p1_blockers", []),
             "technology_risks": result.get("technology_risks"),
-            "kickstart_questions": result.get("blind_spots", {}).get("critical_unknowns", []),
+            "kickstart_questions": result.get("critical_unknowns", []),
             "presales_brief": result.get("presales_brief"),
             "status": "completed",
             "model_used": settings.GENERATING_REPORT_MODEL,
@@ -525,6 +536,16 @@ async def _run_presales_analysis(
         )
         logger.info(f"Created analysis link for presales_id: {presales_id}")
 
+        # Create question records for tracking
+        questions_result = await create_presales_questions(
+            presales_id=presales_id,
+            user_id=user_id,
+            p1_blockers=result.get("p1_blockers", []),
+            kickstart_questions=result.get("critical_unknowns", []),
+            db=db
+        )
+        logger.info(f"Created {questions_result['total_count']} questions for presales_id: {presales_id}")
+
         # Build response compatible with frontend
         response_data = {
             # Frontend compatibility fields
@@ -538,8 +559,9 @@ async def _run_presales_analysis(
             "presales_brief": result.get("presales_brief"),
             "scanned_requirements": result.get("scanned_requirements"),
             "blind_spots": result.get("blind_spots"),
+            "p1_blockers": result.get("p1_blockers", []),
             "technology_risks": result.get("technology_risks"),
-            "kickstart_questions": result.get("blind_spots", {}).get("critical_unknowns", []),
+            "kickstart_questions": result.get("critical_unknowns", []),
             "processing_times": result.get("processing_times"),
             "status": "completed",
 
@@ -580,6 +602,7 @@ async def _run_presales_analysis(
 async def generate_full_report_from_presales(
     presales_id: str = Form(...),
     user_answers: Optional[str] = Form(default=None),  # JSON string of answers to kickstart questions
+    assumptions: Optional[str] = Form(default=None),  # JSON string of assumptions from readiness analysis
     current_token: dict = Depends(token_validator),
     db: Session = Depends(get_db)
 ):
@@ -588,10 +611,13 @@ async def generate_full_report_from_presales(
 
     This endpoint triggers the full agent pipeline using the pre-sales
     analysis as context, along with any user-provided answers to kickstart questions.
+    If assumptions are provided (from readiness analysis), the report will clearly
+    distinguish between confirmed information and assumptions made.
 
     Args:
         presales_id: ID of the pre-sales analysis to build upon
         user_answers: JSON string of answers to kickstart questions
+        assumptions: JSON string of assumptions list from readiness analysis
 
     Returns:
         Full technical report with chat_history_id
@@ -624,6 +650,18 @@ async def generate_full_report_from_presales(
             except json.JSONDecodeError as e:
                 logger.warning(f"Invalid user_answers JSON: {str(e)}")
 
+        # Parse assumptions if provided
+        assumptions_list = []
+        if assumptions:
+            try:
+                assumptions_list = json.loads(assumptions)
+                logger.info(f"Received {len(assumptions_list)} assumptions for report generation")
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid assumptions JSON: {str(e)}")
+
+        # Get questions with answers
+        questions = await get_presales_questions(presales_id, user_id, db)
+
         # Get the analysis link
         analysis_link = await get_analysis_link(
             document_id=presales["document_id"],
@@ -631,8 +669,35 @@ async def generate_full_report_from_presales(
             db=db
         )
 
-        # Build enhanced context from pre-sales output
-        enhanced_context = f"""
+        # If we have assumptions, use the assumptions-aware report generator
+        if assumptions_list:
+            logger.info(f"Generating report with {len(assumptions_list)} assumptions")
+
+            # Build document context
+            document_context = json.dumps(presales.get('extracted_requirements', {}))
+
+            # Generate report with assumptions
+            result = await generate_report_with_assumptions(
+                document=document_context,
+                scanned_requirements=presales.get('extracted_requirements', {}),
+                confirmed_answers=questions,
+                assumptions_list=assumptions_list,
+                timeout=180
+            )
+
+            if result.get("error"):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Report generation failed: {result['error']}"
+                )
+
+            agent_response_message = result["report"]
+            logger.info(f"Report with assumptions generated: {result['confirmed_count']} confirmed, {result['assumptions_count']} assumed")
+
+        else:
+            # No assumptions - use original pipeline
+            # Build enhanced context from pre-sales output
+            enhanced_context = f"""
 ## Pre-Sales Analysis Context
 
 ### Project Summary
@@ -653,19 +718,19 @@ async def generate_full_report_from_presales(
 (Note: Using pre-analyzed requirements for efficiency)
 """
 
-        # Run the full agent pipeline with enhanced context
-        result = await run_agent_pipeline(document=[enhanced_context])
-        logger.info(f"Full agent pipeline completed for presales_id: {presales_id}")
+            # Run the full agent pipeline with enhanced context
+            result = await run_agent_pipeline(document=[enhanced_context])
+            logger.info(f"Full agent pipeline completed for presales_id: {presales_id}")
 
-        if not result.get("message") or len(result["message"]) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Report generation failed: No report was generated"
-            )
+            if not result.get("message") or len(result["message"]) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Report generation failed: No report was generated"
+                )
 
-        # Get the final report content
-        final_message = result["message"][-1]
-        agent_response_message = final_message.content if hasattr(final_message, 'content') else str(final_message)
+            # Get the final report content
+            final_message = result["message"][-1]
+            agent_response_message = final_message.content if hasattr(final_message, 'content') else str(final_message)
 
         # Extract title
         document_title = presales.get('extracted_requirements', {}).get('project_summary', 'Technical Analysis Report')[:100]
@@ -1025,6 +1090,340 @@ async def presales_chat(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing chat: {str(e)}"
         )
+
+
+# =============================================================================
+# PRESALES QUESTION MANAGEMENT & ANALYSIS ENDPOINTS
+# =============================================================================
+
+@router.get("/presales/{presales_id}/questions")
+async def get_presales_questions_endpoint(
+    presales_id: str,
+    include_invalid: bool = True,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all questions for a presales analysis.
+
+    Args:
+        presales_id: The presales analysis ID
+        include_invalid: Whether to include invalidated questions
+
+    Returns:
+        List of questions with their current state
+    """
+    user_id = current_token["regular_login_token"]["id"]
+    logger.info(f"Getting questions for presales: {presales_id}")
+
+    questions = await get_presales_questions(presales_id, user_id, db, include_invalid)
+
+    # Group questions by type and status
+    p1_blockers = [q for q in questions if q["question_type"] == "p1_blocker"]
+    kickstart = [q for q in questions if q["question_type"] == "kickstart"]
+    invalid = [q for q in questions if q["status"] == "invalid"]
+
+    return {
+        "presales_id": presales_id,
+        "questions": questions,
+        "summary": {
+            "total": len(questions),
+            "p1_blockers": len(p1_blockers),
+            "kickstart": len(kickstart),
+            "answered": sum(1 for q in questions if q["status"] == "answered"),
+            "pending": sum(1 for q in questions if q["status"] == "pending"),
+            "invalid": len(invalid)
+        }
+    }
+
+
+@router.post("/presales/{presales_id}/questions/answers")
+async def save_question_answers(
+    presales_id: str,
+    answers: str = Form(...),
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Save answers for multiple questions.
+
+    Args:
+        presales_id: The presales analysis ID
+        answers: JSON dict mapping frontend key (p1_0, question_0) or question_id -> answer text
+
+    Returns:
+        Dict with update status
+    """
+    import json as json_module
+
+    user_id = current_token["regular_login_token"]["id"]
+    logger.info(f"Saving answers for presales: {presales_id}")
+
+    # Parse answers if it's a string
+    if isinstance(answers, str):
+        answers = json_module.loads(answers)
+
+    logger.info(f"Received answers for {len(answers)} questions")
+    logger.info(f"Received answer keys: {list(answers.keys())}")
+
+    # Get all questions for this presales to map frontend keys to question_ids
+    questions = await get_presales_questions(presales_id, user_id, db)
+
+    # Build mappings from frontend keys to question_id
+    # Frontend sends: p1_0, p1_1 (for P1 blockers, 0-indexed)
+    # Frontend sends: question_0, question_1 (for kickstart questions, 0-indexed)
+    # Backend has: question_number like P1-1, P1-2 (1-indexed) and Q1, Q2
+
+    # Separate P1 blockers and kickstart questions by type
+    p1_questions = [q for q in questions if q["question_type"] == "p1_blocker"]
+    kickstart_questions = [q for q in questions if q["question_type"] == "kickstart"]
+
+    # Sort by display_order to ensure correct mapping
+    p1_questions.sort(key=lambda x: x["display_order"])
+    kickstart_questions.sort(key=lambda x: x["display_order"])
+
+    # Map frontend keys to actual question_ids
+    mapped_answers = {}
+
+    for key, answer in answers.items():
+        question_id = None
+
+        if key.startswith("p1_"):
+            # P1 blocker: p1_0 -> index 0 -> first P1 question
+            try:
+                idx = int(key.split("_")[1])
+                if idx < len(p1_questions):
+                    question_id = p1_questions[idx]["question_id"]
+                    logger.info(f"Mapped {key} -> P1 question {p1_questions[idx]['question_number']} ({question_id})")
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse P1 key {key}: {e}")
+
+        elif key.startswith("question_"):
+            # Kickstart question: question_0 -> index 0 -> first kickstart question
+            try:
+                idx = int(key.split("_")[1])
+                if idx < len(kickstart_questions):
+                    question_id = kickstart_questions[idx]["question_id"]
+                    logger.info(f"Mapped {key} -> kickstart question {kickstart_questions[idx]['question_number']} ({question_id})")
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse kickstart key {key}: {e}")
+
+        else:
+            # Assume it's already a question_id (UUID)
+            question_id = key
+            logger.info(f"Using key as question_id: {key}")
+
+        if question_id and answer:  # Only save non-empty answers
+            mapped_answers[question_id] = answer
+
+    logger.info(f"Mapped {len(mapped_answers)} answers to question_ids")
+
+    if not mapped_answers:
+        return {
+            "presales_id": presales_id,
+            "status": "success",
+            "updated_count": 0,
+            "history_records": 0,
+            "message": "No valid answers to save"
+        }
+
+    result = await update_question_answers(presales_id, user_id, mapped_answers, db)
+
+    return {
+        "presales_id": presales_id,
+        "status": "success",
+        **result
+    }
+
+
+@router.post("/presales/{presales_id}/analyze")
+async def analyze_presales_answers(
+    presales_id: str,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Analyze answers and calculate readiness for full report.
+
+    This endpoint:
+    1. Gets all questions and answers
+    2. Runs the answer analyzer agent
+    3. Identifies contradictions, vague answers, invalidated questions
+    4. Calculates readiness score
+    5. Generates list of assumptions
+
+    Returns:
+        Readiness report with all analysis results
+    """
+    from agents.answer_analyzer import analyze_answers, analyze_answers_quick
+
+    user_id = current_token["regular_login_token"]["id"]
+    logger.info(f"Analyzing answers for presales: {presales_id}")
+
+    try:
+        # Get presales data
+        presales = await get_presales_by_id(presales_id, user_id, db)
+        if not presales:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Presales analysis not found: {presales_id}"
+            )
+
+        # Get questions
+        questions = await get_presales_questions(presales_id, user_id, db)
+
+        # Get document for context
+        document = ""
+        if presales.get("extracted_requirements"):
+            document = json.dumps(presales["extracted_requirements"])
+
+        # Run full analysis
+        analysis_result = await analyze_answers(
+            document=document,
+            scanned_requirements=presales.get("extracted_requirements", {}),
+            questions=questions,
+            timeout=120
+        )
+
+        # Update question statuses based on invalidation
+        for inv_q in analysis_result.invalidated_questions:
+            question_number = inv_q.get("question_id")
+            # Find the actual question_id from question_number
+            matching_q = next(
+                (q for q in questions if q["question_number"] == question_number),
+                None
+            )
+            if matching_q:
+                await update_question_status(
+                    question_id=matching_q["question_id"],
+                    user_id=user_id,
+                    status_value="invalid",
+                    reason=inv_q.get("reason", ""),
+                    invalidated_by=inv_q.get("invalidated_by", ""),
+                    db=db
+                )
+
+        # Update question quality flags
+        for vague in analysis_result.vague_answers:
+            question_number = vague.get("question_id")
+            matching_q = next(
+                (q for q in questions if q["question_number"] == question_number),
+                None
+            )
+            if matching_q:
+                # Update answer quality
+                q_record = db.query(models.PresalesQuestion).filter(
+                    models.PresalesQuestion.question_id == matching_q["question_id"]
+                ).first()
+                if q_record:
+                    q_record.answer_quality = "vague"
+                    q_record.answer_feedback = vague.get("issue", "")
+                    db.commit()
+
+        # Update presales readiness
+        await update_presales_readiness(
+            presales_id=presales_id,
+            readiness_score=analysis_result.readiness_score,
+            readiness_status=analysis_result.readiness_status,
+            assumptions_list=analysis_result.assumptions,
+            contradictions_list=analysis_result.contradictions,
+            vague_answers_list=analysis_result.vague_answers,
+            db=db
+        )
+
+        # Save analysis history
+        await save_analysis_history(
+            presales_id=presales_id,
+            user_id=user_id,
+            analysis_result=analysis_result.to_dict(),
+            questions_snapshot=questions,
+            processing_time_ms=analysis_result.processing_time_ms,
+            db=db
+        )
+
+        logger.info(f"Analysis complete for {presales_id}: score={analysis_result.readiness_score}")
+
+        # Get updated questions
+        updated_questions = await get_presales_questions(presales_id, user_id, db)
+
+        return {
+            "presales_id": presales_id,
+            "readiness": {
+                "score": analysis_result.readiness_score,
+                "status": analysis_result.readiness_status,
+                "summary": analysis_result.readiness.get("summary", "")
+            },
+            "contradictions": analysis_result.contradictions,
+            "vague_answers": analysis_result.vague_answers,
+            "invalidated_questions": analysis_result.invalidated_questions,
+            "assumptions": analysis_result.assumptions,
+            "recommendations": analysis_result.recommendations,
+            "questions": updated_questions,
+            "can_generate_report": analysis_result.can_generate_report,
+            "processing_time_ms": analysis_result.processing_time_ms
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error analyzing presales answers: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error analyzing answers: {str(e)}"
+        )
+
+
+@router.post("/presales/{presales_id}/questions/{question_id}/restore")
+async def restore_presales_question(
+    presales_id: str,
+    question_id: str,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Restore an invalidated question.
+
+    Args:
+        presales_id: The presales analysis ID
+        question_id: The question ID to restore
+
+    Returns:
+        Dict with restored question status
+    """
+    user_id = current_token["regular_login_token"]["id"]
+    logger.info(f"Restoring question {question_id} for presales: {presales_id}")
+
+    result = await restore_question(question_id, user_id, db)
+
+    return {
+        "presales_id": presales_id,
+        **result
+    }
+
+
+@router.get("/presales/{presales_id}/full")
+async def get_presales_full(
+    presales_id: str,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Get full presales data including questions, readiness, and analysis results.
+
+    Returns complete state for frontend display.
+    """
+    user_id = current_token["regular_login_token"]["id"]
+    logger.info(f"Getting full presales data for: {presales_id}")
+
+    data = await get_presales_with_questions(presales_id, user_id, db)
+
+    # Add quick readiness calculation if not yet analyzed
+    if data.get("readiness_status") == "not_analyzed":
+        from agents.answer_analyzer import analyze_answers_quick
+        quick_readiness = await analyze_answers_quick(data.get("questions", []))
+        data["quick_readiness"] = quick_readiness.get("readiness")
+
+    return data
 
 
 @router.get("/task_status/{task_id}")

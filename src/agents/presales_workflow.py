@@ -101,7 +101,10 @@ class PresalesState(TypedDict):
         document: Raw document text to analyze
         scanned_requirements: Output from scanner agent (JSON)
         blind_spots: Output from blind spot detector (JSON)
+        p1_blockers: Extracted P1 blockers with questions
+        critical_unknowns: Kickstart questions (critical unknowns)
         technology_risks: Extracted tech risks for passive capture
+        red_flags: Warning signs from analysis
         presales_brief: Final markdown brief
         error: Error message if pipeline fails
         processing_times: Dict tracking time for each agent
@@ -109,7 +112,10 @@ class PresalesState(TypedDict):
     document: str
     scanned_requirements: Optional[dict]
     blind_spots: Optional[dict]
+    p1_blockers: Optional[List[dict]]
+    critical_unknowns: Optional[List[dict]]
     technology_risks: Optional[List[dict]]
+    red_flags: Optional[List[dict]]
     presales_brief: Optional[str]
     error: Optional[str]
     processing_times: dict
@@ -285,11 +291,14 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
             response = parse_json_response(response, "blindspot")
 
         state["blind_spots"] = response
+        state["p1_blockers"] = response.get("p1_blockers", [])
+        state["critical_unknowns"] = response.get("critical_unknowns", [])
         state["technology_risks"] = response.get("technology_risks", [])
+        state["red_flags"] = response.get("red_flags", [])
         state["processing_times"]["blindspot"] = round(time.time() - start_time, 2)
 
         logger.info(f"blindspot_node completed in {state['processing_times']['blindspot']}s")
-        logger.info(f"Identified {len(state['technology_risks'])} technology risks")
+        logger.info(f"Identified {len(state['p1_blockers'])} P1 blockers, {len(state['critical_unknowns'])} kickstart questions, {len(state['technology_risks'])} technology risks")
         return state
 
     except Exception as e:
@@ -335,8 +344,10 @@ async def brief_generator_node(state: PresalesState) -> PresalesState:
             input_dict={
                 "project_summary": project_summary,
                 "scanned_requirements": json.dumps(state["scanned_requirements"], indent=2),
-                "blind_spots": json.dumps(state["blind_spots"], indent=2),
-                "technology_risks": json.dumps(state["technology_risks"], indent=2)
+                "p1_blockers": json.dumps(state.get("p1_blockers", []), indent=2),
+                "critical_unknowns": json.dumps(state.get("critical_unknowns", []), indent=2),
+                "technology_risks": json.dumps(state.get("technology_risks", []), indent=2),
+                "red_flags": json.dumps(state.get("red_flags", []), indent=2)
             },
             timeout=60,
             agent_name="brief_generator"
@@ -412,8 +423,11 @@ async def run_presales_pipeline(
         dict containing:
             - presales_brief: Markdown brief for pre-sales (str)
             - scanned_requirements: Extracted requirements (dict)
-            - blind_spots: Identified blind spots (dict)
+            - blind_spots: Full blind spots analysis (dict)
+            - p1_blockers: List of P1 blockers with questions (list)
+            - critical_unknowns: Kickstart questions (list)
             - technology_risks: List of tech risks for capture (list)
+            - red_flags: Warning signs from analysis (list)
             - processing_times: Time taken by each agent (dict)
             - error: Error message if failed (str or None)
 
@@ -436,7 +450,10 @@ async def run_presales_pipeline(
         "document": document,
         "scanned_requirements": None,
         "blind_spots": None,
+        "p1_blockers": None,
+        "critical_unknowns": None,
         "technology_risks": None,
+        "red_flags": None,
         "presales_brief": None,
         "error": None,
         "processing_times": {}
@@ -475,11 +492,113 @@ async def run_presales_pipeline(
 
 
 # =============================================================================
+# FULL REPORT WITH ASSUMPTIONS GENERATOR
+# =============================================================================
+
+async def generate_report_with_assumptions(
+    document: str,
+    scanned_requirements: dict,
+    confirmed_answers: list,
+    assumptions_list: list,
+    timeout: int = 180
+) -> dict:
+    """
+    Generate a comprehensive technical report that clearly distinguishes
+    between confirmed information (from answers) and assumptions made.
+
+    Args:
+        document: Original document text
+        scanned_requirements: Extracted requirements from scanner
+        confirmed_answers: List of questions with their answers
+        assumptions_list: List of assumptions to be made for unanswered questions
+        timeout: Timeout in seconds
+
+    Returns:
+        dict containing:
+            - report: Generated markdown report
+            - processing_time: Time taken in seconds
+            - error: Error message if failed (None if successful)
+    """
+    from utils.presales_prompts import FULL_REPORT_WITH_ASSUMPTIONS_PROMPT
+
+    logger.info("Starting report generation with assumptions")
+    logger.info(f"Confirmed answers: {len(confirmed_answers)}, Assumptions: {len(assumptions_list)}")
+    start_time = time.time()
+
+    try:
+        # Format confirmed answers for the prompt
+        confirmed_formatted = []
+        for answer in confirmed_answers:
+            q_type = answer.get("question_type", "unknown")
+            q_num = answer.get("question_number", "?")
+            q_text = answer.get("question_text", "")
+            ans = answer.get("answer", "")
+
+            if ans:  # Only include answered questions
+                confirmed_formatted.append(f"""
+**{q_num}** ({q_type})
+- Question: {q_text}
+- Answer: {ans}
+""")
+
+        # Format assumptions for the prompt
+        assumptions_formatted = []
+        for assumption in assumptions_list:
+            risk_level = assumption.get("risk_level", "medium")
+            risk_emoji = "🔴" if risk_level == "high" else "🟡" if risk_level == "medium" else "🟢"
+            assumptions_formatted.append(f"""
+**For {assumption.get('for_question_id', 'Unknown')}** {risk_emoji} ({risk_level} risk)
+- Assumption: {assumption.get('assumption', 'N/A')}
+- Basis: {assumption.get('basis', 'Industry standard practice')}
+- Impact if wrong: {assumption.get('impact_if_wrong', 'May require rework')}
+""")
+
+        prompt = ChatPromptTemplate.from_template(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
+        chain = prompt | llm_reasoning | StrOutputParser()
+
+        response = await asyncio.wait_for(
+            chain.ainvoke({
+                "document": document[:15000],  # Limit document size
+                "confirmed_answers": "\n".join(confirmed_formatted) if confirmed_formatted else "No confirmed answers provided.",
+                "assumptions_list": "\n".join(assumptions_formatted) if assumptions_formatted else "No assumptions needed - all information confirmed."
+            }),
+            timeout=timeout
+        )
+
+        processing_time = round(time.time() - start_time, 2)
+        logger.info(f"Report with assumptions generated in {processing_time}s")
+
+        return {
+            "report": response,
+            "processing_time": processing_time,
+            "error": None,
+            "confirmed_count": len([a for a in confirmed_answers if a.get("answer")]),
+            "assumptions_count": len(assumptions_list)
+        }
+
+    except asyncio.TimeoutError:
+        logger.error(f"Report generation timed out after {timeout}s")
+        return {
+            "report": None,
+            "processing_time": round(time.time() - start_time, 2),
+            "error": f"Report generation timed out after {timeout} seconds"
+        }
+    except Exception as e:
+        logger.error(f"Report generation failed: {str(e)}")
+        return {
+            "report": None,
+            "processing_time": round(time.time() - start_time, 2),
+            "error": str(e)
+        }
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
 __all__ = [
     'run_presales_pipeline',
+    'generate_report_with_assumptions',
     'PresalesState',
     'PresalesPipelineError',
     'PresalesTimeoutError',

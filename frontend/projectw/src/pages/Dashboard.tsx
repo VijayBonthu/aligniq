@@ -21,12 +21,76 @@ interface Message {
   timestamp: string;
 }
 
+// New unified question interface matching backend
+interface PresalesQuestion {
+  question_id: string;
+  presales_id: string;
+  question_type: 'p1_blocker' | 'kickstart';
+  question_number: string;  // 'P1-1', 'Q1', etc.
+  display_order: number;
+  area_or_category: string;
+  title: string;
+  description: string;  // why_it_matters or why_critical
+  impact_description?: string;  // impact_if_unknown
+  question_text: string;
+  answer?: string;
+  answer_quality?: 'good' | 'vague' | 'contradicting';
+  answer_feedback?: string;
+  answered_at?: string;
+  status: 'pending' | 'answered' | 'invalid' | 'needs_review';
+  invalidated_reason?: string;
+  invalidated_at?: string;
+}
+
+// Readiness analysis result
+interface ReadinessResult {
+  score: number;
+  status: 'not_analyzed' | 'needs_more_info' | 'ready_with_assumptions' | 'ready';
+  summary?: string;
+  p1_answered?: number;
+  p1_total?: number;
+  kickstart_answered?: number;
+  kickstart_total?: number;
+}
+
+interface Contradiction {
+  question_ids: string[];
+  description: string;
+  explanation: string;
+  suggested_resolution: string;
+}
+
+interface VagueAnswer {
+  question_id: string;
+  current_answer: string;
+  issue: string;
+  expected_format: string;
+  impact: string;
+}
+
+interface Assumption {
+  for_question_id: string;
+  assumption: string;
+  basis: string;
+  risk_level: 'low' | 'medium' | 'high';
+  impact_if_wrong: string;
+}
+
+// Legacy interfaces for backward compatibility
 interface KickstartQuestion {
   category: string;
   question: string;
   why_critical: string;
   impact_if_unknown: string;
-  answer?: string;  // User-provided answer
+  answer?: string;
+}
+
+interface P1Blocker {
+  area: string;
+  blocker: string;
+  why_it_matters: string;
+  question: string;
+  answer?: string;
 }
 
 interface Conversation {
@@ -35,12 +99,21 @@ interface Conversation {
   created_at: string;
   messages: Message[];
   document_id: string;
-  chat_history_id: string | null;  // null for presales mode
+  chat_history_id: string | null;
   modified_at: string;
-  analysis_mode?: 'presales' | 'full';  // Track analysis mode
-  presales_id?: string;  // For presales analysis
-  kickstart_questions?: KickstartQuestion[];  // Questions from presales
-  blind_spots?: any;  // Full blind spots data
+  analysis_mode?: 'presales' | 'full';
+  presales_id?: string;
+  // New unified questions from backend
+  questions?: PresalesQuestion[];
+  // Legacy fields for backward compatibility
+  p1_blockers?: P1Blocker[];
+  kickstart_questions?: KickstartQuestion[];
+  blind_spots?: any;
+  // Readiness tracking
+  readiness?: ReadinessResult;
+  contradictions?: Contradiction[];
+  vague_answers?: VagueAnswer[];
+  assumptions?: Assumption[];
 }
 
 interface Recommendation {
@@ -114,6 +187,17 @@ const Dashboard: React.FC = () => {
   const [isSavingAnswers, setIsSavingAnswers] = useState(false);
   const [isPresalesChatting, setIsPresalesChatting] = useState(false);
   const [selectedJiraIssue, setSelectedJiraIssue] = useState<string | null>(null);
+  // Readiness analysis state
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [showReadinessModal, setShowReadinessModal] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState<{
+    readiness: ReadinessResult;
+    contradictions: Contradiction[];
+    vague_answers: VagueAnswer[];
+    assumptions: Assumption[];
+    recommendations: string[];
+    can_generate_report: boolean;
+  } | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   // Add a debounce tracking variable
   const refreshInProgress = useRef(false);
@@ -437,12 +521,20 @@ const Dashboard: React.FC = () => {
         selected: true  // Initial message is selected by default
       };
 
-      // Extract kickstart questions from presales response
+      // Extract P1 blockers and kickstart questions from presales response
+      let p1Blockers: P1Blocker[] = [];
       let kickstartQuestions: KickstartQuestion[] = [];
-      if (isPresales && uploadResponse.data.blind_spots?.critical_unknowns) {
-        kickstartQuestions = uploadResponse.data.blind_spots.critical_unknowns;
-      } else if (isPresales && uploadResponse.data.kickstart_questions) {
-        kickstartQuestions = uploadResponse.data.kickstart_questions;
+      if (isPresales) {
+        // Extract P1 blockers
+        if (uploadResponse.data.p1_blockers) {
+          p1Blockers = uploadResponse.data.p1_blockers;
+        }
+        // Extract kickstart questions
+        if (uploadResponse.data.kickstart_questions) {
+          kickstartQuestions = uploadResponse.data.kickstart_questions;
+        } else if (uploadResponse.data.blind_spots?.critical_unknowns) {
+          kickstartQuestions = uploadResponse.data.blind_spots.critical_unknowns;
+        }
       }
 
       // Create a new conversation with the document info from the API response
@@ -456,6 +548,7 @@ const Dashboard: React.FC = () => {
         modified_at: new Date().toISOString(),
         analysis_mode: analysisMode,
         presales_id: presalesId,
+        p1_blockers: p1Blockers,
         kickstart_questions: kickstartQuestions,
         blind_spots: uploadResponse.data.blind_spots
       };
@@ -1733,12 +1826,20 @@ const Dashboard: React.FC = () => {
           chatHistoryId = chatResponse.data.chat_history_id || response.data.chat_history_id || documentId;
         }
 
-        // Extract kickstart questions from presales response
+        // Extract P1 blockers and kickstart questions from presales response
+        let p1Blockers: P1Blocker[] = [];
         let kickstartQuestions: KickstartQuestion[] = [];
-        if (isPresales && response.data.blind_spots?.critical_unknowns) {
-          kickstartQuestions = response.data.blind_spots.critical_unknowns;
-        } else if (isPresales && response.data.kickstart_questions) {
-          kickstartQuestions = response.data.kickstart_questions;
+        if (isPresales) {
+          // Extract P1 blockers
+          if (response.data.p1_blockers) {
+            p1Blockers = response.data.p1_blockers;
+          }
+          // Extract kickstart questions
+          if (response.data.kickstart_questions) {
+            kickstartQuestions = response.data.kickstart_questions;
+          } else if (response.data.blind_spots?.critical_unknowns) {
+            kickstartQuestions = response.data.blind_spots.critical_unknowns;
+          }
         }
 
         // Step 3: Create a new conversation with the response data
@@ -1761,6 +1862,7 @@ const Dashboard: React.FC = () => {
           modified_at: new Date().toISOString(),
           analysis_mode: analysisMode,
           presales_id: presalesId,
+          p1_blockers: p1Blockers,
           kickstart_questions: kickstartQuestions,
           blind_spots: response.data.blind_spots
         };
@@ -1817,7 +1919,7 @@ const Dashboard: React.FC = () => {
   };
 
   // Handle generating full report from presales analysis
-  const handleGenerateFullReport = async () => {
+  const handleGenerateFullReport = async (assumptionsToUse?: Assumption[]) => {
     if (!activeConversation?.presales_id) {
       toast.error('No pre-sales analysis found');
       return;
@@ -1843,6 +1945,12 @@ const Dashboard: React.FC = () => {
       // Include kickstart answers if any were provided
       if (Object.keys(kickstartAnswers).length > 0) {
         formData.append('user_answers', JSON.stringify(kickstartAnswers));
+      }
+
+      // Include assumptions if provided (from readiness analysis)
+      if (assumptionsToUse && assumptionsToUse.length > 0) {
+        formData.append('assumptions', JSON.stringify(assumptionsToUse));
+        console.log(`Generating report with ${assumptionsToUse.length} assumptions`);
       }
 
       // Call the generate-full-report endpoint
@@ -2011,11 +2119,11 @@ const Dashboard: React.FC = () => {
     }
   };
 
-  // Handle saving kickstart question answers
-  const handleSaveKickstartAnswers = async () => {
+  // Handle saving answers and running analysis
+  const handleSaveAndAnalyze = async () => {
     if (!activeConversation?.presales_id) return;
 
-    setIsSavingAnswers(true);
+    setIsAnalyzing(true);
 
     try {
       const token = localStorage.getItem('token') ||
@@ -2027,34 +2135,123 @@ const Dashboard: React.FC = () => {
         return;
       }
 
+      // First, save the answers if there are any
+      if (Object.keys(kickstartAnswers).length > 0) {
+        await axios.post(
+          `${API_URL}/presales/${activeConversation.presales_id}/questions/answers`,
+          { answers: JSON.stringify(kickstartAnswers) },
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            }
+          }
+        );
+      }
+
+      // Then run analysis
       const response = await axios.post(
-        `${API_URL}/presales/${activeConversation.presales_id}/answers`,
-        kickstartAnswers,
+        `${API_URL}/presales/${activeConversation.presales_id}/analyze`,
+        {},
         {
           headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
+            'Authorization': `Bearer ${token}`
           }
         }
       );
 
-      toast.success('Answers saved successfully!');
-      console.log('Answers saved:', response.data);
+      // Store analysis result
+      setAnalysisResult({
+        readiness: response.data.readiness,
+        contradictions: response.data.contradictions || [],
+        vague_answers: response.data.vague_answers || [],
+        assumptions: response.data.assumptions || [],
+        recommendations: response.data.recommendations || [],
+        can_generate_report: response.data.can_generate_report
+      });
+
+      // Update conversation with new questions state
+      if (response.data.questions) {
+        setActiveConversation(prev => prev ? {
+          ...prev,
+          questions: response.data.questions,
+          readiness: response.data.readiness
+        } : null);
+      }
+
+      // Show readiness modal
+      setShowReadinessModal(true);
+
+      console.log('Analysis complete:', response.data);
 
     } catch (error) {
-      console.error('Error saving answers:', error);
-      toast.error('Failed to save answers');
+      console.error('Error analyzing answers:', error);
+      toast.error('Failed to analyze answers');
     } finally {
-      setIsSavingAnswers(false);
+      setIsAnalyzing(false);
     }
   };
 
-  // Update kickstart answer
-  const handleKickstartAnswerChange = (questionIndex: number, answer: string) => {
+  // Legacy function for backward compatibility
+  const handleSaveKickstartAnswers = handleSaveAndAnalyze;
+
+  // Update kickstart/P1 answer - accepts either numeric index for kickstart questions or string key for P1 blockers
+  const handleKickstartAnswerChange = (questionKey: number | string, answer: string) => {
+    const key = typeof questionKey === 'number' ? `question_${questionKey}` : questionKey;
     setKickstartAnswers(prev => ({
       ...prev,
-      [`question_${questionIndex}`]: answer
+      [key]: answer
     }));
+  };
+
+  // Apply assumptions to answer fields - maps question_id (P1-1, Q4) to frontend keys (p1_0, question_0)
+  const handleApplyAssumptions = (assumptions: Assumption[]) => {
+    if (!assumptions || assumptions.length === 0) {
+      toast.info('No assumptions to apply');
+      return;
+    }
+
+    const newAnswers: Record<string, string> = { ...kickstartAnswers };
+    let appliedCount = 0;
+
+    for (const assumption of assumptions) {
+      const questionId = assumption.for_question_id;
+      let frontendKey: string | null = null;
+
+      // Map question_id format to frontend key format
+      // P1-1, P1-2, etc. → p1_0, p1_1, etc. (1-indexed to 0-indexed)
+      if (questionId.startsWith('P1-')) {
+        const num = parseInt(questionId.replace('P1-', ''), 10);
+        if (!isNaN(num) && num > 0) {
+          frontendKey = `p1_${num - 1}`;
+        }
+      }
+      // Q1, Q2, etc. → question_0, question_1, etc. (1-indexed to 0-indexed)
+      else if (questionId.startsWith('Q')) {
+        const num = parseInt(questionId.replace('Q', ''), 10);
+        if (!isNaN(num) && num > 0) {
+          frontendKey = `question_${num - 1}`;
+        }
+      }
+
+      if (frontendKey) {
+        // Only apply if the field is currently empty or not set
+        if (!newAnswers[frontendKey] || newAnswers[frontendKey].trim() === '') {
+          // Format the assumed answer with a marker so user knows it's an assumption
+          newAnswers[frontendKey] = `[ASSUMED] ${assumption.assumption}`;
+          appliedCount++;
+        }
+      }
+    }
+
+    setKickstartAnswers(newAnswers);
+    setShowReadinessModal(false);
+
+    if (appliedCount > 0) {
+      toast.success(`Applied ${appliedCount} assumption(s) to answer fields. Review and edit as needed, then Save & Analyze again.`);
+    } else {
+      toast.info('All assumption fields already have answers');
+    }
   };
 
   // Add/update a useEffect to ensure the integration panel closes when split view is activated
@@ -2316,7 +2513,7 @@ const Dashboard: React.FC = () => {
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
-                        {/* Toggle Kickstart Questions Panel */}
+                        {/* Toggle Questions Panel (P1 Blockers + Kickstart Questions) */}
                         <button
                           onClick={() => setShowKickstartPanel(!showKickstartPanel)}
                           className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200 flex items-center
@@ -2327,10 +2524,10 @@ const Dashboard: React.FC = () => {
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                           </svg>
-                          Kickstart Questions
-                          {activeConversation.kickstart_questions && activeConversation.kickstart_questions.length > 0 && (
+                          Questions
+                          {((activeConversation.p1_blockers?.length || 0) + (activeConversation.kickstart_questions?.length || 0)) > 0 && (
                             <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-yellow-500/30 text-yellow-200 text-xs">
-                              {activeConversation.kickstart_questions.length}
+                              {(activeConversation.p1_blockers?.length || 0) + (activeConversation.kickstart_questions?.length || 0)}
                             </span>
                           )}
                         </button>
@@ -2365,53 +2562,111 @@ const Dashboard: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Kickstart Questions Panel - Collapsible */}
-                    {showKickstartPanel && activeConversation.kickstart_questions && activeConversation.kickstart_questions.length > 0 && (
-                      <div className="p-3 md:p-4 border-b border-white/10 bg-yellow-500/5 max-h-64 overflow-y-auto">
+                    {/* Questions Panel - P1 Blockers + Kickstart Questions */}
+                    {showKickstartPanel && ((activeConversation.p1_blockers?.length || 0) + (activeConversation.kickstart_questions?.length || 0)) > 0 && (
+                      <div className="p-3 md:p-4 border-b border-white/10 bg-yellow-500/5 max-h-80 overflow-y-auto">
                         <div className="flex items-center justify-between mb-3">
-                          <h4 className="text-sm font-medium text-yellow-300">Kickstart Questions</h4>
+                          <h4 className="text-sm font-medium text-yellow-300">Questions <span className="font-normal text-gray-400">(reference by P1-# or Q# in chat)</span></h4>
                           <button
-                            onClick={handleSaveKickstartAnswers}
-                            disabled={isSavingAnswers || Object.keys(kickstartAnswers).length === 0}
+                            onClick={handleSaveAndAnalyze}
+                            disabled={isAnalyzing}
                             className="px-2 py-1 bg-yellow-600/20 text-yellow-300 rounded text-xs hover:bg-yellow-600/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
                           >
-                            {isSavingAnswers ? (
+                            {isAnalyzing ? (
                               <>
                                 <svg className="animate-spin h-3 w-3 mr-1" viewBox="0 0 24 24">
                                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
                                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                                 </svg>
-                                Saving...
+                                Analyzing...
                               </>
                             ) : (
-                              <>Save Answers</>
+                              <>Save & Analyze</>
                             )}
                           </button>
                         </div>
-                        <div className="space-y-3">
-                          {activeConversation.kickstart_questions.map((q, index) => (
-                            <div key={index} className="bg-white/5 rounded-lg p-3">
-                              <div className="flex items-start gap-2 mb-2">
-                                <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-300 rounded text-xs capitalize shrink-0">
-                                  {q.category}
-                                </span>
-                                <p className="text-sm text-white">{q.question}</p>
-                              </div>
-                              <p className="text-xs text-gray-400 mb-2 pl-0">
-                                <span className="text-yellow-400/70">Why critical:</span> {q.why_critical}
-                              </p>
-                              <textarea
-                                placeholder="Enter client's answer or your notes..."
-                                value={kickstartAnswers[`question_${index}`] || ''}
-                                onChange={(e) => handleKickstartAnswerChange(index, e.target.value)}
-                                className="w-full px-2 py-1.5 bg-white/5 border border-white/10 rounded text-sm text-white
-                                  placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-yellow-500/50
-                                  resize-none"
-                                rows={2}
-                              />
+
+                        {/* P1 Blockers Section */}
+                        {activeConversation.p1_blockers && activeConversation.p1_blockers.length > 0 && (
+                          <div className="mb-4">
+                            <h5 className="text-xs font-semibold text-red-400 mb-2 flex items-center">
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                              </svg>
+                              P1 Blockers (Must Resolve)
+                            </h5>
+                            <div className="space-y-3">
+                              {activeConversation.p1_blockers.map((p1, index) => (
+                                <div key={`p1-${index}`} className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+                                  <div className="flex items-start gap-2 mb-2">
+                                    <span className="px-1.5 py-0.5 bg-red-500/30 text-red-300 rounded text-xs font-bold shrink-0">
+                                      P1-{index + 1}
+                                    </span>
+                                    <span className="px-1.5 py-0.5 bg-gray-500/20 text-gray-300 rounded text-xs capitalize shrink-0">
+                                      {p1.area}
+                                    </span>
+                                    <p className="text-sm text-white font-medium">{p1.blocker}</p>
+                                  </div>
+                                  <p className="text-xs text-gray-400 mb-2">
+                                    <span className="text-red-400/70">Why it matters:</span> {p1.why_it_matters}
+                                  </p>
+                                  <p className="text-xs text-white mb-2 bg-white/5 p-2 rounded">
+                                    <span className="text-yellow-400">Question:</span> {p1.question}
+                                  </p>
+                                  <textarea
+                                    placeholder={`Enter answer for P1-${index + 1}...`}
+                                    value={kickstartAnswers[`p1_${index}`] || ''}
+                                    onChange={(e) => handleKickstartAnswerChange(`p1_${index}`, e.target.value)}
+                                    className="w-full px-2 py-1.5 bg-white/5 border border-red-500/20 rounded text-sm text-white
+                                      placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-red-500/50
+                                      resize-none"
+                                    rows={2}
+                                  />
+                                </div>
+                              ))}
                             </div>
-                          ))}
-                        </div>
+                          </div>
+                        )}
+
+                        {/* Kickstart Questions Section */}
+                        {activeConversation.kickstart_questions && activeConversation.kickstart_questions.length > 0 && (
+                          <div>
+                            <h5 className="text-xs font-semibold text-yellow-400 mb-2 flex items-center">
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              Kickstart Questions (For Scoping)
+                            </h5>
+                            <div className="space-y-3">
+                              {activeConversation.kickstart_questions.map((q, index) => (
+                                <div key={`q-${index}`} className="bg-white/5 rounded-lg p-3">
+                                  <div className="flex items-start gap-2 mb-2">
+                                    <span className="px-1.5 py-0.5 bg-purple-500/30 text-purple-300 rounded text-xs font-bold shrink-0">
+                                      Q{index + 1}
+                                    </span>
+                                    <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-300 rounded text-xs capitalize shrink-0">
+                                      {q.category}
+                                    </span>
+                                    <p className="text-sm text-white">{q.question}</p>
+                                  </div>
+                                  <p className="text-xs text-gray-400 mb-2">
+                                    <span className="text-yellow-400/70">Why critical:</span> {q.why_critical}
+                                  </p>
+                                  <textarea
+                                    placeholder={`Enter answer for Q${index + 1}...`}
+                                    value={kickstartAnswers[`question_${index}`] || ''}
+                                    onChange={(e) => handleKickstartAnswerChange(index, e.target.value)}
+                                    className="w-full px-2 py-1.5 bg-white/5 border border-white/10 rounded text-sm text-white
+                                      placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-yellow-500/50
+                                      resize-none"
+                                    rows={2}
+                                  />
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                         <p className="mt-3 text-xs text-gray-500 text-center">
                           These answers will be included when generating the full report
                         </p>
@@ -2430,7 +2685,7 @@ const Dashboard: React.FC = () => {
                               handlePresalesChat();
                             }
                           }}
-                          placeholder="Ask a question about the analysis..."
+                          placeholder="Ask about the analysis (e.g., 'Tell me more about P1-2' or 'Explain Q3')..."
                           className="w-full px-3 md:px-4 py-2 md:py-3 pr-12 md:pr-16 bg-white/5 border border-white/10 rounded-lg text-white
                             placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500
                             min-h-[40px] md:min-h-[50px] max-h-[96px] overflow-y-auto resize-none text-sm md:text-base"
@@ -2634,6 +2889,169 @@ const Dashboard: React.FC = () => {
         {/* Toast notifications will appear here */}
       </div>
       
+      {/* Readiness Analysis Modal */}
+      {showReadinessModal && analysisResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-indigo-950 border border-white/20 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-hidden shadow-2xl">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-white/10 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-white">Readiness Analysis</h3>
+              <button
+                onClick={() => setShowReadinessModal(false)}
+                className="p-1 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Modal Content - Scrollable */}
+            <div className="p-4 overflow-y-auto max-h-[calc(90vh-140px)]">
+              {/* Readiness Score */}
+              <div className="mb-6 p-4 bg-white/5 rounded-lg">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm text-gray-300">Readiness Score</span>
+                  <span className={`text-lg font-bold ${
+                    analysisResult.readiness.score >= 0.8 ? 'text-green-400' :
+                    analysisResult.readiness.score >= 0.5 ? 'text-yellow-400' : 'text-red-400'
+                  }`}>
+                    {Math.round(analysisResult.readiness.score * 100)}%
+                  </span>
+                </div>
+                <div className="w-full bg-white/10 rounded-full h-3 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-500 ${
+                      analysisResult.readiness.score >= 0.8 ? 'bg-green-500' :
+                      analysisResult.readiness.score >= 0.5 ? 'bg-yellow-500' : 'bg-red-500'
+                    }`}
+                    style={{ width: `${analysisResult.readiness.score * 100}%` }}
+                  />
+                </div>
+                <p className="mt-2 text-sm text-gray-400">
+                  {analysisResult.readiness.summary || `Status: ${analysisResult.readiness.status.replace(/_/g, ' ')}`}
+                </p>
+              </div>
+
+              {/* Contradictions */}
+              {analysisResult.contradictions.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-red-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    Contradictions Found ({analysisResult.contradictions.length})
+                  </h4>
+                  <div className="space-y-2">
+                    {analysisResult.contradictions.map((c, i) => (
+                      <div key={i} className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm">
+                        <p className="text-white font-medium">{c.description}</p>
+                        <p className="text-gray-400 mt-1">{c.explanation}</p>
+                        <p className="text-yellow-300 mt-1 text-xs">Fix: {c.suggested_resolution}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Vague Answers */}
+              {analysisResult.vague_answers.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-yellow-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Vague Answers ({analysisResult.vague_answers.length})
+                  </h4>
+                  <div className="space-y-2">
+                    {analysisResult.vague_answers.map((v, i) => (
+                      <div key={i} className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-sm">
+                        <p className="text-white"><span className="font-medium">{v.question_id}:</span> {v.issue}</p>
+                        <p className="text-gray-400 mt-1">Expected: {v.expected_format}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Assumptions */}
+              {analysisResult.assumptions.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-blue-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                    </svg>
+                    Assumptions to be Made ({analysisResult.assumptions.length})
+                  </h4>
+                  <div className="space-y-2">
+                    {analysisResult.assumptions.map((a, i) => (
+                      <div key={i} className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg text-sm">
+                        <div className="flex items-start justify-between">
+                          <p className="text-white">{a.assumption}</p>
+                          <span className={`text-xs px-2 py-0.5 rounded ${
+                            a.risk_level === 'high' ? 'bg-red-500/20 text-red-300' :
+                            a.risk_level === 'medium' ? 'bg-yellow-500/20 text-yellow-300' :
+                            'bg-green-500/20 text-green-300'
+                          }`}>
+                            {a.risk_level} risk
+                          </span>
+                        </div>
+                        <p className="text-gray-400 mt-1 text-xs">For: {a.for_question_id}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Recommendations */}
+              {analysisResult.recommendations.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-green-400 mb-2">Recommendations</h4>
+                  <ul className="space-y-1 text-sm text-gray-300">
+                    {analysisResult.recommendations.map((r, i) => (
+                      <li key={i} className="flex items-start">
+                        <span className="text-green-400 mr-2">•</span>
+                        {r}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 border-t border-white/10 flex items-center justify-between gap-3">
+              <button
+                onClick={() => setShowReadinessModal(false)}
+                className="px-4 py-2 bg-white/10 text-white rounded-lg hover:bg-white/20 text-sm"
+              >
+                Back to Edit
+              </button>
+              {analysisResult.assumptions.length > 0 ? (
+                <button
+                  onClick={() => handleApplyAssumptions(analysisResult.assumptions)}
+                  disabled={analysisResult.contradictions.length > 0}
+                  className="px-4 py-2 bg-gradient-to-r from-yellow-600 to-orange-600 text-white rounded-lg hover:from-yellow-500 hover:to-orange-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm flex items-center"
+                >
+                  Apply {analysisResult.assumptions.length} Assumptions
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    setShowReadinessModal(false);
+                    handleGenerateFullReport();
+                  }}
+                  disabled={!analysisResult.can_generate_report}
+                  className="px-4 py-2 bg-gradient-to-r from-green-600 to-blue-600 text-white rounded-lg hover:from-green-500 hover:to-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm flex items-center"
+                >
+                  Generate Full Report
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Integration panel - improved for mobile */}
       <RightSidebar
         onJiraConnect={handleJiraIntegration}

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, create_engine, ForeignKey, Boolean
+from sqlalchemy import Column, String, Integer, Float, create_engine, ForeignKey, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from config import settings
@@ -150,8 +150,9 @@ class PresalesAnalysis(Base):
     # Analysis outputs (JSON)
     extracted_requirements = Column(JSON, nullable=True)  # From scanner agent
     blind_spots = Column(JSON, nullable=True)             # From blind spot detector
+    p1_blockers = Column(JSON, nullable=True)             # P1 blockers with questions
     technology_risks = Column(JSON, nullable=True)        # Tech risks identified by LLM
-    kickstart_questions = Column(JSON, nullable=True)     # Critical questions for client
+    kickstart_questions = Column(JSON, nullable=True)     # Critical questions (critical_unknowns)
 
     # Final brief (markdown)
     presales_brief = Column(Text, nullable=True)
@@ -160,6 +161,15 @@ class PresalesAnalysis(Base):
     status = Column(String(50), nullable=False, default=PresalesStatus.PROCESSING)
     model_used = Column(String(100), nullable=True)       # e.g., "gpt-4o-mini"
     processing_time_seconds = Column(Integer, nullable=True)
+
+    # Readiness tracking (populated after answer analysis)
+    iteration_count = Column(Integer, default=1)
+    readiness_score = Column(Float, default=0.0)          # 0.0 to 1.0
+    readiness_status = Column(String(50), default='not_analyzed')
+    # Values: 'not_analyzed', 'needs_more_info', 'ready_with_assumptions', 'ready'
+    assumptions_list = Column(JSON, default=list)          # Assumptions to be made
+    contradictions_list = Column(JSON, default=list)       # Contradictions found
+    vague_answers_list = Column(JSON, default=list)        # Vague answers needing clarification
 
     created_at = Column(TIMESTAMP(timezone=True), nullable=False,
                         server_default=text("now()"))
@@ -240,3 +250,147 @@ class AnalysisLink(Base):
                         server_default=text("now()"))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
                         onupdate=text("now()"))
+
+
+# =============================================================================
+# QUESTION STATUS ENUM
+# =============================================================================
+class QuestionStatus:
+    PENDING = "pending"           # No answer yet
+    ANSWERED = "answered"         # Has answer
+    INVALID = "invalid"           # No longer relevant
+    NEEDS_REVIEW = "needs_review" # Restored or flagged for review
+
+
+class QuestionType:
+    P1_BLOCKER = "p1_blocker"
+    KICKSTART = "kickstart"
+
+
+class AnswerQuality:
+    GOOD = "good"                 # Clear, useful answer
+    VAGUE = "vague"               # Needs clarification
+    CONTRADICTING = "contradicting"  # Conflicts with other answers
+
+
+class PresalesQuestion(Base):
+    """
+    Tracks individual P1 blockers and kickstart questions with state management.
+
+    Each question goes through a lifecycle:
+    - PENDING: Initial state, no answer
+    - ANSWERED: Has an answer (may be good, vague, or contradicting)
+    - INVALID: Another answer made this question irrelevant
+    - NEEDS_REVIEW: Restored from invalid or flagged for attention
+    """
+    __tablename__ = "presales_questions"
+
+    question_id = Column(String, primary_key=True, nullable=False, index=True,
+                         default=lambda: str(uuid.uuid4()))
+    presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
+                         nullable=False, index=True)
+    user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
+
+    # Question identification
+    question_type = Column(String(20), nullable=False)    # 'p1_blocker' or 'kickstart'
+    question_number = Column(String(10), nullable=False)  # 'P1-1', 'P1-2', 'Q1', etc.
+    display_order = Column(Integer, nullable=False, default=0)
+
+    # Question content (from blind spots analysis)
+    area_or_category = Column(String(100), nullable=True)  # 'Integration', 'Security', etc.
+    title = Column(String(500), nullable=True)             # Blocker title or main point
+    description = Column(Text, nullable=True)              # why_it_matters or why_critical
+    impact_description = Column(Text, nullable=True)       # impact_if_unknown
+    question_text = Column(Text, nullable=False)           # The actual question to ask
+
+    # Answer tracking
+    answer = Column(Text, nullable=True)
+    answer_quality = Column(String(20), nullable=True)     # 'good', 'vague', 'contradicting'
+    answer_feedback = Column(Text, nullable=True)          # Feedback about answer quality
+    answered_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    answered_by = Column(String, nullable=True)            # user_id who answered
+
+    # State management
+    status = Column(String(20), nullable=False, default=QuestionStatus.PENDING)
+
+    # Invalidation tracking
+    invalidated_reason = Column(Text, nullable=True)
+    invalidated_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    invalidated_by_question_id = Column(String, nullable=True)  # Which question invalidated this
+
+    # Iteration tracking
+    created_in_iteration = Column(Integer, default=1)
+    invalidated_in_iteration = Column(Integer, nullable=True)
+    restored_in_iteration = Column(Integer, nullable=True)
+
+    # Timestamps
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False,
+                        server_default=text("now()"))
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=True,
+                        onupdate=text("now()"))
+
+
+class PresalesAnswerHistory(Base):
+    """
+    Audit trail for all answer changes.
+
+    Tracks every modification to answers for:
+    - Debugging and support
+    - Understanding user behavior
+    - Future collaborative features
+    """
+    __tablename__ = "presales_answer_history"
+
+    history_id = Column(String, primary_key=True, nullable=False, index=True,
+                        default=lambda: str(uuid.uuid4()))
+    question_id = Column(String, ForeignKey(PresalesQuestion.question_id),
+                         nullable=False, index=True)
+    presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
+                         nullable=False, index=True)
+
+    # Change tracking
+    previous_answer = Column(Text, nullable=True)
+    new_answer = Column(Text, nullable=True)
+    change_type = Column(String(20), nullable=False)  # 'created', 'updated', 'cleared'
+
+    # Metadata
+    changed_by = Column(String, nullable=False)       # user_id
+    changed_at = Column(TIMESTAMP(timezone=True), nullable=False,
+                        server_default=text("now()"))
+    iteration_number = Column(Integer, nullable=True)
+
+
+class PresalesAnalysisHistory(Base):
+    """
+    Tracks each analysis run for audit/debugging.
+
+    Captures a snapshot of the analysis state at each iteration,
+    allowing us to understand how the analysis evolved.
+    """
+    __tablename__ = "presales_analysis_history"
+
+    analysis_history_id = Column(String, primary_key=True, nullable=False, index=True,
+                                  default=lambda: str(uuid.uuid4()))
+    presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
+                         nullable=False, index=True)
+
+    # Analysis snapshot
+    iteration_number = Column(Integer, nullable=False)
+    readiness_score = Column(Float, nullable=True)
+    readiness_status = Column(String(50), nullable=True)
+
+    # Analysis results
+    assumptions_made = Column(JSON, nullable=True)
+    contradictions_found = Column(JSON, nullable=True)
+    vague_answers_found = Column(JSON, nullable=True)
+    questions_invalidated = Column(JSON, nullable=True)  # Array of question_ids
+    questions_added = Column(JSON, nullable=True)        # Array of new questions
+
+    # Input snapshot
+    answers_snapshot = Column(JSON, nullable=True)       # All answers at time of analysis
+
+    # Metadata
+    analyzed_at = Column(TIMESTAMP(timezone=True), nullable=False,
+                         server_default=text("now()"))
+    analyzed_by = Column(String, nullable=True)          # user_id who triggered
+    processing_time_ms = Column(Integer, nullable=True)

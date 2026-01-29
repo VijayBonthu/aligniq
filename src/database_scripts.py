@@ -814,6 +814,7 @@ async def save_presales_analysis(presales_data: dict, db: Session) -> dict:
             - user_id: The user ID
             - scanned_requirements: Output from scanner agent (dict)
             - blind_spots: Output from blind spot detector (dict)
+            - p1_blockers: P1 blockers with questions (list)
             - technology_risks: List of tech risks (list)
             - kickstart_questions: Critical questions for client (list)
             - presales_brief: Final markdown brief (str)
@@ -834,6 +835,7 @@ async def save_presales_analysis(presales_data: dict, db: Session) -> dict:
             user_id=presales_data["user_id"],
             extracted_requirements=presales_data.get("scanned_requirements"),
             blind_spots=presales_data.get("blind_spots"),
+            p1_blockers=presales_data.get("p1_blockers"),
             technology_risks=presales_data.get("technology_risks"),
             kickstart_questions=presales_data.get("kickstart_questions"),
             presales_brief=presales_data.get("presales_brief"),
@@ -1313,4 +1315,542 @@ async def get_user_presales_history(user_id: str, db: Session, limit: int = 20) 
         )
 
 
+# =============================================================================
+# PRESALES QUESTION MANAGEMENT
+# =============================================================================
+
+async def create_presales_questions(
+    presales_id: str,
+    user_id: str,
+    p1_blockers: list,
+    kickstart_questions: list,
+    db: Session
+) -> dict:
+    """
+    Create question records from presales analysis results.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID
+        p1_blockers: List of P1 blocker dicts from blind spot detector
+        kickstart_questions: List of kickstart question dicts
+        db: Database session
+
+    Returns:
+        Dict with counts of created questions
+    """
+    try:
+        questions_created = []
+        display_order = 0
+
+        # Create P1 blocker questions
+        for idx, p1 in enumerate(p1_blockers or []):
+            question = models.PresalesQuestion(
+                presales_id=presales_id,
+                user_id=user_id,
+                question_type=models.QuestionType.P1_BLOCKER,
+                question_number=f"P1-{idx + 1}",
+                display_order=display_order,
+                area_or_category=p1.get("area", ""),
+                title=p1.get("blocker", ""),
+                description=p1.get("why_it_matters", ""),
+                question_text=p1.get("question", ""),
+                status=models.QuestionStatus.PENDING
+            )
+            db.add(question)
+            questions_created.append(question)
+            display_order += 1
+
+        # Create kickstart questions
+        for idx, ks in enumerate(kickstart_questions or []):
+            question = models.PresalesQuestion(
+                presales_id=presales_id,
+                user_id=user_id,
+                question_type=models.QuestionType.KICKSTART,
+                question_number=f"Q{idx + 1}",
+                display_order=display_order,
+                area_or_category=ks.get("category", ""),
+                title=ks.get("question", ""),
+                description=ks.get("why_critical", ""),
+                impact_description=ks.get("impact_if_unknown", ""),
+                question_text=ks.get("question", ""),
+                status=models.QuestionStatus.PENDING
+            )
+            db.add(question)
+            questions_created.append(question)
+            display_order += 1
+
+        db.commit()
+
+        logger.info(f"Created {len(questions_created)} questions for presales: {presales_id}")
+
+        return {
+            "p1_count": len(p1_blockers or []),
+            "kickstart_count": len(kickstart_questions or []),
+            "total_count": len(questions_created)
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error creating presales questions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating questions: {str(e)}"
+        )
+
+
+async def get_presales_questions(
+    presales_id: str,
+    user_id: str,
+    db: Session,
+    include_invalid: bool = True
+) -> list:
+    """
+    Get all questions for a presales analysis.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID (for security)
+        db: Database session
+        include_invalid: Whether to include invalidated questions
+
+    Returns:
+        List of question dicts
+    """
+    try:
+        query = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.presales_id == presales_id,
+            models.PresalesQuestion.user_id == user_id
+        )
+
+        if not include_invalid:
+            query = query.filter(
+                models.PresalesQuestion.status != models.QuestionStatus.INVALID
+            )
+
+        questions = query.order_by(models.PresalesQuestion.display_order).all()
+
+        return [
+            {
+                "question_id": q.question_id,
+                "presales_id": q.presales_id,
+                "question_type": q.question_type,
+                "question_number": q.question_number,
+                "display_order": q.display_order,
+                "area_or_category": q.area_or_category,
+                "title": q.title,
+                "description": q.description,
+                "impact_description": q.impact_description,
+                "question_text": q.question_text,
+                "answer": q.answer,
+                "answer_quality": q.answer_quality,
+                "answer_feedback": q.answer_feedback,
+                "answered_at": q.answered_at.isoformat() if q.answered_at else None,
+                "answered_by": q.answered_by,
+                "status": q.status,
+                "invalidated_reason": q.invalidated_reason,
+                "invalidated_at": q.invalidated_at.isoformat() if q.invalidated_at else None,
+                "created_at": q.created_at.isoformat() if q.created_at else None
+            }
+            for q in questions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting presales questions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving questions: {str(e)}"
+        )
+
+
+async def update_question_answers(
+    presales_id: str,
+    user_id: str,
+    answers: dict,
+    db: Session
+) -> dict:
+    """
+    Update answers for multiple questions at once.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID
+        answers: Dict mapping question_id -> answer
+        db: Database session
+
+    Returns:
+        Dict with update status
+    """
+    from datetime import datetime
+
+    try:
+        updated_count = 0
+        history_records = []
+
+        for question_id, answer in answers.items():
+            question = db.query(models.PresalesQuestion).filter(
+                models.PresalesQuestion.question_id == question_id,
+                models.PresalesQuestion.presales_id == presales_id,
+                models.PresalesQuestion.user_id == user_id
+            ).first()
+
+            if not question:
+                logger.warning(f"Question not found: {question_id}")
+                continue
+
+            # Record history
+            history = models.PresalesAnswerHistory(
+                question_id=question_id,
+                presales_id=presales_id,
+                previous_answer=question.answer,
+                new_answer=answer if answer else None,
+                change_type="updated" if question.answer else "created",
+                changed_by=user_id
+            )
+            db.add(history)
+            history_records.append(history)
+
+            # Update question
+            question.answer = answer if answer else None
+            question.answered_at = datetime.utcnow() if answer else None
+            question.answered_by = user_id if answer else None
+            question.status = models.QuestionStatus.ANSWERED if answer else models.QuestionStatus.PENDING
+
+            updated_count += 1
+
+        db.commit()
+
+        logger.info(f"Updated {updated_count} question answers for presales: {presales_id}")
+
+        return {
+            "updated_count": updated_count,
+            "history_records": len(history_records)
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error updating question answers: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating answers: {str(e)}"
+        )
+
+
+async def update_question_status(
+    question_id: str,
+    user_id: str,
+    status_value: str,
+    reason: str,
+    invalidated_by: str,
+    db: Session
+) -> dict:
+    """
+    Update the status of a question (e.g., mark as invalid).
+
+    Args:
+        question_id: The question ID
+        user_id: The user ID
+        status_value: New status value
+        reason: Reason for status change
+        invalidated_by: Question ID that caused invalidation (if applicable)
+        db: Database session
+
+    Returns:
+        Dict with status
+    """
+    from datetime import datetime
+
+    try:
+        question = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.question_id == question_id,
+            models.PresalesQuestion.user_id == user_id
+        ).first()
+
+        if not question:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Question not found: {question_id}"
+            )
+
+        question.status = status_value
+        if status_value == models.QuestionStatus.INVALID:
+            question.invalidated_reason = reason
+            question.invalidated_at = datetime.utcnow()
+            question.invalidated_by_question_id = invalidated_by
+        elif status_value == models.QuestionStatus.NEEDS_REVIEW:
+            question.restored_in_iteration = (question.restored_in_iteration or 0) + 1
+
+        db.commit()
+        db.refresh(question)
+
+        logger.info(f"Updated question {question_id} status to: {status_value}")
+
+        return {
+            "question_id": question_id,
+            "status": question.status
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error updating question status: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating question status: {str(e)}"
+        )
+
+
+async def restore_question(
+    question_id: str,
+    user_id: str,
+    db: Session
+) -> dict:
+    """
+    Restore an invalidated question back to needs_review status.
+
+    Args:
+        question_id: The question ID
+        user_id: The user ID
+        db: Database session
+
+    Returns:
+        Dict with status
+    """
+    try:
+        question = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.question_id == question_id,
+            models.PresalesQuestion.user_id == user_id
+        ).first()
+
+        if not question:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Question not found: {question_id}"
+            )
+
+        if question.status != models.QuestionStatus.INVALID:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Question is not in invalid status"
+            )
+
+        # Restore with old answer if exists, otherwise pending
+        if question.answer:
+            question.status = models.QuestionStatus.NEEDS_REVIEW
+        else:
+            question.status = models.QuestionStatus.PENDING
+
+        question.restored_in_iteration = (question.restored_in_iteration or 0) + 1
+
+        db.commit()
+        db.refresh(question)
+
+        logger.info(f"Restored question {question_id} to status: {question.status}")
+
+        return {
+            "question_id": question_id,
+            "status": question.status,
+            "answer_preserved": question.answer is not None
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error restoring question: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error restoring question: {str(e)}"
+        )
+
+
+async def update_presales_readiness(
+    presales_id: str,
+    readiness_score: float,
+    readiness_status: str,
+    assumptions_list: list,
+    contradictions_list: list,
+    vague_answers_list: list,
+    db: Session
+) -> dict:
+    """
+    Update presales analysis with readiness information.
+
+    Args:
+        presales_id: The presales analysis ID
+        readiness_score: Score from 0.0 to 1.0
+        readiness_status: Status string
+        assumptions_list: List of assumptions
+        contradictions_list: List of contradictions
+        vague_answers_list: List of vague answers
+        db: Database session
+
+    Returns:
+        Dict with status
+    """
+    try:
+        presales = db.query(models.PresalesAnalysis).filter(
+            models.PresalesAnalysis.presales_id == presales_id
+        ).first()
+
+        if not presales:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Presales analysis not found: {presales_id}"
+            )
+
+        presales.readiness_score = readiness_score
+        presales.readiness_status = readiness_status
+        presales.assumptions_list = assumptions_list
+        presales.contradictions_list = contradictions_list
+        presales.vague_answers_list = vague_answers_list
+        presales.iteration_count = (presales.iteration_count or 1) + 1
+
+        flag_modified(presales, "assumptions_list")
+        flag_modified(presales, "contradictions_list")
+        flag_modified(presales, "vague_answers_list")
+
+        db.commit()
+        db.refresh(presales)
+
+        logger.info(f"Updated presales readiness for {presales_id}: score={readiness_score}, status={readiness_status}")
+
+        return {
+            "presales_id": presales_id,
+            "readiness_score": presales.readiness_score,
+            "readiness_status": presales.readiness_status,
+            "iteration_count": presales.iteration_count
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error updating presales readiness: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating readiness: {str(e)}"
+        )
+
+
+async def save_analysis_history(
+    presales_id: str,
+    user_id: str,
+    analysis_result: dict,
+    questions_snapshot: list,
+    processing_time_ms: int,
+    db: Session
+) -> dict:
+    """
+    Save analysis history record for audit trail.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID who triggered analysis
+        analysis_result: The analysis result dict
+        questions_snapshot: Snapshot of questions with answers
+        processing_time_ms: Time taken for analysis
+        db: Database session
+
+    Returns:
+        Dict with history record ID
+    """
+    try:
+        # Get current iteration count
+        presales = db.query(models.PresalesAnalysis).filter(
+            models.PresalesAnalysis.presales_id == presales_id
+        ).first()
+
+        iteration = presales.iteration_count if presales else 1
+
+        history = models.PresalesAnalysisHistory(
+            presales_id=presales_id,
+            iteration_number=iteration,
+            readiness_score=analysis_result.get("readiness", {}).get("score"),
+            readiness_status=analysis_result.get("readiness", {}).get("status"),
+            assumptions_made=analysis_result.get("assumptions"),
+            contradictions_found=analysis_result.get("contradictions"),
+            vague_answers_found=analysis_result.get("vague_answers"),
+            questions_invalidated=[
+                q.get("question_id") for q in analysis_result.get("invalidated_questions", [])
+            ],
+            answers_snapshot=questions_snapshot,
+            analyzed_by=user_id,
+            processing_time_ms=processing_time_ms
+        )
+
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+
+        logger.info(f"Saved analysis history for presales {presales_id}, iteration {iteration}")
+
+        return {
+            "analysis_history_id": history.analysis_history_id,
+            "iteration_number": history.iteration_number
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error saving analysis history: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving analysis history: {str(e)}"
+        )
+
+
+async def get_presales_with_questions(
+    presales_id: str,
+    user_id: str,
+    db: Session
+) -> dict:
+    """
+    Get presales analysis with all questions.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID
+        db: Database session
+
+    Returns:
+        Dict with presales data and questions
+    """
+    try:
+        presales = db.query(models.PresalesAnalysis).filter(
+            models.PresalesAnalysis.presales_id == presales_id,
+            models.PresalesAnalysis.user_id == user_id
+        ).first()
+
+        if not presales:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Presales analysis not found: {presales_id}"
+            )
+
+        questions = await get_presales_questions(presales_id, user_id, db)
+
+        return {
+            "presales_id": presales.presales_id,
+            "document_id": presales.document_id,
+            "presales_brief": presales.presales_brief,
+            "readiness_score": presales.readiness_score,
+            "readiness_status": presales.readiness_status,
+            "assumptions_list": presales.assumptions_list or [],
+            "contradictions_list": presales.contradictions_list or [],
+            "vague_answers_list": presales.vague_answers_list or [],
+            "iteration_count": presales.iteration_count,
+            "status": presales.status,
+            "questions": questions,
+            "created_at": presales.created_at.isoformat() if presales.created_at else None
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting presales with questions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving presales: {str(e)}"
+        )
 

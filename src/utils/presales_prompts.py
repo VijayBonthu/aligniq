@@ -113,14 +113,18 @@ Think like someone who has been burned before and knows the warning signs.
 
 ## YOUR TASKS
 
-### 1. Client Underestimations
-What are they likely underestimating? Look for:
+### 1. P1 Blockers
+Issues that MUST be resolved before proceeding. Without answers, we cannot scope accurately.
+Look for:
 - Complexity they're glossing over ("simple integration" that isn't simple)
 - Hidden dependencies they haven't considered
 - Optimistic assumptions about existing systems
 - Scope that sounds small but is actually large
+- Missing critical information that blocks estimation
 
-### 2. Critical Unknowns (Kickstart Questions)
+For each blocker, create a specific QUESTION to ask the client.
+
+### 2. Kickstart Questions (Critical Unknowns)
 Questions that MUST be answered before accurate scoping. Categorize by:
 - **Data**: Volume, formats, quality, migration needs
 - **Security**: Auth, encryption, compliance, access control
@@ -148,12 +152,12 @@ Patterns that suggest trouble ahead:
 Return ONLY valid JSON with this exact structure:
 
 {{
-  "underestimations": [
+  "p1_blockers": [
     {{
       "area": "Integration|Performance|Security|Data|Timeline|Scope|Other",
-      "what_they_said": "What the document states or implies",
-      "reality": "What it actually involves",
-      "impact": "high|medium|low"
+      "blocker": "What the issue/blocker is",
+      "why_it_matters": "Why this must be resolved before proceeding",
+      "question": "Specific question to ask the client"
     }}
   ],
   "critical_unknowns": [
@@ -185,7 +189,7 @@ Return ONLY valid JSON with this exact structure:
 1. Be specific and actionable, not generic
 2. For technology risks, only flag issues you have knowledge about - don't invent problems
 3. Prioritize by impact - most critical items first
-4. Maximum items: 5 underestimations, 10 critical unknowns, 10 technology risks, 5 red flags
+4. Maximum items: 5 P1 blockers, 10 critical unknowns, 10 technology risks, 5 red flags
 5. If no items for a category, return empty array []
 
 Think: "What would bite a team 3 months into this project?"
@@ -215,11 +219,17 @@ This document will be used in client conversations to:
 **Scanned Requirements:**
 {scanned_requirements}
 
-**Blind Spots Analysis:**
-{blind_spots}
+**P1 Blockers (from analysis):**
+{p1_blockers}
+
+**Kickstart Questions (Critical Unknowns):**
+{critical_unknowns}
 
 **Technology Risks:**
 {technology_risks}
+
+**Red Flags:**
+{red_flags}
 
 ## OUTPUT REQUIREMENTS
 
@@ -236,36 +246,28 @@ Generate a markdown document with this EXACT structure:
 
 ## P1 Blockers
 
-*Issues that MUST be resolved before proceeding. Without answers, we cannot scope accurately.*
+*Issues that MUST be resolved before proceeding. Without answers, we cannot scope accurately. Number as P1-1, P1-2, etc.*
 
-| # | Blocker | Why It Matters | Question to Ask |
-|---|---------|----------------|-----------------|
-| 1 | [Blocker description] | [Impact if not resolved] | [Specific question] |
+| # | Area | Blocker | Why It Matters | Question to Ask |
+|---|------|---------|----------------|-----------------|
+| P1-1 | [Area] | [Blocker description] | [Impact if not resolved] | [Specific question] |
+| P1-2 | [Area] | [Blocker description] | [Impact if not resolved] | [Specific question] |
 
-*If no P1 blockers identified, write: "None identified - proceed to kickstart questions."*
+*Use exact numbering P1-1, P1-2, P1-3... If no P1 blockers, write: "None identified - proceed to kickstart questions."*
 
 ---
 
 ## Kickstart Questions
 
-*Questions that must be answered to begin scoping. Organized by category.*
+*Questions that must be answered to begin scoping. Number questions sequentially (Q1, Q2, etc.) for easy reference.*
 
-### Data & Integration
-| Question | Impact if Unknown |
-|----------|-------------------|
-| [Question] | [What we can't estimate without this] |
+| # | Category | Question | Impact if Unknown |
+|---|----------|----------|-------------------|
+| Q1 | Data/Integration | [Question] | [What we can't estimate without this] |
+| Q2 | Security/Compliance | [Question] | [What we can't estimate without this] |
+| Q3 | Scale/Performance | [Question] | [What we can't estimate without this] |
 
-### Security & Compliance
-| Question | Impact if Unknown |
-|----------|-------------------|
-| [Question] | [What we can't estimate without this] |
-
-### Scale & Performance
-| Question | Impact if Unknown |
-|----------|-------------------|
-| [Question] | [What we can't estimate without this] |
-
-*Only include categories that have questions. Max 10 questions total.*
+*Categories: Data/Integration, Security/Compliance, Scale/Performance, Other. Number questions Q1, Q2, Q3... in order. Max 10 questions total.*
 
 ---
 
@@ -344,10 +346,12 @@ You've generated a Pre-Sales Brief for a project. The user is now asking follow-
 ## Instructions
 1. Answer based on the analysis you've already done
 2. If asked to explain something from the brief, provide more detail
-3. If asked about something not in the analysis, say so clearly
-4. If asked to add/modify items, acknowledge and suggest they can regenerate
-5. Keep responses concise and actionable
-6. Use markdown formatting for readability
+3. If the user references a P1 blocker by number (e.g., "P1-1", "P1-2"), look up that specific blocker from the P1 Blockers table and explain it in detail including the question to ask
+4. If the user references a kickstart question by number (e.g., "Q1", "Q3", "question 2"), look up that specific question from the Kickstart Questions table and explain it in detail
+5. If asked about something not in the analysis, say so clearly
+6. If asked to add/modify items, acknowledge and suggest they can regenerate
+7. Keep responses concise and actionable
+8. Use markdown formatting for readability
 
 Respond directly to the user's question.
 """
@@ -369,4 +373,208 @@ You are AlignIQ, helping a tech pre-sales person understand the analysis.
 - Keep response focused and concise
 
 Provide your answer:
+"""
+
+
+# =============================================================================
+# ANSWER ANALYZER PROMPTS
+# Analyze user answers for quality, contradictions, and readiness
+# =============================================================================
+
+ANSWER_ANALYZER_PROMPT = """
+You are an expert pre-sales analyst reviewing answers provided by a tech pre-sales person.
+
+Your job is to analyze the answers against the original document and questions to:
+1. Identify contradictions between answers
+2. Flag vague or unclear answers
+3. Determine which questions are no longer relevant given the answers
+4. Calculate overall readiness for full report generation
+5. List assumptions that would need to be made for unanswered questions
+
+## INPUTS
+
+**Original Document:**
+{document}
+
+**Scanned Requirements:**
+{scanned_requirements}
+
+**Questions and Answers:**
+{questions_with_answers}
+
+## YOUR TASKS
+
+### 1. Contradiction Detection
+Look for answers that conflict with each other or with the document:
+- Direct contradictions (e.g., "uses OAuth" vs "no authentication needed")
+- Implicit contradictions (e.g., "real-time updates" vs "batch processing only")
+- Document vs answer conflicts (e.g., document says X, answer claims Y)
+
+### 2. Vague Answer Detection
+Identify answers that are too vague to be useful:
+- Single word answers to complex questions
+- Answers that don't actually address the question
+- Answers using ambiguous terms without specifics
+For each vague answer, explain what specific information is needed.
+
+### 3. Question Invalidation
+Some questions may no longer be relevant based on answers:
+- If answer to Q1 makes Q3 unnecessary, mark Q3 as invalid
+- Provide clear reasoning for why each invalidated question is no longer needed
+
+### 4. Readiness Assessment
+Calculate how ready we are to generate a full report:
+- Count answered questions vs total
+- Weight P1 blockers more heavily than kickstart questions
+- Consider answer quality (good answers count more than vague ones)
+- Determine status: 'needs_more_info', 'ready_with_assumptions', or 'ready'
+
+### 5. Assumptions List
+For any unanswered questions or vague answers, list the assumptions we would make:
+- Be specific and realistic
+- Base assumptions on common patterns for this type of project
+- Flag high-risk assumptions that could significantly impact the project
+
+## OUTPUT FORMAT
+Return ONLY valid JSON with this exact structure:
+
+{{
+  "contradictions": [
+    {{
+      "question_ids": ["P1-1", "Q3"],
+      "description": "What is contradicting",
+      "explanation": "Why this is a problem",
+      "suggested_resolution": "How to fix this"
+    }}
+  ],
+  "vague_answers": [
+    {{
+      "question_id": "Q2",
+      "current_answer": "The answer they provided",
+      "issue": "Why this is too vague",
+      "expected_format": "What a good answer would look like",
+      "impact": "What we can't determine without clarification"
+    }}
+  ],
+  "invalidated_questions": [
+    {{
+      "question_id": "Q5",
+      "reason": "Why this question is no longer relevant",
+      "invalidated_by": "P1-2"
+    }}
+  ],
+  "readiness": {{
+    "score": 0.75,
+    "status": "ready_with_assumptions",
+    "p1_answered": 3,
+    "p1_total": 4,
+    "kickstart_answered": 5,
+    "kickstart_total": 8,
+    "good_quality_answers": 6,
+    "vague_answers": 2,
+    "summary": "Brief explanation of readiness state"
+  }},
+  "assumptions": [
+    {{
+      "for_question_id": "Q4",
+      "assumption": "What we will assume",
+      "basis": "Why this is a reasonable assumption",
+      "risk_level": "low|medium|high",
+      "impact_if_wrong": "What happens if this assumption is incorrect"
+    }}
+  ],
+  "recommendations": [
+    "Suggestion 1 for improving readiness",
+    "Suggestion 2"
+  ]
+}}
+
+## IMPORTANT RULES
+1. Be constructive, not critical - help them improve
+2. Only flag real issues, not minor stylistic concerns
+3. Assumptions should be realistic and based on industry standards
+4. Score should reflect genuine readiness, not be artificially low
+5. If answers are good, say so - don't manufacture problems
+6. Return ONLY the JSON, no other text
+"""
+
+
+READINESS_SUMMARY_PROMPT = """
+Generate a user-friendly summary of the readiness analysis for display.
+
+## Analysis Results
+{analysis_results}
+
+## Instructions
+Create a clear, actionable summary that:
+1. Highlights the most important issues (if any)
+2. Explains what happens next
+3. Gives confidence about proceeding
+
+Keep it concise - 2-3 paragraphs max.
+Use simple language, avoid jargon.
+
+If readiness is high, be encouraging.
+If there are issues, be constructive and specific about how to fix them.
+"""
+
+
+FULL_REPORT_WITH_ASSUMPTIONS_PROMPT = """
+You are generating a comprehensive technical report. Some information was provided through answers,
+and some will be based on reasonable assumptions.
+
+## CRITICAL INSTRUCTION
+You MUST clearly distinguish between:
+- **Confirmed Information**: Based on answers provided
+- **Assumptions Made**: Where information was not provided
+
+## Document Context
+{document}
+
+## Confirmed Information (from answers)
+{confirmed_answers}
+
+## Assumptions Being Made
+{assumptions_list}
+
+## Report Structure Requirements
+Include these sections:
+
+### 1. Executive Summary
+Brief overview with clear note about assumption count
+
+### 2. Information Status
+| Category | Confirmed | Assumed |
+|----------|-----------|---------|
+| Technical Requirements | X | Y |
+| Integration Points | X | Y |
+| Security Requirements | X | Y |
+| Scale/Performance | X | Y |
+
+### 3. Confirmed Requirements
+Details based on provided answers
+
+### 4. Assumed Requirements
+**IMPORTANT**: Each assumption must be clearly marked with:
+- What we're assuming
+- Why we made this assumption
+- Risk if assumption is wrong
+- Recommendation to confirm
+
+### 5. Technical Architecture
+(with clear markers for assumed vs confirmed elements)
+
+### 6. Risk Assessment
+Include risks specifically from unconfirmed assumptions
+
+### 7. Recommendations
+- Immediate actions
+- Items requiring client confirmation
+- Assumptions to validate ASAP
+
+### 8. Appendix: Assumptions Summary
+Complete list of all assumptions for easy client review
+
+## Output
+Generate the full report in markdown format.
 """
