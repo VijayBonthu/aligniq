@@ -65,6 +65,7 @@ class AnalysisResult:
         self.invalidated_questions = raw_result.get("invalidated_questions", [])
         self.readiness = raw_result.get("readiness", {})
         self.assumptions = raw_result.get("assumptions", [])
+        self.follow_up_questions = raw_result.get("follow_up_questions", [])
         self.recommendations = raw_result.get("recommendations", [])
         self.processing_time_ms = raw_result.get("processing_time_ms", 0)
 
@@ -83,7 +84,9 @@ class AnalysisResult:
     @property
     def can_generate_report(self) -> bool:
         """Check if we can proceed with report generation (possibly with assumptions)"""
-        return self.readiness_status in ["ready", "ready_with_assumptions"]
+        # Can generate if ready OR ready_with_assumptions OR even needs_more_info (with consent)
+        # We let the user decide - they can always generate with assumptions
+        return self.readiness_status in ["ready", "ready_with_assumptions", "needs_more_info"]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -92,6 +95,7 @@ class AnalysisResult:
             "invalidated_questions": self.invalidated_questions,
             "readiness": self.readiness,
             "assumptions": self.assumptions,
+            "follow_up_questions": self.follow_up_questions,
             "recommendations": self.recommendations,
             "processing_time_ms": self.processing_time_ms
         }

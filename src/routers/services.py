@@ -1357,6 +1357,7 @@ async def analyze_presales_answers(
             "vague_answers": analysis_result.vague_answers,
             "invalidated_questions": analysis_result.invalidated_questions,
             "assumptions": analysis_result.assumptions,
+            "follow_up_questions": analysis_result.follow_up_questions,
             "recommendations": analysis_result.recommendations,
             "questions": updated_questions,
             "can_generate_report": analysis_result.can_generate_report,

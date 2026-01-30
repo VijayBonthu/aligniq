@@ -76,6 +76,20 @@ interface Assumption {
   impact_if_wrong: string;
 }
 
+interface InvalidatedQuestion {
+  question_id: string;  // e.g., "Q5", "P1-2"
+  reason: string;
+  invalidated_by: string;  // Which question caused this to be invalidated
+  preserved_insight?: string;  // Any valuable info from the answer before invalidation
+}
+
+interface FollowUpQuestion {
+  question_text: string;
+  reason: string;
+  priority: 'high' | 'medium';
+  based_on: string;  // Which answer triggered this
+}
+
 // Legacy interfaces for backward compatibility
 interface KickstartQuestion {
   category: string;
@@ -194,7 +208,9 @@ const Dashboard: React.FC = () => {
     readiness: ReadinessResult;
     contradictions: Contradiction[];
     vague_answers: VagueAnswer[];
+    invalidated_questions: InvalidatedQuestion[];
     assumptions: Assumption[];
+    follow_up_questions: FollowUpQuestion[];
     recommendations: string[];
     can_generate_report: boolean;
   } | null>(null);
@@ -2165,7 +2181,9 @@ const Dashboard: React.FC = () => {
         readiness: response.data.readiness,
         contradictions: response.data.contradictions || [],
         vague_answers: response.data.vague_answers || [],
+        invalidated_questions: response.data.invalidated_questions || [],
         assumptions: response.data.assumptions || [],
+        follow_up_questions: response.data.follow_up_questions || [],
         recommendations: response.data.recommendations || [],
         can_generate_report: response.data.can_generate_report
       });
@@ -2211,6 +2229,8 @@ const Dashboard: React.FC = () => {
       return;
     }
 
+    console.log('Applying assumptions:', assumptions);
+
     const newAnswers: Record<string, string> = { ...kickstartAnswers };
     let appliedCount = 0;
 
@@ -2219,38 +2239,118 @@ const Dashboard: React.FC = () => {
       let frontendKey: string | null = null;
 
       // Map question_id format to frontend key format
-      // P1-1, P1-2, etc. → p1_0, p1_1, etc. (1-indexed to 0-indexed)
-      if (questionId.startsWith('P1-')) {
-        const num = parseInt(questionId.replace('P1-', ''), 10);
+      // Handle both uppercase and lowercase: P1-1, p1-1, Q1, q1
+      const qIdLower = questionId?.toLowerCase() || '';
+
+      if (qIdLower.startsWith('p1-')) {
+        const num = parseInt(qIdLower.replace('p1-', ''), 10);
         if (!isNaN(num) && num > 0) {
           frontendKey = `p1_${num - 1}`;
         }
       }
-      // Q1, Q2, etc. → question_0, question_1, etc. (1-indexed to 0-indexed)
-      else if (questionId.startsWith('Q')) {
-        const num = parseInt(questionId.replace('Q', ''), 10);
+      else if (qIdLower.startsWith('q')) {
+        const num = parseInt(qIdLower.replace('q', ''), 10);
         if (!isNaN(num) && num > 0) {
           frontendKey = `question_${num - 1}`;
         }
       }
 
+      console.log(`Mapping ${questionId} -> ${frontendKey}`);
+
       if (frontendKey) {
-        // Only apply if the field is currently empty or not set
-        if (!newAnswers[frontendKey] || newAnswers[frontendKey].trim() === '') {
-          // Format the assumed answer with a marker so user knows it's an assumption
-          newAnswers[frontendKey] = `[ASSUMED] ${assumption.assumption}`;
-          appliedCount++;
+        const currentValue = newAnswers[frontendKey] || '';
+        const assumptionText = `\n\n[SYSTEM ASSUMPTION] ${assumption.assumption}`;
+
+        // If field is empty, just add the assumption
+        // If field has content, append assumption at the end so user can edit
+        if (currentValue.trim() === '') {
+          newAnswers[frontendKey] = `[SYSTEM ASSUMPTION] ${assumption.assumption}`;
+        } else {
+          // Append to existing answer - user can review and edit
+          newAnswers[frontendKey] = currentValue + assumptionText;
         }
+        appliedCount++;
       }
     }
+
+    console.log('Applied answers:', newAnswers);
 
     setKickstartAnswers(newAnswers);
     setShowReadinessModal(false);
 
     if (appliedCount > 0) {
-      toast.success(`Applied ${appliedCount} assumption(s) to answer fields. Review and edit as needed, then Save & Analyze again.`);
+      toast.success(`Applied ${appliedCount} assumption(s). Review and edit as needed, then Save & Analyze again.`);
     } else {
-      toast.info('All assumption fields already have answers');
+      toast.warning('Could not map assumptions to question fields. Check the console for details.');
+    }
+  };
+
+  // Restore an invalidated question - makes it active again for the user to answer
+  const handleRestoreQuestion = async (questionNumber: string) => {
+    if (!activeConversation?.presales_id) {
+      toast.error('No pre-sales analysis found');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('token') ||
+                    localStorage.getItem('regular_token') ||
+                    localStorage.getItem('google_auth_token');
+
+      if (!token) {
+        toast.error('Authentication required');
+        return;
+      }
+
+      // Find the question_id from the question number (P1-1, Q2, etc.)
+      // We need to get it from the questions in activeConversation
+      const allQuestions = activeConversation.questions || [];
+      const questionToRestore = allQuestions.find(q => q.question_number === questionNumber);
+
+      if (!questionToRestore) {
+        toast.error(`Question ${questionNumber} not found`);
+        return;
+      }
+
+      const response = await axios.post(
+        `${API_URL}/presales/${activeConversation.presales_id}/questions/${questionToRestore.question_id}/restore`,
+        {},
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        }
+      );
+
+      if (response.data.status === 'restored') {
+        toast.success(`Question ${questionNumber} restored. You can now answer it again.`);
+
+        // Update local state - remove from invalidated_questions in analysisResult
+        if (analysisResult) {
+          setAnalysisResult({
+            ...analysisResult,
+            invalidated_questions: analysisResult.invalidated_questions.filter(
+              q => q.question_id !== questionNumber
+            )
+          });
+        }
+
+        // Update the question status in activeConversation
+        setActiveConversation(prev => {
+          if (!prev || !prev.questions) return prev;
+          return {
+            ...prev,
+            questions: prev.questions.map(q =>
+              q.question_id === questionToRestore.question_id
+                ? { ...q, status: response.data.answer_preserved ? 'needs_review' : 'pending' }
+                : q
+            )
+          };
+        });
+      }
+    } catch (error) {
+      console.error('Error restoring question:', error);
+      toast.error('Failed to restore question');
     }
   };
 
@@ -2596,34 +2696,92 @@ const Dashboard: React.FC = () => {
                               P1 Blockers (Must Resolve)
                             </h5>
                             <div className="space-y-3">
-                              {activeConversation.p1_blockers.map((p1, index) => (
-                                <div key={`p1-${index}`} className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
-                                  <div className="flex items-start gap-2 mb-2">
-                                    <span className="px-1.5 py-0.5 bg-red-500/30 text-red-300 rounded text-xs font-bold shrink-0">
-                                      P1-{index + 1}
-                                    </span>
-                                    <span className="px-1.5 py-0.5 bg-gray-500/20 text-gray-300 rounded text-xs capitalize shrink-0">
-                                      {p1.area}
-                                    </span>
-                                    <p className="text-sm text-white font-medium">{p1.blocker}</p>
+                              {activeConversation.p1_blockers.map((p1, index) => {
+                                const questionNumber = `P1-${index + 1}`;
+                                const isInvalidated = analysisResult?.invalidated_questions?.some(
+                                  inv => inv.question_id === questionNumber
+                                );
+                                const invalidationInfo = analysisResult?.invalidated_questions?.find(
+                                  inv => inv.question_id === questionNumber
+                                );
+                                const vagueInfo = analysisResult?.vague_answers?.find(
+                                  v => v.question_id === questionNumber
+                                );
+
+                                return (
+                                  <div
+                                    key={`p1-${index}`}
+                                    className={`rounded-lg p-3 transition-all ${
+                                      isInvalidated
+                                        ? 'bg-gray-500/10 border border-gray-500/30 opacity-60'
+                                        : vagueInfo
+                                          ? 'bg-yellow-500/10 border border-yellow-500/30'
+                                          : 'bg-red-500/10 border border-red-500/20'
+                                    }`}
+                                  >
+                                    <div className="flex items-start gap-2 mb-2">
+                                      <span className={`px-1.5 py-0.5 rounded text-xs font-bold shrink-0 ${
+                                        isInvalidated
+                                          ? 'bg-gray-500/30 text-gray-400 line-through'
+                                          : 'bg-red-500/30 text-red-300'
+                                      }`}>
+                                        {questionNumber}
+                                      </span>
+                                      {isInvalidated && (
+                                        <span className="px-1.5 py-0.5 bg-gray-600/30 text-gray-400 rounded text-xs shrink-0">
+                                          Disabled
+                                        </span>
+                                      )}
+                                      {vagueInfo && !isInvalidated && (
+                                        <span className="px-1.5 py-0.5 bg-yellow-500/30 text-yellow-300 rounded text-xs shrink-0">
+                                          Needs Clarification
+                                        </span>
+                                      )}
+                                      <span className="px-1.5 py-0.5 bg-gray-500/20 text-gray-300 rounded text-xs capitalize shrink-0">
+                                        {p1.area}
+                                      </span>
+                                      <p className={`text-sm font-medium ${isInvalidated ? 'text-gray-400 line-through' : 'text-white'}`}>
+                                        {p1.blocker}
+                                      </p>
+                                    </div>
+                                    {isInvalidated && invalidationInfo && (
+                                      <div className="mb-2 p-2 bg-gray-600/20 rounded text-xs">
+                                        <p className="text-gray-400">{invalidationInfo.reason}</p>
+                                        {invalidationInfo.invalidated_by && (
+                                          <p className="text-blue-400/60 mt-1">
+                                            Made unnecessary by: {invalidationInfo.invalidated_by}
+                                          </p>
+                                        )}
+                                      </div>
+                                    )}
+                                    {vagueInfo && !isInvalidated && (
+                                      <div className="mb-2 p-2 bg-yellow-500/10 border border-yellow-500/20 rounded text-xs">
+                                        <p className="text-yellow-300">{vagueInfo.issue}</p>
+                                        <p className="text-gray-400 mt-1">Expected: {vagueInfo.expected_format}</p>
+                                      </div>
+                                    )}
+                                    {!isInvalidated && (
+                                      <>
+                                        <p className="text-xs text-gray-400 mb-2">
+                                          <span className="text-red-400/70">Why it matters:</span> {p1.why_it_matters}
+                                        </p>
+                                        <p className="text-xs text-white mb-2 bg-white/5 p-2 rounded">
+                                          <span className="text-yellow-400">Question:</span> {p1.question}
+                                        </p>
+                                        <textarea
+                                          placeholder={`Enter answer for ${questionNumber}...`}
+                                          value={kickstartAnswers[`p1_${index}`] || ''}
+                                          onChange={(e) => handleKickstartAnswerChange(`p1_${index}`, e.target.value)}
+                                          className="w-full px-2 py-1.5 bg-white/5 border border-red-500/20 rounded text-sm text-white
+                                            placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-red-500/50
+                                            resize-none"
+                                          rows={2}
+                                        />
+                                      </>
+                                    )}
                                   </div>
-                                  <p className="text-xs text-gray-400 mb-2">
-                                    <span className="text-red-400/70">Why it matters:</span> {p1.why_it_matters}
-                                  </p>
-                                  <p className="text-xs text-white mb-2 bg-white/5 p-2 rounded">
-                                    <span className="text-yellow-400">Question:</span> {p1.question}
-                                  </p>
-                                  <textarea
-                                    placeholder={`Enter answer for P1-${index + 1}...`}
-                                    value={kickstartAnswers[`p1_${index}`] || ''}
-                                    onChange={(e) => handleKickstartAnswerChange(`p1_${index}`, e.target.value)}
-                                    className="w-full px-2 py-1.5 bg-white/5 border border-red-500/20 rounded text-sm text-white
-                                      placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-red-500/50
-                                      resize-none"
-                                    rows={2}
-                                  />
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
                         )}
@@ -2638,31 +2796,89 @@ const Dashboard: React.FC = () => {
                               Kickstart Questions (For Scoping)
                             </h5>
                             <div className="space-y-3">
-                              {activeConversation.kickstart_questions.map((q, index) => (
-                                <div key={`q-${index}`} className="bg-white/5 rounded-lg p-3">
-                                  <div className="flex items-start gap-2 mb-2">
-                                    <span className="px-1.5 py-0.5 bg-purple-500/30 text-purple-300 rounded text-xs font-bold shrink-0">
-                                      Q{index + 1}
-                                    </span>
-                                    <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-300 rounded text-xs capitalize shrink-0">
-                                      {q.category}
-                                    </span>
-                                    <p className="text-sm text-white">{q.question}</p>
+                              {activeConversation.kickstart_questions.map((q, index) => {
+                                const questionNumber = `Q${index + 1}`;
+                                const isInvalidated = analysisResult?.invalidated_questions?.some(
+                                  inv => inv.question_id === questionNumber
+                                );
+                                const invalidationInfo = analysisResult?.invalidated_questions?.find(
+                                  inv => inv.question_id === questionNumber
+                                );
+                                const vagueInfo = analysisResult?.vague_answers?.find(
+                                  v => v.question_id === questionNumber
+                                );
+
+                                return (
+                                  <div
+                                    key={`q-${index}`}
+                                    className={`rounded-lg p-3 transition-all ${
+                                      isInvalidated
+                                        ? 'bg-gray-500/10 border border-gray-500/30 opacity-60'
+                                        : vagueInfo
+                                          ? 'bg-yellow-500/10 border border-yellow-500/30'
+                                          : 'bg-white/5'
+                                    }`}
+                                  >
+                                    <div className="flex items-start gap-2 mb-2">
+                                      <span className={`px-1.5 py-0.5 rounded text-xs font-bold shrink-0 ${
+                                        isInvalidated
+                                          ? 'bg-gray-500/30 text-gray-400 line-through'
+                                          : 'bg-purple-500/30 text-purple-300'
+                                      }`}>
+                                        {questionNumber}
+                                      </span>
+                                      {isInvalidated && (
+                                        <span className="px-1.5 py-0.5 bg-gray-600/30 text-gray-400 rounded text-xs shrink-0">
+                                          Disabled
+                                        </span>
+                                      )}
+                                      {vagueInfo && !isInvalidated && (
+                                        <span className="px-1.5 py-0.5 bg-yellow-500/30 text-yellow-300 rounded text-xs shrink-0">
+                                          Needs Clarification
+                                        </span>
+                                      )}
+                                      <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-300 rounded text-xs capitalize shrink-0">
+                                        {q.category}
+                                      </span>
+                                      <p className={`text-sm ${isInvalidated ? 'text-gray-400 line-through' : 'text-white'}`}>
+                                        {q.question}
+                                      </p>
+                                    </div>
+                                    {isInvalidated && invalidationInfo && (
+                                      <div className="mb-2 p-2 bg-gray-600/20 rounded text-xs">
+                                        <p className="text-gray-400">{invalidationInfo.reason}</p>
+                                        {invalidationInfo.invalidated_by && (
+                                          <p className="text-blue-400/60 mt-1">
+                                            Made unnecessary by: {invalidationInfo.invalidated_by}
+                                          </p>
+                                        )}
+                                      </div>
+                                    )}
+                                    {vagueInfo && !isInvalidated && (
+                                      <div className="mb-2 p-2 bg-yellow-500/10 border border-yellow-500/20 rounded text-xs">
+                                        <p className="text-yellow-300">{vagueInfo.issue}</p>
+                                        <p className="text-gray-400 mt-1">Expected: {vagueInfo.expected_format}</p>
+                                      </div>
+                                    )}
+                                    {!isInvalidated && (
+                                      <>
+                                        <p className="text-xs text-gray-400 mb-2">
+                                          <span className="text-yellow-400/70">Why critical:</span> {q.why_critical}
+                                        </p>
+                                        <textarea
+                                          placeholder={`Enter answer for ${questionNumber}...`}
+                                          value={kickstartAnswers[`question_${index}`] || ''}
+                                          onChange={(e) => handleKickstartAnswerChange(index, e.target.value)}
+                                          className="w-full px-2 py-1.5 bg-white/5 border border-white/10 rounded text-sm text-white
+                                            placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-yellow-500/50
+                                            resize-none"
+                                          rows={2}
+                                        />
+                                      </>
+                                    )}
                                   </div>
-                                  <p className="text-xs text-gray-400 mb-2">
-                                    <span className="text-yellow-400/70">Why critical:</span> {q.why_critical}
-                                  </p>
-                                  <textarea
-                                    placeholder={`Enter answer for Q${index + 1}...`}
-                                    value={kickstartAnswers[`question_${index}`] || ''}
-                                    onChange={(e) => handleKickstartAnswerChange(index, e.target.value)}
-                                    className="w-full px-2 py-1.5 bg-white/5 border border-white/10 rounded text-sm text-white
-                                      placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-yellow-500/50
-                                      resize-none"
-                                    rows={2}
-                                  />
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
                         )}
@@ -2931,6 +3147,21 @@ const Dashboard: React.FC = () => {
                 <p className="mt-2 text-sm text-gray-400">
                   {analysisResult.readiness.summary || `Status: ${analysisResult.readiness.status.replace(/_/g, ' ')}`}
                 </p>
+
+                {/* P1 Impact Warning - Show when P1s have assumptions */}
+                {analysisResult.assumptions.some(a => a.for_question_id.startsWith('P1-')) && (
+                  <div className="mt-3 p-2 bg-orange-500/10 border border-orange-500/20 rounded text-xs">
+                    <p className="text-orange-300 font-medium flex items-center">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      Some P1 blockers will use assumptions
+                    </p>
+                    <p className="text-gray-400 mt-1">
+                      P1 blockers are critical for project success. You can still proceed, but we recommend reviewing assumptions marked as "high risk" for these questions.
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Contradictions */}
@@ -2948,6 +3179,47 @@ const Dashboard: React.FC = () => {
                         <p className="text-white font-medium">{c.description}</p>
                         <p className="text-gray-400 mt-1">{c.explanation}</p>
                         <p className="text-yellow-300 mt-1 text-xs">Fix: {c.suggested_resolution}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Invalidated Questions - Questions that are no longer relevant */}
+              {analysisResult.invalidated_questions.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-gray-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                    </svg>
+                    Questions Auto-Disabled ({analysisResult.invalidated_questions.length})
+                  </h4>
+                  <p className="text-xs text-gray-500 mb-2">
+                    These questions are no longer relevant based on your answers. This saves you time!
+                  </p>
+                  <div className="space-y-2">
+                    {analysisResult.invalidated_questions.map((inv, i) => (
+                      <div key={i} className="p-3 bg-gray-500/10 border border-gray-500/20 rounded-lg text-sm">
+                        <div className="flex items-start justify-between">
+                          <div className="flex-1">
+                            <p className="text-gray-300 line-through">
+                              <span className="font-medium text-gray-400">{inv.question_id}:</span> Disabled
+                            </p>
+                            <p className="text-gray-500 mt-1 text-xs">{inv.reason}</p>
+                            {inv.invalidated_by && (
+                              <p className="text-blue-400/70 mt-1 text-xs">
+                                Made unnecessary by your answer to {inv.invalidated_by}
+                              </p>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => handleRestoreQuestion(inv.question_id)}
+                            className="ml-2 px-2 py-1 text-xs bg-gray-600/50 text-gray-300 rounded hover:bg-gray-500/50 transition-colors"
+                            title="Restore this question if you think it's still relevant"
+                          >
+                            Restore
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -2997,6 +3269,39 @@ const Dashboard: React.FC = () => {
                           </span>
                         </div>
                         <p className="text-gray-400 mt-1 text-xs">For: {a.for_question_id}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Follow-up Questions - Only shown if critical gaps found */}
+              {analysisResult.follow_up_questions && analysisResult.follow_up_questions.length > 0 && (
+                <div className="mb-4">
+                  <h4 className="text-sm font-semibold text-purple-400 mb-2 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                    </svg>
+                    Additional Questions Suggested ({analysisResult.follow_up_questions.length})
+                  </h4>
+                  <p className="text-xs text-gray-500 mb-2">
+                    These are optional but would help clarify critical gaps. You can skip them and proceed with assumptions.
+                  </p>
+                  <div className="space-y-2">
+                    {analysisResult.follow_up_questions.map((fq, i) => (
+                      <div key={i} className="p-3 bg-purple-500/10 border border-purple-500/20 rounded-lg text-sm">
+                        <div className="flex items-start justify-between">
+                          <p className="text-white">{fq.question_text}</p>
+                          <span className={`text-xs px-2 py-0.5 rounded ml-2 shrink-0 ${
+                            fq.priority === 'high' ? 'bg-red-500/20 text-red-300' : 'bg-yellow-500/20 text-yellow-300'
+                          }`}>
+                            {fq.priority}
+                          </span>
+                        </div>
+                        <p className="text-gray-400 mt-1 text-xs">{fq.reason}</p>
+                        {fq.based_on && (
+                          <p className="text-purple-400/60 mt-1 text-xs">Based on: {fq.based_on}</p>
+                        )}
                       </div>
                     ))}
                   </div>
