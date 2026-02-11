@@ -19,21 +19,15 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI(lifespan=lifespan)
 # app = FastAPI()
 
-origins = [
-    "https://immense-finally-giraffe.ngrok-free.app",
-    "https://7ede-142-198-208-131.ngrok-free.app",
-    "http://localhost",
-    "http://localhost:8080",
-    "http://localhost:3000",
-    "http://localhost:3001"
-
+origins = [ 
+    
     # Add any other domains that need to access your API
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"], 
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -50,4 +44,4 @@ async def home():
     return "Welcome to Oauth testing login page"  
     
 if __name__ == "__main__":
-    uvicorn.run("main:app", port=8080, log_level='info', reload=True, reload_excludes=["*.log"])
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, log_level='info', reload=True, reload_excludes=["*.log"])

@@ -43,8 +43,8 @@ class Settings:
 
     # Pipeline configuration
     DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-    PIPELINE_TIMEOUT = int(os.getenv("PIPELINE_TIMEOUT", "1500"))  # 10 minutes default
-    LLM_CALL_TIMEOUT = int(os.getenv("LLM_CALL_TIMEOUT", "300"))  # 2 minutes per LLM call
+    PIPELINE_TIMEOUT = int(os.getenv("PIPELINE_TIMEOUT", "2000"))  # 10 minutes default
+    LLM_CALL_TIMEOUT = int(os.getenv("LLM_CALL_TIMEOUT", "500"))  # 2 minutes per LLM call
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
     LLM_RETRY_MIN_WAIT = int(os.getenv("LLM_RETRY_MIN_WAIT", "1"))  # seconds
     LLM_RETRY_MAX_WAIT = int(os.getenv("LLM_RETRY_MAX_WAIT", "10"))  # seconds

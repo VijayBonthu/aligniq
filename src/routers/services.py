@@ -70,6 +70,7 @@ from database_scripts import (
     get_presales_by_id,
     create_analysis_link,
     get_analysis_link,
+    get_analysis_link_by_presales_id,
     update_analysis_link_with_full_report,
     save_user_answers,
     mark_risk_relevance,
@@ -82,7 +83,11 @@ from database_scripts import (
     restore_question,
     update_presales_readiness,
     save_analysis_history,
-    get_presales_with_questions
+    get_presales_with_questions,
+    save_question_answer,
+    # Undo/Rollback Functions
+    get_last_pending_change,
+    remove_last_pending_change
 )
 from agents.agentic_workflow import main_report_summary, regenerate_report_sections
 import models
@@ -199,7 +204,7 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
         task_status[task_id]["message"] = str(e)
 
 
-@router.post("/upload/")
+@router.post("/upload")
 async def upload_file(
     background_tasks: BackgroundTasks,
     current_token: dict = Depends(token_validator),
@@ -527,14 +532,45 @@ async def _run_presales_analysis(
             )
             logger.info(f"Saved {len(result['technology_risks'])} technology risks")
 
-        # Create analysis link for future full report
+        # Generate a meaningful title from the presales analysis
+        scanned_reqs = result.get("scanned_requirements", {})
+        project_summary = scanned_reqs.get("project_summary", "")
+        # Extract first sentence or first 80 chars for title
+        if project_summary:
+            # Take first sentence or truncate
+            first_sentence = project_summary.split('.')[0].strip()
+            conversation_title = first_sentence[:80] + ('...' if len(first_sentence) > 80 else '')
+        else:
+            conversation_title = "Pre-Sales Analysis"
+
+        # Create ChatHistory record so presales appears in conversation sidebar
+        chat_data = {
+            "user_id": user_id,
+            "document_id": document_id,
+            "message": [
+                {
+                    "role": "assistant",
+                    "content": result.get("presales_brief", ""),
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "presales_brief",
+                    "presales_id": presales_id
+                }
+            ],
+            "title": conversation_title
+        }
+        chat_record = await save_chat_history(chat=chat_data, db=db)
+        chat_history_id = chat_record["chat_history_id"]
+        logger.info(f"Created chat history for presales: {chat_history_id}")
+
+        # Create analysis link with chat_history_id for unified tracking
         await create_analysis_link(
             document_id=document_id,
             user_id=user_id,
             presales_id=presales_id,
+            chat_history_id=chat_history_id,
             db=db
         )
-        logger.info(f"Created analysis link for presales_id: {presales_id}")
+        logger.info(f"Created analysis link for presales_id: {presales_id} with chat_history_id: {chat_history_id}")
 
         # Create question records for tracking
         questions_result = await create_presales_questions(
@@ -551,7 +587,7 @@ async def _run_presales_analysis(
             # Frontend compatibility fields
             "message": result.get("presales_brief"),  # Frontend expects 'message'
             "document_id": document_id,
-            "title": "Pre-Sales Analysis Brief",
+            "title": conversation_title,
 
             # Pre-sales specific fields
             "presales_id": presales_id,
@@ -565,8 +601,8 @@ async def _run_presales_analysis(
             "processing_times": result.get("processing_times"),
             "status": "completed",
 
-            # Note: No chat_history_id for presales - use /generate-full-report/ to get one
-            "chat_history_id": None  # Explicitly null - frontend should handle this
+            # Chat history ID - allows presales to appear in conversation sidebar
+            "chat_history_id": chat_history_id
         }
 
         logger.info(f"Pre-sales analysis completed. Brief length: {len(result.get('presales_brief', '') or '')} chars")
@@ -603,6 +639,7 @@ async def generate_full_report_from_presales(
     presales_id: str = Form(...),
     user_answers: Optional[str] = Form(default=None),  # JSON string of answers to kickstart questions
     assumptions: Optional[str] = Form(default=None),  # JSON string of assumptions from readiness analysis
+    additional_context: Optional[str] = Form(default=None),  # Free-form additional context from user
     current_token: dict = Depends(token_validator),
     db: Session = Depends(get_db)
 ):
@@ -618,6 +655,7 @@ async def generate_full_report_from_presales(
         presales_id: ID of the pre-sales analysis to build upon
         user_answers: JSON string of answers to kickstart questions
         assumptions: JSON string of assumptions list from readiness analysis
+        additional_context: Free-form text with additional requirements, client notes, etc.
 
     Returns:
         Full technical report with chat_history_id
@@ -659,6 +697,10 @@ async def generate_full_report_from_presales(
             except json.JSONDecodeError as e:
                 logger.warning(f"Invalid assumptions JSON: {str(e)}")
 
+        # Log additional context if provided
+        if additional_context:
+            logger.info(f"Received additional context ({len(additional_context)} chars) for report generation")
+
         # Get questions with answers
         questions = await get_presales_questions(presales_id, user_id, db)
 
@@ -682,6 +724,7 @@ async def generate_full_report_from_presales(
                 scanned_requirements=presales.get('extracted_requirements', {}),
                 confirmed_answers=questions,
                 assumptions_list=assumptions_list,
+                additional_context=additional_context,
                 timeout=180
             )
 
@@ -697,26 +740,33 @@ async def generate_full_report_from_presales(
         else:
             # No assumptions - use original pipeline
             # Build enhanced context from pre-sales output
+            additional_context_section = ""
+            if additional_context:
+                additional_context_section = f"""
+                                    ### Additional Context from Client/Team
+                                    {additional_context}
+                                    """
+
             enhanced_context = f"""
-## Pre-Sales Analysis Context
+                                    ## Pre-Sales Analysis Context
 
-### Project Summary
-{presales.get('extracted_requirements', {}).get('project_summary', 'N/A')}
+                                    ### Project Summary
+                                    {presales.get('extracted_requirements', {}).get('project_summary', 'N/A')}
 
-### Technologies Identified
-{json.dumps(presales.get('extracted_requirements', {}).get('technologies_mentioned', []), indent=2)}
+                                    ### Technologies Identified
+                                    {json.dumps(presales.get('extracted_requirements', {}).get('technologies_mentioned', []), indent=2)}
 
-### Blind Spots & Risks Identified
-{json.dumps(presales.get('blind_spots', {}), indent=2)}
+                                    ### Blind Spots & Risks Identified
+                                    {json.dumps(presales.get('blind_spots', {}), indent=2)}
 
-### User-Provided Answers to Kickstart Questions
-{json.dumps(answers_dict, indent=2) if answers_dict else 'No additional context provided'}
+                                    ### User-Provided Answers to Kickstart Questions
+                                    {json.dumps(answers_dict, indent=2) if answers_dict else 'No additional context provided'}
+                                    {additional_context_section}
+                                    ---
 
----
-
-## Original Document Content
-(Note: Using pre-analyzed requirements for efficiency)
-"""
+                                    ## Original Document Content
+                                    (Note: Using pre-analyzed requirements for efficiency)
+                                    """
 
             # Run the full agent pipeline with enhanced context
             result = await run_agent_pipeline(document=[enhanced_context])
@@ -735,26 +785,78 @@ async def generate_full_report_from_presales(
         # Extract title
         document_title = presales.get('extracted_requirements', {}).get('project_summary', 'Technical Analysis Report')[:100]
 
-        # Create initial chat history
-        initial_chat_data = {
-            "user_id": user_id,
-            "document_id": presales["document_id"],
-            "message": [
+        # Check if presales already has a chat_history_id (from when presales was created)
+        existing_chat_history_id = analysis_link.get("chat_history_id") if analysis_link else None
+
+        if existing_chat_history_id:
+            # Presales already has a chat history - append full report to existing conversation
+            logger.info(f"Appending full report to existing chat_history: {existing_chat_history_id}")
+
+            # Get existing messages from the chat history
+            existing_chat = await get_single_user_chat_history(
+                chat_history_id=existing_chat_history_id,
+                user_id=user_id,
+                db=db
+            )
+
+            existing_messages_raw = existing_chat.get("message", []) if existing_chat else []
+            # Parse JSON string if needed (database stores as JSON string)
+            if isinstance(existing_messages_raw, str):
+                try:
+                    existing_messages = json.loads(existing_messages_raw)
+                except json.JSONDecodeError:
+                    existing_messages = []
+            else:
+                existing_messages = existing_messages_raw if isinstance(existing_messages_raw, list) else []
+
+            # Append the full report message
+            updated_messages = existing_messages + [
                 {
                     "role": "assistant",
                     "content": agent_response_message,
                     "timestamp": datetime.now().isoformat(),
+                    "type": "full_report",
                     "selected": True
                 }
-            ],
-            "title": document_title
-        }
+            ]
 
-        save_chat = await save_chat_history(chat=initial_chat_data, db=db)
-        chat_history_id = save_chat["chat_history_id"]
-        logger.info(f"Created chat history: {chat_history_id}")
+            # Update the chat history with appended message
+            updated_chat_data = {
+                "chat_history_id": existing_chat_history_id,
+                "user_id": user_id,
+                "document_id": presales["document_id"],
+                "message": updated_messages,
+                "title": document_title  # Update title to reflect full report
+            }
 
-        # Update analysis link with full report
+            await save_chat_history(chat=updated_chat_data, db=db)
+            chat_history_id = existing_chat_history_id
+            logger.info(f"Appended full report to existing chat history: {chat_history_id}")
+
+        else:
+            # No existing chat history (legacy presales) - create new one
+            logger.info(f"Creating new chat history for presales: {presales_id}")
+
+            initial_chat_data = {
+                "user_id": user_id,
+                "document_id": presales["document_id"],
+                "message": [
+                    {
+                        "role": "assistant",
+                        "content": agent_response_message,
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "full_report",
+                        "selected": True
+                    }
+                ],
+                "title": document_title
+            }
+
+            save_chat = await save_chat_history(chat=initial_chat_data, db=db)
+            chat_history_id = save_chat["chat_history_id"]
+            logger.info(f"Created new chat history: {chat_history_id}")
+
+        # Update analysis link with full report (marks as generated)
         await update_analysis_link_with_full_report(
             presales_id=presales_id,
             chat_history_id=chat_history_id,
@@ -1015,23 +1117,29 @@ async def presales_chat(
     db: Session = Depends(get_db)
 ):
     """
-    Chat with the pre-sales analysis to get clarifications.
+    Enhanced chat with the pre-sales analysis.
 
-    This allows pre-sales teams to:
-    - Ask clarifying questions about the brief
-    - Get more details on specific risks or blockers
-    - Understand recommendations better
+    Features:
+    - Conversation history persistence
+    - Reference lookup (P1-1, Q3, etc.)
+    - Answer capture from chat messages
+    - Modification tracking
 
     Args:
         presales_id: The pre-sales analysis ID
         message: The user's question/message
 
     Returns:
-        AI response about the pre-sales analysis
+        AI response with action metadata
     """
-    from utils.presales_prompts import PRESALES_CHAT_CONTEXT_PROMPT
+    from utils.presales_prompts import (
+        PRESALES_CHAT_ENHANCED_PROMPT,
+        PRESALES_CHAT_ROUTER_PROMPT
+    )
     from langchain_openai import ChatOpenAI
     from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+    import re
 
     user_id = current_token["regular_login_token"]["id"]
     logger.info(f"Presales chat for presales_id: {presales_id}, message: {message[:100]}...")
@@ -1046,40 +1154,221 @@ async def presales_chat(
                 detail=f"Pre-sales analysis not found: {presales_id}"
             )
 
+        # Get the linked chat_history_id from analysis_link
+        analysis_link = await get_analysis_link_by_presales_id(
+            presales_id=presales_id,
+            user_id=user_id,
+            db=db
+        )
+
+        chat_history_id = analysis_link.get("chat_history_id") if analysis_link else None
+        document_id = presales.get("document_id")
+
+        # Load existing conversation history
+        conversation_history = []
+        if chat_history_id:
+            try:
+                existing_chat = await get_single_user_chat_history(
+                    user_id=user_id,
+                    chat_history_id=chat_history_id,
+                    db=db
+                )
+                if existing_chat and existing_chat.get("message"):
+                    messages_raw = existing_chat.get("message", [])
+                    if isinstance(messages_raw, str):
+                        conversation_history = json.loads(messages_raw)
+                    else:
+                        conversation_history = messages_raw
+                    # Filter to only chat messages (exclude initial presales_brief)
+                    conversation_history = [
+                        msg for msg in conversation_history
+                        if msg.get("type") not in ["presales_brief", "full_report"]
+                    ]
+            except Exception as e:
+                logger.warning(f"Could not load conversation history: {str(e)}")
+                conversation_history = []
+
         # Build context from presales analysis
         presales_brief = presales.get("presales_brief", "")
-        scanned_requirements = json.dumps(presales.get("extracted_requirements", {}), indent=2)
-        technology_risks = json.dumps(presales.get("technology_risks", []), indent=2)
+        p1_blockers = presales.get("p1_blockers", [])
+        kickstart_questions = presales.get("kickstart_questions", [])
+        technology_risks = presales.get("technology_risks", [])
+        scanned_requirements = presales.get("extracted_requirements", {})
+
+        # Get questions with answers from database
+        try:
+            questions_list = await get_presales_questions(presales_id=presales_id, db=db, user_id=user_id)
+            # get_presales_questions returns a list directly
+            if not isinstance(questions_list, list):
+                questions_list = []
+        except Exception as e:
+            logger.warning(f"Could not load questions: {str(e)}")
+            questions_list = []
+
+        # Detect referenced items (P1-1, Q3, etc.)
+        referenced_item = None
+        referenced_item_content = None
+
+        # Check for P1 blocker references
+        p1_match = re.search(r'P1-?(\d+)', message, re.IGNORECASE)
+        if p1_match:
+            p1_num = int(p1_match.group(1))
+            if p1_blockers and 0 < p1_num <= len(p1_blockers):
+                referenced_item = f"P1-{p1_num}"
+                referenced_item_content = json.dumps(p1_blockers[p1_num - 1], indent=2)
+                logger.info(f"Detected P1 blocker reference: {referenced_item}")
+
+        # Check for kickstart question references
+        q_match = re.search(r'(?:Q|question\s*)(\d+)', message, re.IGNORECASE)
+        if q_match and not referenced_item:
+            q_num = int(q_match.group(1))
+            if kickstart_questions and 0 < q_num <= len(kickstart_questions):
+                referenced_item = f"Q{q_num}"
+                referenced_item_content = json.dumps(kickstart_questions[q_num - 1], indent=2)
+                logger.info(f"Detected kickstart question reference: {referenced_item}")
+
+        # Detect if user is providing an answer
+        answer_detected = None
+        answer_patterns = [
+            r'(?:for|regarding|about)\s+(?:P1-?|Q)(\d+)[,:]?\s+(.+)',
+            r'(?:the\s+)?answer\s+(?:to|for)\s+(?:P1-?|Q|question\s*)(\d+)\s+is[:\s]+(.+)',
+            r'(?:P1-?|Q)(\d+)[:\s]+(.+?)(?:$|\.|,)',
+        ]
+
+        for pattern in answer_patterns:
+            match = re.search(pattern, message, re.IGNORECASE | re.DOTALL)
+            if match:
+                q_ref = match.group(1)
+                answer_content = match.group(2).strip()
+                if answer_content and len(answer_content) > 5:  # Minimum answer length
+                    # Determine if it's P1 or Q
+                    if 'p1' in message.lower():
+                        answer_detected = {"reference": f"P1-{q_ref}", "answer": answer_content}
+                    else:
+                        answer_detected = {"reference": f"Q{q_ref}", "answer": answer_content}
+                    logger.info(f"Detected answer: {answer_detected}")
+                    break
+
+        # Save detected answer to database
+        answer_saved = False
+        if answer_detected:
+            try:
+                # Find the question_id for this reference
+                ref = answer_detected["reference"]
+                for q in questions_list:
+                    if q.get("question_number") == ref:
+                        await save_question_answer(
+                            question_id=q["question_id"],
+                            answer=answer_detected["answer"],
+                            db=db
+                        )
+                        answer_saved = True
+                        logger.info(f"Saved answer for {ref}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not save answer: {str(e)}")
+
+        # Format conversation history for prompt
+        history_text = "No previous messages in this conversation."
+        if conversation_history:
+            history_lines = []
+            for msg in conversation_history[-10:]:  # Last 10 messages
+                role = msg.get("role", "unknown").capitalize()
+                content = msg.get("content", "")[:500]  # Truncate long messages
+                history_lines.append(f"**{role}**: {content}")
+            history_text = "\n\n".join(history_lines)
 
         # Create the chat prompt
-        prompt = ChatPromptTemplate.from_template(PRESALES_CHAT_CONTEXT_PROMPT)
-
-        # Use fast model for chat responses
         llm = ChatOpenAI(
             api_key=settings.OPENAI_CHATGPT,
-            model=settings.GENERATING_REPORT_MODEL,
+            model=settings.SUMMARIZATION_MODEL,  # Use faster model for chat
             temperature=0.3,
             request_timeout=60
         )
 
-        chain = prompt | llm
+        prompt = ChatPromptTemplate.from_template(PRESALES_CHAT_ENHANCED_PROMPT)
+        chain = prompt | llm | StrOutputParser()
 
         # Get response
-        response = await chain.ainvoke({
-            "presales_brief": presales_brief,
-            "scanned_requirements": scanned_requirements,
-            "technology_risks": technology_risks,
-            "user_message": message
+        response_content = await chain.ainvoke({
+            "presales_brief": presales_brief[:3000],  # Truncate for context window
+            "p1_blockers": json.dumps(p1_blockers, indent=2),
+            "kickstart_questions": json.dumps(kickstart_questions, indent=2),
+            "technology_risks": json.dumps(technology_risks, indent=2),
+            "scanned_requirements": json.dumps(scanned_requirements, indent=2)[:2000],
+            "conversation_history": history_text,
+            "user_message": message,
+            "referenced_item": referenced_item_content or "No specific item referenced."
         })
 
-        response_content = response.content if hasattr(response, 'content') else str(response)
+        # If answer was saved, append confirmation to response
+        if answer_saved and answer_detected:
+            response_content += f"\n\n✅ **Answer recorded** for {answer_detected['reference']}: \"{answer_detected['answer'][:100]}{'...' if len(answer_detected['answer']) > 100 else ''}\""
+
         logger.info(f"Presales chat response generated, length: {len(response_content)}")
+
+        # Save conversation to chat history
+        if chat_history_id:
+            try:
+                # Append new messages to existing history
+                new_messages = [
+                    {
+                        "role": "user",
+                        "content": message,
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "chat"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": response_content,
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "chat"
+                    }
+                ]
+
+                # Get full message list including initial presales_brief message
+                all_messages = []
+                if conversation_history:
+                    # Re-fetch to get all messages including presales_brief
+                    existing_chat = await get_single_user_chat_history(
+                        user_id=user_id,
+                        chat_history_id=chat_history_id,
+                        db=db
+                    )
+                    if existing_chat and existing_chat.get("message"):
+                        msgs = existing_chat.get("message", [])
+                        if isinstance(msgs, str):
+                            all_messages = json.loads(msgs)
+                        else:
+                            all_messages = msgs
+
+                all_messages.extend(new_messages)
+
+                # Save updated conversation
+                await save_chat_history(
+                    chat={
+                        "chat_history_id": chat_history_id,
+                        "user_id": user_id,
+                        "document_id": document_id,
+                        "message": all_messages
+                    },
+                    db=db
+                )
+                logger.info(f"Saved conversation to chat_history_id: {chat_history_id}")
+            except Exception as e:
+                logger.warning(f"Could not save conversation history: {str(e)}")
 
         return {
             "presales_id": presales_id,
+            "chat_history_id": chat_history_id,
             "user_message": message,
             "assistant_message": response_content,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "action": {
+                "referenced_item": referenced_item,
+                "answer_detected": answer_detected,
+                "answer_saved": answer_saved
+            }
         }
 
     except HTTPException:
@@ -1991,6 +2280,176 @@ async def conversation_with_doc_v2(
                 "has_conflicts": len(conflicts) > 0,
                 "latest_change_id": change_id
             }
+
+        # ============================================================
+        # UNDO/ROLLBACK ACTIONS
+        # ============================================================
+
+        # Handle undo_last_change action
+        elif action == "undo_last_change":
+            logger.info("Processing undo_last_change action")
+            try:
+                result = await remove_last_pending_change(chat_context["chat_history_id"], db)
+
+                if result["status"] == "no_changes":
+                    llm_response = "**No Changes to Undo**\n\nThere are no pending changes to undo. Your current report has no uncommitted modifications."
+                else:
+                    removed = result["removed_change"]
+                    remaining = result["remaining_count"]
+                    llm_response = f"""**Change Undone** ↩️
+
+**Removed:** {removed.get('user_request', 'Unknown change')}
+**Change ID:** {removed.get('id', 'N/A')}
+
+**Remaining pending changes:** {remaining}
+
+{f"When ready, say **'regenerate report'** to apply the remaining changes." if remaining > 0 else "No pending changes remaining."}"""
+
+                pending_changes_info = {
+                    "total_pending": result["remaining_count"],
+                    "has_conflicts": False,
+                    "undone_change": result.get("removed_change")
+                }
+                logger.info(f"Undid last change, remaining: {result['remaining_count']}")
+            except Exception as e:
+                logger.error(f"Error undoing last change: {str(e)}")
+                llm_response = f"I encountered an error while trying to undo the last change: {str(e)}"
+
+        # Handle undo_specific_change action
+        elif action == "undo_specific_change":
+            logger.info("Processing undo_specific_change action")
+            # Extract change ID from user message (e.g., CHG-001, CHG-002)
+            import re
+            change_id_match = re.search(r'CHG-(\d+)', user_message, re.IGNORECASE)
+
+            if change_id_match:
+                change_id = f"CHG-{change_id_match.group(1).zfill(3)}"
+                try:
+                    result = await remove_pending_change(chat_context["chat_history_id"], change_id, db)
+                    llm_response = f"""**Change Removed** ↩️
+
+**Removed Change ID:** {change_id}
+
+**Remaining pending changes:** {result['remaining_count']}
+
+{f"When ready, say **'regenerate report'** to apply the remaining changes." if result['remaining_count'] > 0 else "No pending changes remaining."}"""
+
+                    pending_changes_info = {
+                        "total_pending": result["remaining_count"],
+                        "has_conflicts": False,
+                        "removed_change_id": change_id
+                    }
+                    logger.info(f"Removed specific change {change_id}")
+                except HTTPException as he:
+                    if he.status_code == 404:
+                        llm_response = f"**Change Not Found**\n\nI couldn't find a pending change with ID **{change_id}**. Use **'show pending changes'** to see all available changes."
+                    else:
+                        raise
+                except Exception as e:
+                    logger.error(f"Error removing change {change_id}: {str(e)}")
+                    llm_response = f"I encountered an error while trying to remove change {change_id}: {str(e)}"
+            else:
+                # No change ID found, show pending changes instead
+                pending_changes = await get_pending_changes(chat_context["chat_history_id"], db)
+                if pending_changes:
+                    changes_list = "\n".join([f"- **{c.get('id')}**: {c.get('user_request', 'Unknown')}" for c in pending_changes])
+                    llm_response = f"""**Which change would you like to remove?**
+
+Please specify a change ID (e.g., "remove CHG-001").
+
+**Current Pending Changes:**
+{changes_list}"""
+                else:
+                    llm_response = "**No Pending Changes**\n\nThere are no pending changes to remove."
+
+        # Handle clear_all_changes action
+        elif action == "clear_all_changes":
+            logger.info("Processing clear_all_changes action")
+            try:
+                # First get current changes for logging
+                current_changes = await get_pending_changes(chat_context["chat_history_id"], db)
+                cleared_count = len(current_changes)
+
+                if cleared_count == 0:
+                    llm_response = "**No Pending Changes**\n\nThere are no pending changes to clear. Your report is clean."
+                else:
+                    result = await clear_pending_changes(chat_context["chat_history_id"], db)
+                    llm_response = f"""**All Changes Cleared** 🗑️
+
+**Removed:** {cleared_count} pending change(s)
+
+Your report is now back to the last generated version. Any modifications you previously requested have been discarded.
+
+Feel free to start fresh with new modification requests."""
+
+                pending_changes_info = {
+                    "total_pending": 0,
+                    "has_conflicts": False,
+                    "cleared_count": cleared_count
+                }
+                logger.info(f"Cleared all pending changes, count: {cleared_count}")
+            except Exception as e:
+                logger.error(f"Error clearing pending changes: {str(e)}")
+                llm_response = f"I encountered an error while trying to clear all changes: {str(e)}"
+
+        # Handle show_pending_changes action
+        elif action == "show_pending_changes":
+            logger.info("Processing show_pending_changes action")
+            try:
+                pending_changes = await get_pending_changes(chat_context["chat_history_id"], db)
+
+                if not pending_changes:
+                    llm_response = """**No Pending Changes**
+
+Your report has no uncommitted modifications. The current version is up to date.
+
+To make changes, you can:
+- Request architecture changes (e.g., "Use PostgreSQL instead of MongoDB")
+- Modify requirements (e.g., "Add real-time notification support")
+- Correct assumptions (e.g., "We're using AWS, not Azure")"""
+                else:
+                    # Format changes list
+                    changes_list = []
+                    for i, change in enumerate(pending_changes, 1):
+                        change_id = change.get('id', f'CHG-{i:03d}')
+                        change_type = change.get('type', 'unknown').replace('_', ' ').title()
+                        request = change.get('user_request', 'Unknown change')
+                        timestamp = change.get('timestamp', 'N/A')
+                        affected = ', '.join(change.get('affected_sections', []))
+
+                        changes_list.append(f"""**{i}. {change_id}** ({change_type})
+   - Request: {request}
+   - Affects: {affected}
+   - Added: {timestamp[:16] if len(timestamp) > 16 else timestamp}""")
+
+                    # Check for conflicts
+                    conflicts = detect_conflicts(pending_changes)
+                    conflict_warning = ""
+                    if conflicts:
+                        conflict_warning = f"\n\n⚠️ **Warning:** {len(conflicts)} potential conflict(s) detected. Please review before regenerating."
+
+                    llm_response = f"""**Pending Changes** ({len(pending_changes)})
+{conflict_warning}
+
+{chr(10).join(changes_list)}
+
+---
+
+**Actions:**
+- Say **"regenerate report"** to apply all changes
+- Say **"undo last change"** to remove the most recent change
+- Say **"remove CHG-XXX"** to remove a specific change
+- Say **"clear all changes"** to discard all modifications"""
+
+                pending_changes_info = {
+                    "total_pending": len(pending_changes),
+                    "has_conflicts": len(detect_conflicts(pending_changes)) > 0 if pending_changes else False,
+                    "changes": pending_changes
+                }
+                logger.info(f"Showed {len(pending_changes)} pending changes")
+            except Exception as e:
+                logger.error(f"Error getting pending changes: {str(e)}")
+                llm_response = f"I encountered an error while retrieving pending changes: {str(e)}"
 
         # Handle regenerate_full_report action
         elif action == "regenerate_full_report":

@@ -198,6 +198,7 @@ const Dashboard: React.FC = () => {
   // Presales-specific state
   const [showKickstartPanel, setShowKickstartPanel] = useState(false);
   const [kickstartAnswers, setKickstartAnswers] = useState<Record<string, string>>({});
+  const [additionalContext, setAdditionalContext] = useState<string>('');
   const [isSavingAnswers, setIsSavingAnswers] = useState(false);
   const [isPresalesChatting, setIsPresalesChatting] = useState(false);
   const [selectedJiraIssue, setSelectedJiraIssue] = useState<string | null>(null);
@@ -215,6 +216,9 @@ const Dashboard: React.FC = () => {
     can_generate_report: boolean;
   } | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  // Pending changes state for full report chat
+  const [pendingChangesCount, setPendingChangesCount] = useState(0);
+  const [hasConflicts, setHasConflicts] = useState(false);
   // Add a debounce tracking variable
   const refreshInProgress = useRef(false);
   const refreshTimeout = useRef<number | null>(null);
@@ -281,17 +285,17 @@ const Dashboard: React.FC = () => {
     try {
       const timestamp = new Date().getTime();
       console.log(`Starting fetchConversations at timestamp: ${timestamp}`);
-      
+
       // Get the token for authentication
-      const token = localStorage.getItem('token') || 
-                  localStorage.getItem('regular_token') || 
+      const token = localStorage.getItem('token') ||
+                  localStorage.getItem('regular_token') ||
                   localStorage.getItem('google_auth_token');
-      
+
       if (!token) {
         console.error("No token found");
         return;
       }
-      
+
       // Set the authorization header explicitly and add cache-busting parameter
       const response = await axios.get(`${API_URL}/chat?_t=${timestamp}`, {
         headers: {
@@ -525,7 +529,8 @@ const Dashboard: React.FC = () => {
       const documentId = uploadResponse.data.document_id;
       const analysisMode = uploadResponse.data.analysis_mode || 'full';
       const isPresales = analysisMode === 'presales';
-      const chatHistoryId = isPresales ? null : (uploadResponse.data.chat_history_id || documentId);
+      // Presales now also creates chat_history_id for sidebar visibility
+      const chatHistoryId = uploadResponse.data.chat_history_id || documentId;
       const chatTitle = uploadResponse.data.title || `Analysis of ${files[0].name}`;
       const presalesId = uploadResponse.data.presales_id;
 
@@ -555,12 +560,12 @@ const Dashboard: React.FC = () => {
 
       // Create a new conversation with the document info from the API response
       const newConversation: Conversation = {
-        id: isPresales ? presalesId : chatHistoryId,  // Use presales_id or chat_history_id as the ID
+        id: chatHistoryId,  // Use chat_history_id as the ID (now created for both presales and full)
         title: chatTitle,
         created_at: new Date().toISOString(),
         messages: [initialMessage],
         document_id: documentId || '',
-        chat_history_id: chatHistoryId,  // null for presales mode
+        chat_history_id: chatHistoryId,
         modified_at: new Date().toISOString(),
         analysis_mode: analysisMode,
         presales_id: presalesId,
@@ -571,16 +576,15 @@ const Dashboard: React.FC = () => {
 
       setActiveConversation(newConversation);
 
-      // Reset kickstart answers when new presales analysis starts
+      // Reset kickstart answers and additional context when new presales analysis starts
       if (isPresales) {
         setKickstartAnswers({});
+        setAdditionalContext('');
         setShowKickstartPanel(true);  // Auto-show the panel for presales
       }
 
-      // Only refresh conversations list for full analysis (presales doesn't create chat history)
-      if (!isPresales) {
-        fetchConversations();
-      }
+      // Refresh conversations list - presales now also creates chat history
+      fetchConversations();
       
       // Reset file state
       setFiles([]);
@@ -611,83 +615,182 @@ const Dashboard: React.FC = () => {
     setTimeout(autoResizeTextarea, 0);
   };
 
-  // Improved selectConversation function with proper loading and parsing
+  // Optimized selectConversation function with parallel API calls
   const selectConversation = async (chatHistoryId: string) => {
     try {
       setIsLoadingConversation(true);
       setError('');
-      
-      // Get the authentication token
-      const token = localStorage.getItem('token') || 
-                   localStorage.getItem('regular_token') || 
+      setShowUploadUI(false);
+      setPendingChangesCount(0);
+      setHasConflicts(false);
+
+      const token = localStorage.getItem('token') ||
+                   localStorage.getItem('regular_token') ||
                    localStorage.getItem('google_auth_token');
-      
+
       if (!token) {
         throw new Error("No authentication token found");
       }
-      
-      // Fetch the specific conversation
+
+      const authHeaders = { 'Authorization': `Bearer ${token}` };
+
+      // Step 1: Fetch the main conversation (required first)
       const response = await axios.get(`${API_URL}/chat/${chatHistoryId}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
+        headers: authHeaders
       });
-      
-      if (response.data && response.data.user_details) {
-        const details = response.data.user_details;
-        
-        // Parse the messages array from the string
-        let messages: Message[] = [];
 
-        try {
-          // Handle message parsing with error checking
-          if (typeof details.message === 'string') {
-            messages = JSON.parse(details.message);
-          } else if (Array.isArray(details.message)) {
-            messages = details.message;
-            } else {
-            console.error("Unexpected message format:", details.message);
-            messages = [];
-          }
-        } catch (e) {
-          console.error("Error parsing messages:", e);
-          messages = [];
-        }
-
-        // Add IDs to messages and preserve selection state from backend
-        const messagesWithIds = messages.map((msg, index) => ({
-          ...msg,
-          id: msg.id || `msg-${index}-${Date.now()}`,
-          selected: msg.selected ?? true  // Use backend's selected state, default to true if not present
-        }));
-
-        // Set up selectedMessageIds based on the selected field from backend
-        const selectedIds = messagesWithIds
-          .filter(msg => msg.selected)
-          .map(msg => msg.id!)
-          .filter((id): id is string => id !== undefined);
-
-        setSelectedMessageIds(selectedIds);
-
-        // Create a conversation object with the full data
-        const conversation: Conversation = {
-          id: details.chat_history_id,
-          title: details.title,
-          created_at: details.modified_at,
-          messages: messagesWithIds,
-          document_id: details.document_id || '',
-          chat_history_id: details.chat_history_id,
-          modified_at: details.modified_at
-        };
-
-        setActiveConversation(conversation);
-        
-        // Auto-close sidebar on mobile
-        if (isMobile && sidebarExpanded) {
-          setSidebarExpanded(false);
-        }
-            } else {
+      if (!response.data?.user_details) {
         throw new Error("Invalid response format");
+      }
+
+      const details = response.data.user_details;
+
+      // Parse messages
+      let messages: Message[] = [];
+      try {
+        if (typeof details.message === 'string') {
+          messages = JSON.parse(details.message);
+        } else if (Array.isArray(details.message)) {
+          messages = details.message;
+        }
+      } catch (e) {
+        console.error("Error parsing messages:", e);
+      }
+
+      const messagesWithIds = messages.map((msg, index) => ({
+        ...msg,
+        id: msg.id || `msg-${index}-${Date.now()}`,
+        selected: msg.selected ?? true
+      }));
+
+      const selectedIds = messagesWithIds
+        .filter(msg => msg.selected)
+        .map(msg => msg.id!)
+        .filter((id): id is string => id !== undefined);
+      setSelectedMessageIds(selectedIds);
+
+      // Check for presales_id in messages
+      const presalesMessage = messagesWithIds.find(
+        (msg: any) => msg.type === 'presales_brief' || msg.presales_id
+      );
+      let presalesId = presalesMessage?.presales_id;
+
+      // Create base conversation object
+      let conversation: Conversation = {
+        id: details.chat_history_id,
+        title: details.title,
+        created_at: details.modified_at,
+        messages: messagesWithIds,
+        document_id: details.document_id || '',
+        chat_history_id: details.chat_history_id,
+        modified_at: details.modified_at,
+        analysis_mode: presalesId ? 'presales' : 'full',
+        presales_id: presalesId
+      };
+
+      // Step 2: Fetch additional data in PARALLEL based on conversation type
+      if (presalesId || details.document_id) {
+        // For presales or potential presales: fetch presales data and questions in parallel
+        const parallelRequests: Promise<any>[] = [];
+
+        // Always try to fetch presales data if we have document_id
+        if (details.document_id) {
+          parallelRequests.push(
+            axios.get(`${API_URL}/presales/${details.document_id}`, {
+              headers: authHeaders
+            }).catch(() => null) // Don't fail if presales doesn't exist
+          );
+        }
+
+        // If we already know it's presales, also fetch questions in parallel
+        if (presalesId) {
+          parallelRequests.push(
+            axios.get(`${API_URL}/presales/${presalesId}/questions`, {
+              headers: authHeaders
+            }).catch(() => null)
+          );
+        }
+
+        // Execute all requests in parallel
+        const [presalesResponse, questionsResponse] = await Promise.all(parallelRequests);
+
+        // Process presales data
+        const presalesData = presalesResponse?.data;
+        if (presalesData?.presales_id) {
+          presalesId = presalesData.presales_id;
+          conversation = {
+            ...conversation,
+            presales_id: presalesId,
+            analysis_mode: 'presales',
+            presales_brief: presalesData.presales_brief,
+            p1_blockers: presalesData.p1_blockers || [],
+            kickstart_questions: presalesData.kickstart_questions || [],
+            blind_spots: presalesData.blind_spots,
+            extracted_requirements: presalesData.extracted_requirements
+          };
+          setShowKickstartPanel(true);
+
+          // Process questions if we got them, otherwise fetch now
+          let questionsData = questionsResponse?.data;
+          if (!questionsData && presalesId) {
+            // Questions weren't fetched in parallel (presalesId was discovered), fetch now
+            try {
+              const qRes = await axios.get(`${API_URL}/presales/${presalesId}/questions`, {
+                headers: authHeaders
+              });
+              questionsData = qRes.data;
+            } catch (e) {
+              console.log('Could not load questions');
+            }
+          }
+
+          // Process saved answers
+          if (questionsData?.questions) {
+            const savedAnswers: Record<string, string> = {};
+            questionsData.questions.forEach((q: any) => {
+              if (q.answer) {
+                const qNum = q.question_number || '';
+                if (qNum.startsWith('P1-')) {
+                  const num = parseInt(qNum.replace('P1-', '')) - 1;
+                  savedAnswers[`p1_${num}`] = q.answer;
+                } else if (qNum.startsWith('Q')) {
+                  const num = parseInt(qNum.replace('Q', '')) - 1;
+                  savedAnswers[`question_${num}`] = q.answer;
+                }
+              }
+            });
+            setKickstartAnswers(savedAnswers);
+          } else {
+            setKickstartAnswers({});
+          }
+        } else {
+          // Not a presales conversation
+          setShowKickstartPanel(false);
+          setKickstartAnswers({});
+
+          // Fetch pending changes for full report conversations (non-blocking)
+          if (conversation.chat_history_id) {
+            axios.get(`${API_URL}/pending-changes/${conversation.chat_history_id}`, {
+              headers: authHeaders
+            }).then(pendingResponse => {
+              if (pendingResponse.data) {
+                setPendingChangesCount(pendingResponse.data.total_pending || 0);
+                setHasConflicts(pendingResponse.data.has_conflicts || false);
+              }
+            }).catch(() => {
+              // Silently fail
+            });
+          }
+        }
+      } else {
+        setShowKickstartPanel(false);
+        setKickstartAnswers({});
+      }
+
+      setActiveConversation(conversation);
+
+      if (isMobile && sidebarExpanded) {
+        setSidebarExpanded(false);
       }
     } catch (error) {
       console.error('Error loading conversation:', error);
@@ -814,6 +917,27 @@ const Dashboard: React.FC = () => {
           ...updatedConversation,
           messages: finalMessages
         });
+
+        // Handle pending changes info from response
+        if (response.data.pending_changes) {
+          const pendingInfo = response.data.pending_changes;
+          setPendingChangesCount(pendingInfo.total_pending || 0);
+          setHasConflicts(pendingInfo.has_conflicts || false);
+
+          // Show toast notifications for undo/clear actions
+          if (pendingInfo.undone_change) {
+            toast.success('Change undone successfully');
+          }
+          if (pendingInfo.cleared_count !== undefined && pendingInfo.cleared_count > 0) {
+            toast.success(`Cleared ${pendingInfo.cleared_count} pending change(s)`);
+          }
+        }
+
+        // Handle action info for notifications
+        const actionType = response.data.action;
+        if (actionType === 'modify_requirements' || actionType === 'modify_architecture' || actionType === 'correct_assumptions') {
+          toast.success('Change tracked. Say "regenerate report" when ready.');
+        }
 
         // STEP 2: Save the updated conversation to the /chat endpoint with ALL messages
         // Clean messages for API (remove IDs but keep selected state)
@@ -1969,6 +2093,12 @@ const Dashboard: React.FC = () => {
         console.log(`Generating report with ${assumptionsToUse.length} assumptions`);
       }
 
+      // Include additional context if provided
+      if (additionalContext.trim()) {
+        formData.append('additional_context', additionalContext.trim());
+        console.log('Including additional context in report generation');
+      }
+
       // Call the generate-full-report endpoint
       const response = await axios.post(`${API_URL}/generate-full-report/`, formData, {
         headers: {
@@ -2006,6 +2136,7 @@ const Dashboard: React.FC = () => {
         // Reset presales-specific state
         setShowKickstartPanel(false);
         setKickstartAnswers({});
+        setAdditionalContext('');
 
         // Mark data as changed and refresh sidebar
         dataChanged.current = true;
@@ -2113,6 +2244,48 @@ const Dashboard: React.FC = () => {
         };
       });
 
+      // Handle action metadata from enhanced presales chat
+      const actionData = response.data.action;
+      if (actionData) {
+        // If an answer was saved from chat, show notification and refresh questions
+        if (actionData.answer_saved) {
+          const detectedAnswer = actionData.answer_detected;
+          toast.success(`Answer captured for ${detectedAnswer?.question_ref || 'question'}`);
+
+          // Refresh questions to show the updated answer
+          try {
+            const questionsResponse = await axios.get(
+              `${API_URL}/presales/${activeConversation.presales_id}/questions`,
+              {
+                headers: {
+                  'Authorization': `Bearer ${token}`
+                }
+              }
+            );
+
+            if (questionsResponse.data?.questions) {
+              setPresalesQuestions(questionsResponse.data.questions);
+
+              // Update kickstartAnswers state with the new answer
+              const updatedAnswers = { ...kickstartAnswers };
+              questionsResponse.data.questions.forEach((q: PresalesQuestion) => {
+                if (q.answer) {
+                  updatedAnswers[q.question_id] = q.answer;
+                }
+              });
+              setKickstartAnswers(updatedAnswers);
+            }
+          } catch (refreshError) {
+            console.error('Error refreshing questions after answer capture:', refreshError);
+          }
+        }
+
+        // If a reference was detected, log it for debugging
+        if (actionData.referenced_item) {
+          console.log('Referenced item in chat:', actionData.referenced_item);
+        }
+      }
+
       // Scroll to bottom
       setTimeout(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -2137,7 +2310,13 @@ const Dashboard: React.FC = () => {
 
   // Handle saving answers and running analysis
   const handleSaveAndAnalyze = async () => {
-    if (!activeConversation?.presales_id) return;
+    console.log('handleSaveAndAnalyze called');
+    console.log('presales_id:', activeConversation?.presales_id);
+
+    if (!activeConversation?.presales_id) {
+      console.log('No presales_id, returning early');
+      return;
+    }
 
     setIsAnalyzing(true);
 
@@ -2146,6 +2325,8 @@ const Dashboard: React.FC = () => {
                     localStorage.getItem('regular_token') ||
                     localStorage.getItem('google_auth_token');
 
+      console.log('Token found:', !!token);
+
       if (!token) {
         toast.error('Authentication token not found. Please log in again.');
         return;
@@ -2153,19 +2334,29 @@ const Dashboard: React.FC = () => {
 
       // First, save the answers if there are any
       if (Object.keys(kickstartAnswers).length > 0) {
-        await axios.post(
-          `${API_URL}/presales/${activeConversation.presales_id}/questions/answers`,
-          { answers: JSON.stringify(kickstartAnswers) },
-          {
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
+        console.log('Saving answers first...', kickstartAnswers);
+        try {
+          await axios.post(
+            `${API_URL}/presales/${activeConversation.presales_id}/questions/answers`,
+            { answers: JSON.stringify(kickstartAnswers) },
+            {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+              }
             }
-          }
-        );
+          );
+          console.log('Answers saved successfully');
+        } catch (saveError) {
+          console.error('Error saving answers:', saveError);
+          throw saveError;
+        }
+      } else {
+        console.log('No answers to save, skipping to analyze');
       }
 
       // Then run analysis
+      console.log('Starting analysis request to:', `${API_URL}/presales/${activeConversation.presales_id}/analyze`);
       const response = await axios.post(
         `${API_URL}/presales/${activeConversation.presales_id}/analyze`,
         {},
@@ -2175,6 +2366,7 @@ const Dashboard: React.FC = () => {
           }
         }
       );
+      console.log('Analysis response received:', response.data);
 
       // Store analysis result
       setAnalysisResult({
@@ -2427,10 +2619,11 @@ const Dashboard: React.FC = () => {
   return (
     <div className="h-screen overflow-hidden flex flex-col bg-gradient-to-br from-[#0f0c29] via-[#302b63] to-[#24243e] text-white">
       {/* Use the modular Sidebar component */}
-      <Sidebar 
+      <Sidebar
         expanded={sidebarExpanded}
         toggleExpanded={() => setSidebarExpanded(!sidebarExpanded)}
         onSelectConversation={handleSelectConversation}
+        onSelectConversationById={selectConversation}
         onNewChat={handleNewChat}
         logout={handleLogout}
         isMobile={isMobile}
@@ -2556,6 +2749,26 @@ const Dashboard: React.FC = () => {
                 {/* Chat input - only shown when conversation is active, not in upload mode, and NOT in presales mode */}
                 {activeConversation && !showUploadUI && activeConversation.analysis_mode !== 'presales' && (
                   <div className="flex-none p-2 md:p-4 border-t border-white/10 bg-indigo-950/50">
+                    {/* Pending changes indicator */}
+                    {pendingChangesCount > 0 && (
+                      <div className={`mb-2 px-3 py-2 rounded-lg text-xs flex items-center justify-between
+                        ${hasConflicts
+                          ? 'bg-yellow-500/20 border border-yellow-500/30 text-yellow-300'
+                          : 'bg-blue-500/20 border border-blue-500/30 text-blue-300'}`}>
+                        <div className="flex items-center gap-2">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          <span>
+                            <strong>{pendingChangesCount}</strong> pending change{pendingChangesCount !== 1 ? 's' : ''}
+                            {hasConflicts && <span className="ml-1 text-yellow-400">(has conflicts)</span>}
+                          </span>
+                        </div>
+                        <span className="text-gray-400">
+                          Say "regenerate report" to apply • "show pending changes" to review • "undo" to remove
+                        </span>
+                      </div>
+                    )}
                     <div className="relative">
                       <textarea
                         value={message}
@@ -2883,8 +3096,38 @@ const Dashboard: React.FC = () => {
                           </div>
                         )}
 
+                        {/* Additional Context Section */}
+                        <div className="mt-4 pt-4 border-t border-white/10">
+                          <h5 className="text-xs font-semibold text-blue-400 mb-2 flex items-center">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            Additional Context (Optional)
+                          </h5>
+                          <p className="text-xs text-gray-400 mb-2">
+                            Add notes from client calls, emails, or any requirements not covered above. This will be included in the full report.
+                          </p>
+                          <textarea
+                            placeholder="e.g., Client mentioned they prefer open-source solutions, cost optimization is a priority, they have existing AWS infrastructure..."
+                            value={additionalContext}
+                            onChange={(e) => setAdditionalContext(e.target.value)}
+                            className="w-full px-3 py-2 bg-white/5 border border-blue-500/20 rounded-lg text-sm text-white
+                              placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500/50
+                              resize-none"
+                            rows={4}
+                          />
+                          {additionalContext.trim() && (
+                            <p className="text-xs text-green-400 mt-1 flex items-center">
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                              </svg>
+                              Additional context will be included in the report
+                            </p>
+                          )}
+                        </div>
+
                         <p className="mt-3 text-xs text-gray-500 text-center">
-                          These answers will be included when generating the full report
+                          All answers and context will be included when generating the full report
                         </p>
                       </div>
                     )}

@@ -10,6 +10,7 @@ interface SidebarProps {
   expanded: boolean;
   toggleExpanded: () => void;
   onSelectConversation: (conversation: any) => void;
+  onSelectConversationById?: (chatHistoryId: string) => Promise<void>;  // New: for presales loading
   onNewChat: () => void;
   logout: () => void;
   isMobile: boolean;
@@ -22,6 +23,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   expanded,
   toggleExpanded,
   onSelectConversation,
+  onSelectConversationById,
   onNewChat,
   logout,
   isMobile,
@@ -56,9 +58,15 @@ const Sidebar: React.FC<SidebarProps> = ({
   // Handle selecting a conversation
   const handleSelectConversation = async (chatHistoryId: string) => {
     try {
-      const conversation = await conversationService.getConversation(chatHistoryId);
-      onSelectConversation(conversation);
-      
+      // If onSelectConversationById is provided, use it for presales detection
+      if (onSelectConversationById) {
+        await onSelectConversationById(chatHistoryId);
+      } else {
+        // Fallback to old behavior
+        const conversation = await conversationService.getConversation(chatHistoryId);
+        onSelectConversation(conversation);
+      }
+
       // Close sidebar on mobile
       if (isMobile && expanded) {
         toggleExpanded();

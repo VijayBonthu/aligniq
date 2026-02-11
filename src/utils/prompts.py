@@ -1356,10 +1356,27 @@ AVAILABLE ACTIONS (CHOOSE ONE)
 
 8. **general_discussion**
    - High-level discussion NOT requiring any tool.
-   - “Is AWS better for this?”
-   - “What do you think about Fabric?”
+   - "Is AWS better for this?"
+   - "What do you think about Fabric?"
 
-9. **unsupported**
+9. **undo_last_change**
+   - When the user wants to undo or remove the most recent pending change.
+   - "Undo that", "Cancel that change", "Remove the last change", "Never mind that"
+
+10. **undo_specific_change**
+   - When the user specifies a change ID to remove.
+   - "Remove CHG-001", "Undo change CHG-002", "Delete that first change"
+   - Extract the change_id if mentioned (e.g., CHG-001, CHG-002).
+
+11. **clear_all_changes**
+   - When the user wants to remove ALL pending changes.
+   - "Clear all changes", "Start fresh", "Remove all pending changes", "Discard all modifications"
+
+12. **show_pending_changes**
+   - When the user asks to see what changes are pending.
+   - "What changes are pending?", "Show my pending changes", "List all modifications"
+
+13. **unsupported**
    - If the request is outside system capability.
 
 ===============================
@@ -1375,12 +1392,16 @@ Follow these rules carefully:
 6. If user asks factual questions that need recalling from the report → `retrieve_from_vectorstore`.
 7. If user says "improve", "expand", "add detail", "go deeper" → `improve_existing_report`.
 8. If the message is vague but clearly refers to something IN the report:
-   - Look at `conversation_summary`  
-   - Determine the referenced element  
+   - Look at `conversation_summary`
+   - Determine the referenced element
    - Route to `answer_question_from_report`.
 9. If unclear whether it's a requirement change or architecture change:
    - Prefer **architecture change** (architectural changes depend on requirements).
-10. If nothing fits → `general_discussion`.
+10. If user says "undo", "cancel", "remove" referring to a recent change → `undo_last_change`.
+11. If user mentions a specific change ID to remove → `undo_specific_change`.
+12. If user wants to clear/discard ALL pending changes → `clear_all_changes`.
+13. If user asks what changes are pending or wants to see modifications → `show_pending_changes`.
+14. If nothing fits → `general_discussion`.
 
 ===============================
 OUTPUT

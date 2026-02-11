@@ -500,6 +500,7 @@ async def generate_report_with_assumptions(
     scanned_requirements: dict,
     confirmed_answers: list,
     assumptions_list: list,
+    additional_context: str = None,
     timeout: int = 180
 ) -> dict:
     """
@@ -511,6 +512,7 @@ async def generate_report_with_assumptions(
         scanned_requirements: Extracted requirements from scanner
         confirmed_answers: List of questions with their answers
         assumptions_list: List of assumptions to be made for unanswered questions
+        additional_context: Free-form text with additional requirements, client notes, etc.
         timeout: Timeout in seconds
 
     Returns:
@@ -556,11 +558,21 @@ async def generate_report_with_assumptions(
         prompt = ChatPromptTemplate.from_template(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
         chain = prompt | llm_reasoning | StrOutputParser()
 
+        # Format additional context if provided
+        additional_context_text = ""
+        if additional_context and additional_context.strip():
+            additional_context_text = f"""
+## Additional Context from Client/Team
+{additional_context.strip()}
+"""
+            logger.info(f"Including additional context ({len(additional_context)} chars) in report")
+
         response = await asyncio.wait_for(
             chain.ainvoke({
                 "document": document[:15000],  # Limit document size
                 "confirmed_answers": "\n".join(confirmed_formatted) if confirmed_formatted else "No confirmed answers provided.",
-                "assumptions_list": "\n".join(assumptions_formatted) if assumptions_formatted else "No assumptions needed - all information confirmed."
+                "assumptions_list": "\n".join(assumptions_formatted) if assumptions_formatted else "No assumptions needed - all information confirmed.",
+                "additional_context": additional_context_text
             }),
             timeout=timeout
         )

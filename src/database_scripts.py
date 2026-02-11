@@ -390,6 +390,99 @@ async def update_pending_change(chat_history_id: str, change_id: str, updates: d
         )
 
 
+async def get_last_pending_change(chat_history_id: str, db: Session) -> dict:
+    """
+    Get the most recent pending change for undo operations.
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        The last pending change or None if no pending changes
+    """
+    try:
+        db.expire_all()
+
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+
+        if not record or not record.pending_changes:
+            return None
+
+        # Return the last change (most recently added)
+        pending_changes = record.pending_changes
+        if pending_changes:
+            return pending_changes[-1]
+        return None
+    except SQLAlchemyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting last pending change: {str(e)}"
+        )
+
+
+async def remove_last_pending_change(chat_history_id: str, db: Session) -> dict:
+    """
+    Remove the most recent pending change (undo last change).
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Status dict with removed change and remaining changes
+    """
+    try:
+        db.expire_all()
+
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No report found for chat_history_id: {chat_history_id}"
+            )
+
+        current_changes = copy.deepcopy(record.pending_changes) if record.pending_changes else []
+
+        if not current_changes:
+            return {
+                "status": "no_changes",
+                "message": "No pending changes to undo",
+                "remaining_changes": [],
+                "remaining_count": 0
+            }
+
+        # Remove the last change
+        removed_change = current_changes.pop()
+
+        # Update the record
+        record.pending_changes = current_changes
+        flag_modified(record, "pending_changes")
+
+        db.commit()
+        db.refresh(record)
+
+        return {
+            "status": "success",
+            "removed_change": removed_change,
+            "remaining_changes": current_changes,
+            "remaining_count": len(current_changes)
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error removing last pending change: {str(e)}"
+        )
+
+
 def detect_conflicts(pending_changes: list) -> list:
     """
     Detect conflicting changes in the pending changes list.
@@ -951,6 +1044,7 @@ async def get_presales_analysis(document_id: str, user_id: str, db: Session) -> 
             "user_id": presales.user_id,
             "extracted_requirements": presales.extracted_requirements,
             "blind_spots": presales.blind_spots,
+            "p1_blockers": presales.p1_blockers,
             "technology_risks": presales.technology_risks,
             "kickstart_questions": presales.kickstart_questions,
             "presales_brief": presales.presales_brief,
@@ -1001,6 +1095,7 @@ async def get_presales_by_id(presales_id: str, user_id: str, db: Session) -> dic
             "user_id": presales.user_id,
             "extracted_requirements": presales.extracted_requirements,
             "blind_spots": presales.blind_spots,
+            "p1_blockers": presales.p1_blockers,
             "technology_risks": presales.technology_risks,
             "kickstart_questions": presales.kickstart_questions,
             "presales_brief": presales.presales_brief,
@@ -1024,36 +1119,40 @@ async def create_analysis_link(
     document_id: str,
     user_id: str,
     presales_id: str,
-    db: Session
+    db: Session,
+    chat_history_id: str = None
 ) -> dict:
     """
-    Create a link between document and presales analysis.
+    Create a link between document, presales analysis, and chat history.
 
-    This allows tracking the journey from pre-sales scan to full report.
+    This allows tracking the journey from pre-sales scan to full report,
+    and enables presales to appear in conversation history.
 
     Args:
         document_id: The document ID
         user_id: The user ID
         presales_id: The presales analysis ID
         db: Database session
+        chat_history_id: Optional chat history ID to link immediately
 
     Returns:
-        Dict with link_id
+        Dict with link_id and chat_history_id
     """
     try:
         link = models.AnalysisLink(
             document_id=document_id,
             user_id=user_id,
-            presales_id=presales_id
+            presales_id=presales_id,
+            chat_history_id=chat_history_id
         )
 
         db.add(link)
         db.commit()
         db.refresh(link)
 
-        logger.info(f"Created analysis link: {link.link_id} for document: {document_id}")
+        logger.info(f"Created analysis link: {link.link_id} for document: {document_id}, chat_history: {chat_history_id}")
 
-        return {"link_id": link.link_id}
+        return {"link_id": link.link_id, "chat_history_id": chat_history_id}
 
     except SQLAlchemyError as e:
         db.rollback()
@@ -1099,6 +1198,47 @@ async def get_analysis_link(document_id: str, user_id: str, db: Session) -> dict
 
     except SQLAlchemyError as e:
         logger.error(f"Error getting analysis link: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving analysis link: {str(e)}"
+        )
+
+
+async def get_analysis_link_by_presales_id(presales_id: str, user_id: str, db: Session) -> dict:
+    """
+    Get analysis link by presales_id.
+
+    Args:
+        presales_id: The presales analysis ID
+        user_id: The user ID (for security filtering)
+        db: Database session
+
+    Returns:
+        Dict with link data, or None if not found
+    """
+    try:
+        link = db.query(models.AnalysisLink).filter(
+            models.AnalysisLink.presales_id == presales_id,
+            models.AnalysisLink.user_id == user_id
+        ).first()
+
+        if not link:
+            return None
+
+        return {
+            "link_id": link.link_id,
+            "document_id": link.document_id,
+            "user_id": link.user_id,
+            "presales_id": link.presales_id,
+            "chat_history_id": link.chat_history_id,
+            "user_answers": link.user_answers,
+            "full_report_requested": link.full_report_requested,
+            "full_report_generated": link.full_report_generated,
+            "created_at": link.created_at.isoformat() if link.created_at else None
+        }
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting analysis link by presales_id: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving analysis link: {str(e)}"
@@ -1534,6 +1674,69 @@ async def update_question_answers(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error updating answers: {str(e)}"
         )
+
+
+async def save_question_answer(
+    question_id: str,
+    answer: str,
+    db: Session,
+    user_id: str = None
+) -> dict:
+    """
+    Save a single answer to a question (used by chat).
+
+    Args:
+        question_id: The question ID
+        answer: The answer text
+        db: Database session
+        user_id: Optional user ID for tracking
+
+    Returns:
+        Dict with status and question_id
+    """
+    from datetime import datetime
+
+    try:
+        question = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.question_id == question_id
+        ).first()
+
+        if not question:
+            logger.warning(f"Question not found for answer save: {question_id}")
+            return {"success": False, "error": "Question not found"}
+
+        # Record history if there was a previous answer
+        if question.answer:
+            history = models.PresalesAnswerHistory(
+                question_id=question_id,
+                presales_id=question.presales_id,
+                previous_answer=question.answer,
+                new_answer=answer,
+                change_type="updated_via_chat",
+                changed_by=user_id or question.user_id
+            )
+            db.add(history)
+
+        # Update question
+        question.answer = answer
+        question.answered_at = datetime.utcnow()
+        question.answered_by = user_id or question.user_id
+        question.status = models.QuestionStatus.ANSWERED
+
+        db.commit()
+
+        logger.info(f"Saved answer for question {question_id} via chat")
+
+        return {
+            "success": True,
+            "question_id": question_id,
+            "question_number": question.question_number
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error saving question answer: {str(e)}")
+        return {"success": False, "error": str(e)}
 
 
 async def update_question_status(
