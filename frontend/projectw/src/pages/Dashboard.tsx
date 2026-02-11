@@ -19,6 +19,9 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  selected?: boolean;
+  type?: 'presales_brief' | 'full_report' | 'chat';
+  presales_id?: string;
 }
 
 // New unified question interface matching backend
@@ -123,11 +126,15 @@ interface Conversation {
   p1_blockers?: P1Blocker[];
   kickstart_questions?: KickstartQuestion[];
   blind_spots?: any;
+  presales_brief?: string;
+  extracted_requirements?: any;
   // Readiness tracking
   readiness?: ReadinessResult;
   contradictions?: Contradiction[];
   vague_answers?: VagueAnswer[];
   assumptions?: Assumption[];
+  // Full report content (stored separately for tabbed view)
+  fullReportContent?: string;
 }
 
 interface Recommendation {
@@ -219,6 +226,9 @@ const Dashboard: React.FC = () => {
   // Pending changes state for full report chat
   const [pendingChangesCount, setPendingChangesCount] = useState(0);
   const [hasConflicts, setHasConflicts] = useState(false);
+  // Tab state for presales/report view
+  const [activeTab, setActiveTab] = useState<'presales' | 'report'>('presales');
+  const [hasFullReport, setHasFullReport] = useState(false);
   // Add a debounce tracking variable
   const refreshInProgress = useRef(false);
   const refreshTimeout = useRef<number | null>(null);
@@ -785,6 +795,22 @@ const Dashboard: React.FC = () => {
       } else {
         setShowKickstartPanel(false);
         setKickstartAnswers({});
+      }
+
+      // Detect if conversation has a full report
+      const fullReportMessage = messagesWithIds.find((msg: any) => msg.type === 'full_report');
+      if (fullReportMessage) {
+        setHasFullReport(true);
+        // Store full report content for easy access
+        (conversation as any).fullReportContent = fullReportMessage.content;
+        // Default to report tab if full report exists
+        setActiveTab('report');
+      } else {
+        setHasFullReport(false);
+        // Default to presales tab if it's a presales conversation
+        if (conversation.analysis_mode === 'presales') {
+          setActiveTab('presales');
+        }
       }
 
       setActiveConversation(conversation);
@@ -1858,6 +1884,9 @@ const Dashboard: React.FC = () => {
   const handleNewChat = () => {
     setActiveConversation(null);
     setShowUploadUI(true);
+    // Reset tab state for new conversations
+    setActiveTab('presales');
+    setHasFullReport(false);
   };
   
   // Add this function to handle Jira disconnect
@@ -2112,31 +2141,43 @@ const Dashboard: React.FC = () => {
       if (response.data) {
         toast.success('Full report generated successfully!');
 
-        // Update the conversation with the full report data
+        // Update the conversation - KEEP presales data, ADD full report
         const chatHistoryId = response.data.chat_history_id;
+
+        // Create the full report message
+        const fullReportMessage: Message = {
+          id: `report-${Date.now()}`,
+          role: 'assistant',
+          content: response.data.message,
+          timestamp: new Date().toISOString(),
+          selected: true,
+          type: 'full_report' // Tag this message as the full report
+        };
+
+        // Keep existing presales messages, add the full report
+        const existingMessages = activeConversation.messages || [];
+        const presalesMessages = existingMessages.filter(msg => (msg as any).type !== 'full_report');
 
         const updatedConversation: Conversation = {
           ...activeConversation,
           id: chatHistoryId,
           chat_history_id: chatHistoryId,
-          analysis_mode: 'full',
-          messages: [
-            {
-              role: 'assistant',
-              content: response.data.message,
-              timestamp: new Date().toISOString(),
-              selected: true
-            }
-          ],
-          title: response.data.title || activeConversation.title
+          // Keep analysis_mode as 'presales' - we now use tabs instead
+          messages: [...presalesMessages, fullReportMessage],
+          title: response.data.title || activeConversation.title,
+          fullReportContent: response.data.message // Store full report separately for easy access
         };
 
         setActiveConversation(updatedConversation);
 
-        // Reset presales-specific state
-        setShowKickstartPanel(false);
-        setKickstartAnswers({});
-        setAdditionalContext('');
+        // Set full report flag and switch to report tab
+        setHasFullReport(true);
+        setActiveTab('report');
+
+        // DON'T reset presales state - user might want to go back and modify
+        // setShowKickstartPanel(false);  // Keep this available
+        // setKickstartAnswers({});        // Keep answers for reference
+        // setAdditionalContext('');       // Keep additional context
 
         // Mark data as changed and refresh sidebar
         dataChanged.current = true;
@@ -2652,25 +2693,80 @@ const Dashboard: React.FC = () => {
                 <div className="flex-none p-2 md:p-4 border-b border-white/10 flex justify-between items-center bg-indigo-950/50">
                   <h2 className="text-lg md:text-xl font-semibold text-white truncate">{activeConversation.title}</h2>
                 </div>
-                
+
+                {/* Tab UI - show when in presales mode or has full report */}
+                {(activeConversation.analysis_mode === 'presales' || hasFullReport) && (
+                  <div className="flex-none border-b border-white/10 bg-indigo-950/30">
+                    <div className="flex">
+                      <button
+                        onClick={() => setActiveTab('presales')}
+                        className={`px-4 py-2.5 text-sm font-medium transition-all duration-200 border-b-2 ${
+                          activeTab === 'presales'
+                            ? 'text-purple-300 border-purple-500 bg-purple-500/10'
+                            : 'text-gray-400 border-transparent hover:text-gray-300 hover:bg-white/5'
+                        }`}
+                      >
+                        <span className="flex items-center gap-2">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                          </svg>
+                          Pre-Sales
+                          {((activeConversation.p1_blockers?.length || 0) + (activeConversation.kickstart_questions?.length || 0)) > 0 && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-purple-500/30 text-purple-200 text-xs">
+                              {(activeConversation.p1_blockers?.length || 0) + (activeConversation.kickstart_questions?.length || 0)}
+                            </span>
+                          )}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => setActiveTab('report')}
+                        disabled={!hasFullReport}
+                        className={`px-4 py-2.5 text-sm font-medium transition-all duration-200 border-b-2 ${
+                          activeTab === 'report'
+                            ? 'text-green-300 border-green-500 bg-green-500/10'
+                            : hasFullReport
+                              ? 'text-gray-400 border-transparent hover:text-gray-300 hover:bg-white/5'
+                              : 'text-gray-600 border-transparent cursor-not-allowed'
+                        }`}
+                      >
+                        <span className="flex items-center gap-2">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                          Full Report
+                          {hasFullReport && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-green-500/30 text-green-200 text-xs">
+                              Ready
+                            </span>
+                          )}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Chat messages - improved scrolling and spacing for mobile */}
+                {/* Show on presales tab OR when not in tabbed mode (no presales/report tabs) */}
+                {(activeTab === 'presales' || !(activeConversation.analysis_mode === 'presales' || hasFullReport)) && (
                 <div className="flex-1 overflow-y-auto p-2 md:p-4 space-y-2 md:space-y-4">
                   {/* Select All checkbox header - improved for mobile */}
                   <div className="sticky top-0 z-10 p-2 md:p-3 bg-[#141332]/90 border-b border-white/10 flex items-center">
                     <label className="flex items-center space-x-2 text-xs md:text-sm text-gray-300">
-                      <input 
-                        type="checkbox" 
-                        checked={allMessagesSelected} 
+                      <input
+                        type="checkbox"
+                        checked={allMessagesSelected}
                         onChange={toggleAllMessages}
                         className="form-checkbox h-3 w-3 md:h-4 md:w-4 rounded text-purple-500"
                       />
                       <span>Include all messages as context</span>
                     </label>
                   </div>
-                  
+
                   <div className="p-2 md:p-4 space-y-4 md:space-y-6">
-                    {/* Message rendering - improved for mobile */}
-                    {activeConversation && activeConversation.messages.map((msg, index) => (
+                    {/* Message rendering - filter out full_report messages on presales tab */}
+                    {activeConversation && activeConversation.messages
+                      .filter(msg => (msg as any).type !== 'full_report')
+                      .map((msg, index) => (
                       <div key={msg.id || index} className={`mb-2 md:mb-4 flex items-start ${msg.role === 'user' ? 'mr-6 md:mr-12' : 'ml-6 md:ml-12'}`}>
                         {/* Checkbox for message selection */}
                         <div className="mr-1 md:mr-2 mt-2">
@@ -2746,8 +2842,80 @@ const Dashboard: React.FC = () => {
                     <div ref={messagesEndRef} className="h-px w-full" />
                   </div>
                 </div>
-                {/* Chat input - only shown when conversation is active, not in upload mode, and NOT in presales mode */}
-                {activeConversation && !showUploadUI && activeConversation.analysis_mode !== 'presales' && (
+                )}
+
+                {/* Full Report View - shown on report tab when hasFullReport is true */}
+                {activeTab === 'report' && hasFullReport && activeConversation.fullReportContent && (
+                  <div className="flex-1 overflow-y-auto p-2 md:p-4">
+                    <div className="max-w-4xl mx-auto">
+                      {/* Report header */}
+                      <div className="mb-4 p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            <span className="text-green-300 font-medium">Full Report Generated</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => {
+                                const content = activeConversation.fullReportContent || '';
+                                navigator.clipboard.writeText(content);
+                                toast.success('Report copied to clipboard');
+                              }}
+                              className="px-3 py-1.5 text-xs bg-white/5 hover:bg-white/10 text-gray-300 rounded-lg border border-white/10 flex items-center gap-1.5 transition-colors"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2" />
+                              </svg>
+                              Copy
+                            </button>
+                            <button
+                              onClick={() => setActiveTab('presales')}
+                              className="px-3 py-1.5 text-xs bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 rounded-lg border border-purple-500/30 flex items-center gap-1.5 transition-colors"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
+                              </svg>
+                              Edit Inputs
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Report content */}
+                      <div className="bg-[#1a1745] rounded-lg p-4 md:p-6 border border-white/10">
+                        <div className="prose prose-invert max-w-none text-gray-100 overflow-hidden break-words">
+                          <div dangerouslySetInnerHTML={{
+                            __html: typeof marked.parse(activeConversation.fullReportContent || '') === 'string'
+                              ? marked.parse(activeConversation.fullReportContent || '') as string
+                              : String(marked.parse(activeConversation.fullReportContent || ''))
+                          }} />
+                        </div>
+                      </div>
+
+                      {/* Export options */}
+                      <div className="mt-4 flex justify-end gap-2">
+                        <button
+                          onClick={() => {
+                            const reportMsg = activeConversation?.messages.find(m => (m as any).type === 'full_report');
+                            if (reportMsg) handleDownloadPDF(reportMsg);
+                          }}
+                          className="px-4 py-2 text-sm bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white rounded-lg border border-purple-500/30 flex items-center gap-2 transition-colors"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                          Download PDF
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Chat input for report tab - modify existing report/non-presales chat */}
+                {activeConversation && !showUploadUI && activeTab === 'report' && hasFullReport && (
                   <div className="flex-none p-2 md:p-4 border-t border-white/10 bg-indigo-950/50">
                     {/* Pending changes indicator */}
                     {pendingChangesCount > 0 && (
@@ -2779,9 +2947,9 @@ const Dashboard: React.FC = () => {
                             handleSendMessage();
                           }
                         }}
-                        placeholder="Type your message here..."
+                        placeholder="Request changes to the report (e.g., 'Add more details to the architecture section')..."
                         className="w-full px-3 md:px-4 py-2 md:py-3 pr-12 md:pr-16 bg-white/5 border border-white/10 rounded-lg text-white
-                          placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-purple-500
+                          placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-green-500
                           min-h-[40px] md:min-h-[50px] max-h-[96px] overflow-y-auto resize-none text-sm md:text-base"
                         style={{ height: 'auto', lineHeight: '1.5' }}
                         rows={1}
@@ -2812,8 +2980,8 @@ const Dashboard: React.FC = () => {
                   </div>
                 )}
 
-                {/* Pre-sales mode - Chat input and action bar */}
-                {activeConversation && !showUploadUI && activeConversation.analysis_mode === 'presales' && (
+                {/* Pre-sales mode - Chat input and action bar (only on presales tab) */}
+                {activeConversation && !showUploadUI && activeConversation.analysis_mode === 'presales' && activeTab === 'presales' && (
                   <div className="flex-none border-t border-white/10 bg-indigo-950/50">
                     {/* Presales info bar with buttons */}
                     <div className="p-2 md:p-3 border-b border-white/5 flex flex-wrap items-center justify-between gap-2">

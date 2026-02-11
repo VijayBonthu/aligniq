@@ -2146,8 +2146,12 @@ async def conversation_with_doc_v2(
         logger.info(f"Total messages received: {len(chat_context['message'])}")
 
         # 2. Extract ONLY selected messages for processing
-        selected_messages = [msg for msg in chat_context["message"] if msg.get("selected", True)]
-        logger.info(f"Selected messages for processing: {len(selected_messages)}")
+        # Filter out 'full_report' type messages - they are too large and we have the report summary from DB
+        selected_messages = [
+            msg for msg in chat_context["message"]
+            if msg.get("selected", True) and msg.get("type") != "full_report"
+        ]
+        logger.info(f"Selected messages for processing: {len(selected_messages)} (excluded full_report messages)")
 
         if len(selected_messages) == 0:
             raise HTTPException(status_code=400, detail="No selected messages to process")
@@ -2189,11 +2193,12 @@ async def conversation_with_doc_v2(
         user_message = chat_context["message"][-1]["content"]
 
         # 5. Route query to determine action type
+        # Use summary_report (compressed) not the full report_content
         try:
             router_response = await router_query_llm(
                 user_message=user_message,
                 conversation_summary=conversation_context,
-                report_summary=report_summary
+                report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary
             )
             action = router_response.get("action", "general_discussion")
             action_reason = router_response.get("reason", "")
