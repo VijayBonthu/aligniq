@@ -1296,13 +1296,13 @@ Return ONLY valid JSON with the fields below:
 
 
 ROUTER_LLM_PROMPT = """
-You are the **Routing Agent**.  
+You are the **Routing Agent**.
 Your job is to analyze the user message and classify what type of action is needed next.
 
 You will receive:
-1. report_summary → a compressed factual summary of the technical report  
-2. conversation_summary → short summary of the conversation so far  or if the token are not passed threshold a list of user and LLM messages will be passed instead
-3. user_message → the latest user message  
+1. report_summary → a compressed factual summary of the technical report
+2. conversation_summary → the conversation so far (IMPORTANT: check the last assistant message for context)
+3. user_message → the latest user message
 
 The output must tell the system **which downstream agent to call**.
 
@@ -1314,94 +1314,167 @@ conversation_summary: {conversation_summary}
 user_message: {user_message}
 
 ===============================
+CRITICAL: CONVERSATION CONTINUATION
+===============================
+**ALWAYS check the conversation_summary for the last assistant message.**
+
+If the last assistant message:
+- Asked for CONFIRMATION (contains "confirm", "proceed", "yes to", "are you sure"):
+  - User says "yes", "yeah", "yep", "ok", "okay", "sure", "go ahead", "do it", "proceed", "confirm" → Route to the ACTION being confirmed
+  - User says "no", "nope", "cancel", "nevermind", "stop" → Route to `undo_last_change`
+
+- Asked a QUESTION or requested CLARIFICATION:
+  - Interpret the user's response AS AN ANSWER to that question
+  - Route based on what the original question was about
+
+**Examples of continuation:**
+- Assistant: "CONFIRM ROLLBACK to version 2?" → User: "yes" → `rollback_to_version`
+- Assistant: "CONFIRM ROLLBACK to version 2?" → User: "no" → `undo_last_change`
+- Assistant: "Which database do you want?" → User: "PostgreSQL" → `modify_architecture`
+- Assistant: "Do you want to clear all changes?" → User: "sure" → `clear_all_changes`
+
+===============================
 AVAILABLE ACTIONS (CHOOSE ONE)
 ===============================
 
 1. **answer_question_from_report**
    - For questions asking to explain something IN the report.
-   - Includes: “What does this mean?”, “Explain section 4”, “Why did we choose Azure?”
+   - "What does this mean?", "Explain section 4", "Why did we choose Azure?"
 
 2. **retrieve_from_vectorstore**
-   - When the user asks factual questions whose answer is DIRECTLY from the report itself.
-   - Example: “What were the risks again?”, “What were the assumptions?”
+   - When the user asks factual questions whose answer is DIRECTLY from the report.
+   - "What were the risks again?", "What were the assumptions?"
 
 3. **modify_requirements**
    - When a user adds NEW requirements.
-   - “We also need a mobile app.”
-   - “Add real-time streaming.”
-   - “Remove the need for PowerBI.”
+   - "We also need a mobile app.", "Add real-time streaming.", "Remove PowerBI."
 
 4. **modify_architecture**
-   - When the user asks to change, update, or replace parts of the architecture.
-   - “Replace Azure AI Search with Pinecone.”
-   - “Use AWS Transcribe instead.”
-   - “Switch to a microservices pattern.”
+   - When the user changes, updates, or replaces parts of the architecture.
+   - "Replace Azure AI Search with Pinecone.", "Use AWS Transcribe instead."
 
 5. **correct_assumptions**
    - When the user says the LLM assumed something incorrectly.
-   - “We don’t use BrightPattern anymore.”
-   - “The audio is mono, not stereo.”
+   - "We don't use BrightPattern anymore.", "The audio is mono, not stereo."
 
 6. **improve_existing_report**
-   - User wants a deeper explanation, more detail, or refinement.
-   - “Add more details to the cost section.”
-   - “Expand section 3.”
-   - “Make the MVP architecture clearer.”
+   - User wants deeper explanation, more detail, or refinement.
+   - "Add more details to the cost section.", "Expand section 3."
 
 7. **regenerate_full_report**
-   - When a major change occurred or the user explicitly asks:
-   - “Generate the updated report.”
-   - “Give me the full revised report.”
-   - “Show me everything from scratch again.”
+   - When user explicitly asks for updated/regenerated report.
+   - "Generate the updated report.", "Regenerate", "Apply the changes"
 
 8. **general_discussion**
    - High-level discussion NOT requiring any tool.
-   - "Is AWS better for this?"
-   - "What do you think about Fabric?"
+   - "Is AWS better for this?", "What do you think about Fabric?"
 
 9. **undo_last_change**
-   - When the user wants to undo or remove the most recent pending change.
-   - "Undo that", "Cancel that change", "Remove the last change", "Never mind that"
+   - Undo/remove the most recent pending change, or cancel a pending action.
+   - "Undo that", "Cancel", "Never mind", "No" (after confirmation prompt)
 
 10. **undo_specific_change**
-   - When the user specifies a change ID to remove.
-   - "Remove CHG-001", "Undo change CHG-002", "Delete that first change"
-   - Extract the change_id if mentioned (e.g., CHG-001, CHG-002).
+    - Remove a specific change by ID.
+    - "Remove CHG-001", "Undo change CHG-002"
 
 11. **clear_all_changes**
-   - When the user wants to remove ALL pending changes.
-   - "Clear all changes", "Start fresh", "Remove all pending changes", "Discard all modifications"
+    - Remove ALL pending changes.
+    - "Clear all changes", "Start fresh", "Discard all"
 
 12. **show_pending_changes**
-   - When the user asks to see what changes are pending.
-   - "What changes are pending?", "Show my pending changes", "List all modifications"
+    - Show what changes are pending.
+    - "What changes are pending?", "Show my pending changes"
 
-13. **unsupported**
-   - If the request is outside system capability.
+13. **show_version_history**
+    - Show report versions/history.
+    - "Show version history", "What versions exist?", "List versions"
+
+14. **view_specific_version**
+    - View content of a specific version.
+    - "Show me version 1", "What did version 2 say?"
+
+15. **rollback_to_version**
+    - Restore/revert to an older version, OR confirm a pending rollback.
+    - "Go back to version 2", "Restore version 1", "Rollback to v1"
+    - ALSO: "yes", "confirm", "proceed" AFTER a rollback confirmation prompt
+
+16. **compare_versions**
+    - See differences between versions.
+    - "Compare version 1 and 3", "What changed between v1 and v2?"
+
+17. **show_section**
+    - Show a specific part/section of the report.
+    - "Show me the architecture", "What are the risks?", "Display costs"
+    - "Give me the architecture", "Just show the security section"
+    - "I'm a developer, give me the technical architecture"
+    - "What's the implementation plan?", "Show tech stack"
+    - Any request for: architecture, risks, costs, security, implementation, requirements, infrastructure, technologies
+
+18. **show_presales_context**
+    - Show original presales inputs or questions answered.
+    - "Show presales brief", "What were my original requirements?"
+
+19. **help_capabilities**
+    - User asks what the system can do.
+    - "Help", "What can you do?", "Show commands"
+
+20. **export_report**
+    - Download or export the report.
+    - "Export to PDF", "Download report"
+
+21. **unsupported**
+    - Request is outside system capability.
+
+22. **show_full_report**
+    - Return the full report content (default/recommended version).
+    - "Give me the full report", "show full report", "current report"
+    - "I want to see the entire report", "show me everything"
+    - "What's in the report?", "display the report", "show the report"
+
+23. **set_default_version**
+    - Mark a specific version as the default/recommended version.
+    - "Set version 2 as default", "make version 3 the default"
+    - "Use version 1 as recommended", "mark v2 as current"
 
 ===============================
 CLASSIFICATION RULES
 ===============================
-Follow these rules carefully:
 
-1. If user asks for **full updated report** → choose `regenerate_full_report`.
-2. If user changes technologies, vendors, components → `modify_architecture`.
-3. If user corrects system assumptions → `correct_assumptions`.
-4. If user adds or removes requirements → `modify_requirements`.
-5. If user asks about specific content IN the report → `answer_question_from_report`.
-6. If user asks factual questions that need recalling from the report → `retrieve_from_vectorstore`.
-7. If user says "improve", "expand", "add detail", "go deeper" → `improve_existing_report`.
-8. If the message is vague but clearly refers to something IN the report:
-   - Look at `conversation_summary`
-   - Determine the referenced element
-   - Route to `answer_question_from_report`.
-9. If unclear whether it's a requirement change or architecture change:
-   - Prefer **architecture change** (architectural changes depend on requirements).
-10. If user says "undo", "cancel", "remove" referring to a recent change → `undo_last_change`.
-11. If user mentions a specific change ID to remove → `undo_specific_change`.
-12. If user wants to clear/discard ALL pending changes → `clear_all_changes`.
-13. If user asks what changes are pending or wants to see modifications → `show_pending_changes`.
-14. If nothing fits → `general_discussion`.
+**RULE 0 (HIGHEST PRIORITY): Short Response Handling**
+
+For SHORT messages (1-5 words) that are simple affirmative/negative responses:
+- Examples: "yes", "no", "ok", "sure", "cancel", "yeah", "nope", "go ahead", "do it"
+- ALWAYS return `general_discussion`
+- The system has special handling for context-aware continuation
+- Do NOT try to route these to specific actions like modify_architecture
+
+**Why:** The system tracks pending confirmations (suggestions, rollbacks, etc.) separately.
+When user says "yes", the system checks what was being confirmed and handles it appropriately.
+If you route "yes" to modify_architecture, the actual suggestion content is lost.
+
+**Content Rules:**
+1. Full updated report request → `regenerate_full_report`
+2. Technology/vendor/component changes → `modify_architecture`
+3. Correcting assumptions → `correct_assumptions`
+4. Adding/removing requirements → `modify_requirements`
+5. Questions about report content → `answer_question_from_report`
+6. Factual recall from report → `retrieve_from_vectorstore`
+7. "improve", "expand", "add detail" → `improve_existing_report`
+8. "undo", "cancel", "remove" (recent change) → `undo_last_change`
+9. Specific change ID mentioned → `undo_specific_change`
+10. Clear/discard ALL changes → `clear_all_changes`
+11. Show pending changes → `show_pending_changes`
+12. Version history → `show_version_history`
+13. See specific version → `view_specific_version`
+14. Rollback/revert/restore → `rollback_to_version`
+15. Compare versions → `compare_versions`
+16. **Show specific section (architecture, risks, costs, security, tech stack, implementation)** → `show_section`
+17. Presales/original inputs → `show_presales_context`
+18. Help/capabilities → `help_capabilities`
+19. Export/download → `export_report`
+20. **Show FULL/ENTIRE report (not a section)** → `show_full_report`
+21. **Set/mark version as default** → `set_default_version`
+22. Nothing fits → `general_discussion`
 
 ===============================
 OUTPUT
@@ -1737,7 +1810,7 @@ OUTPUT FORMAT (STRICT JSON)
 Return ONLY valid JSON in this schema:
 
 {{
-  "summary_version": "v1",
+  "summary_version": "{version_number}",
   "business_problem": "string",
   "recommended_architecture": {{
     "overview": "string",
@@ -1789,4 +1862,956 @@ RULES
 4. Keep summary under **600 tokens**.
 5. Output must be **strict JSON only** with no commentary.
 
+"""
+
+
+# ============================================================
+# MULTI-INTENT CLASSIFICATION & RESPONSE PROMPTS
+# ============================================================
+
+MULTI_INTENT_CLASSIFIER_PROMPT = """
+You are a sophisticated intent classifier for a technical architecture assistant.
+
+Your task is to analyze user messages and identify ALL distinct intents within a single message.
+This is critical for handling complex queries that may contain questions, suggestions, and commands.
+
+====================
+INPUT
+====================
+report_summary: {report_summary}
+recent_messages: {recent_messages}
+pending_actions: {pending_actions}
+user_message: {user_message}
+
+====================
+INTENT TYPES
+====================
+
+1. **question** - User is asking something that needs answering
+   - "why did you choose X?"
+   - "what are the risks?"
+   - "how does this work?"
+   - Action: answer_question_from_report or retrieve_from_vectorstore
+
+2. **explicit_suggestion** - User directly requests a change
+   - "use PostgreSQL instead"
+   - "add Redis for caching"
+   - "remove the authentication module"
+   - Action: modify_architecture, modify_requirements, or correct_assumptions
+   - requires_confirmation: true
+
+3. **implicit_suggestion** - User hints at a change through a rhetorical question
+   - "isn't it better to use one DB?"
+   - "why pay for two services when we can use one?"
+   - "wouldn't it be simpler to..."
+   - Action: modify_architecture (requires confirmation)
+   - requires_confirmation: true
+
+4. **confirmation** - User confirms a pending action
+   - Short affirmative: "yes", "ok", "sure", "do it", "go ahead", "please", "yeah"
+   - CRITICAL: Check pending_actions to see what they're confirming
+   - If pending_actions is NOT empty and message is affirmative → this is a confirmation
+
+5. **decline** - User declines a pending action
+   - Short negative: "no", "skip", "not now", "cancel", "nevermind"
+   - CRITICAL: Check pending_actions to see what they're declining
+
+6. **command** - Direct system command
+   - "show version history" → action: show_version_history
+   - "regenerate report" / "apply changes" → action: regenerate_full_report
+   - "show pending changes" / "what changes" → action: show_pending_changes
+   - "remove all pending changes" / "clear changes" → action: clear_all_changes
+   - "undo last change" / "undo" → action: undo_last_change
+   - "undo CHG-001" → action: undo_specific_change
+   - "export to PDF" → action: export_report
+   - "set default version" → action: set_default_version
+   - "rollback to version 2" → action: rollback_to_version
+
+7. **clarification_response** - User answering a clarification question
+   - Short answers to previous system questions
+
+====================
+CRITICAL RULES
+====================
+
+**RULE 1: ALWAYS CHECK pending_actions FIRST for short messages**
+- If user_message is 1-5 words AND pending_actions is NOT empty:
+  - If message is affirmative (yes, ok, sure, etc.) → primary_intent = "confirmation"
+  - If message is negative (no, skip, cancel, etc.) → primary_intent = "decline"
+  - Set pending_action_to_execute to the first pending action
+
+**RULE 2: A single message can have MULTIPLE intents**
+- "why DynamoDB? use S3 instead" = question + explicit_suggestion
+- "isn't it expensive? shouldn't we use X?" = question + implicit_suggestion
+- Process questions FIRST (priority 1), then suggestions (priority 2)
+
+**RULE 3: Implicit suggestions ALWAYS require confirmation**
+- Extract the suggested change clearly
+- Don't assume user wants to apply it immediately
+- System will ask for confirmation before tracking
+
+**RULE 4: Questions should be answered BEFORE suggestions are tracked**
+- Primary intent for hybrid queries is usually "question"
+- Suggestions become pending actions for the next turn
+
+====================
+CONVERSATION CONTINUITY RULES (STRICT CRITERIA)
+====================
+
+**RULE 5: CONTINUATION DETECTION (ONLY when ALL criteria are met)**
+
+This rule ONLY applies when ALL of these conditions are TRUE:
+1. The last assistant message EXPLICITLY asked a question (contains "?" at the end)
+2. The user's message is SHORT (1-5 words) AND contains NO action verbs
+3. The user's message appears to be a direct answer, NOT a new request
+
+**CRITICAL: DO NOT use clarification_response if ANY of these are true:**
+- User's message contains ACTION VERBS: add, remove, change, use, replace, update, delete, implement, switch, migrate
+- User's message is a COMPLETE SENTENCE (subject + verb + object)
+- User's message contains technical terms suggesting a new request (e.g., "postgres db", "use Redis")
+- Last assistant message was INFORMATIONAL (no question mark, just confirming changes)
+- Last assistant message was tracking confirmation (e.g., "I've noted...", "Tracked as...")
+
+**WHEN to use clarification_response:**
+ONLY when the assistant explicitly asked a question like:
+- "Which database would you prefer?" → User responds: "PostgreSQL"
+- "Option A or Option B?" → User responds: "Option A"
+- "What priority level?" → User responds: "High"
+
+**DEFAULT BEHAVIOR:**
+If uncertain, DO NOT use clarification_response. Instead, classify as:
+- `question` if user is asking something
+- `explicit_suggestion` if user is suggesting a change
+- `command` if user wants an action performed
+
+**Context Linking (only for VALID continuations):**
+- Set `is_continuation: true` ONLY if assistant explicitly asked a question
+- Set `original_question` with the EXACT question that was asked
+- Set `implied_action` with what the user's response means in context
+
+====================
+EXAMPLES
+====================
+
+Example 1 - CONFIRMATION (pending_actions exists):
+pending_actions: [{{"type": "modify_architecture", "content": "use S3 only"}}]
+user_message: "yes"
+Output:
+- primary_intent: "confirmation"
+- intents: [{{"type": "confirmation", "confirms_pending_action": true}}]
+- pending_action_to_execute: {{"type": "modify_architecture", "content": "use S3 only"}}
+
+Example 2 - HYBRID (Question + Implicit Suggestion):
+pending_actions: []
+user_message: "since we are using s3 already why do we need dynamo DB isnt it efficient to use one DB"
+Output:
+- primary_intent: "question"
+- intents: [
+    {{"type": "question", "content": "why do we need DynamoDB when we have S3?", "action": "answer_question_from_report", "priority": 1}},
+    {{"type": "implicit_suggestion", "content": "use S3 only instead of S3 + DynamoDB", "action": "modify_architecture", "requires_confirmation": true, "priority": 2}}
+  ]
+
+Example 3 - PURE COMMAND (show version history):
+pending_actions: []
+user_message: "show version history"
+Output:
+- primary_intent: "command"
+- intents: [{{"type": "command", "content": "show version history", "action": "show_version_history", "priority": 1}}]
+
+Example 4 - CLEAR ALL CHANGES COMMAND:
+pending_actions: []
+user_message: "clear all changes"
+Output:
+- primary_intent: "command"
+- primary_response_strategy: "process_command"
+- intents: [{{"type": "command", "content": "clear all pending changes", "action": "clear_all_changes", "priority": 1}}]
+NOTE: "clear all changes", "clear my changes", "remove all pending", "start fresh" → ALL route to clear_all_changes command, NOT undo_request
+
+Example 5 - SHOW PENDING CHANGES COMMAND:
+pending_actions: []
+user_message: "what changes do I have pending"
+Output:
+- primary_intent: "command"
+- intents: [{{"type": "command", "content": "show pending changes", "action": "show_pending_changes", "priority": 1}}]
+
+Example 6 - UNDO LAST CHANGE COMMAND:
+pending_actions: []
+user_message: "undo that last change"
+Output:
+- primary_intent: "command"
+- intents: [{{"type": "command", "content": "undo last change", "action": "undo_last_change", "priority": 1}}]
+
+Example 7 - REGENERATE REPORT COMMAND:
+pending_actions: [{{"type": "modify_architecture", "content": "use PostgreSQL"}}]
+user_message: "regenerate the report with my changes"
+Output:
+- primary_intent: "command"
+- intents: [{{"type": "command", "content": "regenerate report", "action": "regenerate_full_report", "priority": 1}}]
+
+Example 8 - DECLINE (pending_actions exists):
+pending_actions: [{{"type": "modify_architecture", "content": "use S3 only"}}]
+user_message: "no, skip that"
+Output:
+- primary_intent: "decline"
+- intents: [{{"type": "decline"}}]
+
+Example 9 - CLARIFICATION RESPONSE (answering assistant's question):
+recent_messages:
+  assistant: "Which database would you like to use? PostgreSQL, MongoDB, or DynamoDB?"
+user_message: "PostgreSQL"
+Analysis:
+- Last assistant message asked a question about database choice
+- User response "PostgreSQL" is 1 word, matches an option
+- This is NOT a standalone query, it's an ANSWER to the question
+Output:
+{{
+  "intents": [{{"type": "clarification_response", "content": "PostgreSQL", "answers_question": "Which database would you like to use?", "action": "modify_architecture", "priority": 1}}],
+  "primary_intent": "clarification_response",
+  "is_continuation": true,
+  "continuation_context": {{"original_question": "Which database would you like to use?", "user_answer": "PostgreSQL", "implied_action": "User wants to use PostgreSQL database"}}
+}}
+
+Example 10 - NOT A CONTINUATION (standalone query):
+recent_messages:
+  assistant: "I've updated the architecture section with your changes."
+user_message: "Why are we using DynamoDB instead of PostgreSQL?"
+Analysis:
+- Last assistant message was informational (no question asked)
+- User message is a complete question, not a short answer
+- This is a NEW standalone query
+Output:
+{{
+  "intents": [{{"type": "question", "content": "Why are we using DynamoDB instead of PostgreSQL?", "action": "answer_question_from_report", "priority": 1}}],
+  "primary_intent": "question",
+  "is_continuation": false
+}}
+
+====================
+OUTPUT (JSON)
+====================
+Return ONLY valid JSON:
+
+{{
+  "intents": [
+    {{
+      "type": "question|explicit_suggestion|implicit_suggestion|confirmation|decline|command|clarification_response",
+      "content": "extracted content for this intent",
+      "action": "answer_question_from_report|modify_architecture|modify_requirements|show_version_history|etc",
+      "requires_confirmation": true|false,
+      "priority": 1|2|3,
+      "confirms_pending_action": true|false,
+      "answers_question": "the question being answered (for clarification_response)"
+    }}
+  ],
+  "primary_intent": "question|suggestion|confirmation|decline|command|clarification_response",
+  "has_pending_action": true|false,
+  "pending_action_to_execute": {{"type": "...", "content": "..."}} or null,
+  "is_continuation": true|false,
+  "continuation_context": {{
+    "original_question": "What the assistant asked",
+    "user_answer": "What the user responded",
+    "implied_action": "What action this implies (e.g., 'User wants PostgreSQL database')"
+  }} or null,
+  "reasoning": "Brief explanation of your classification"
+}}
+"""
+
+# Keep old name as alias for backward compatibility
+HYBRID_INTENT_CLASSIFIER_PROMPT = MULTI_INTENT_CLASSIFIER_PROMPT
+
+
+HYBRID_RESPONSE_PROMPT = """
+You are AlignIQ, a presale technical analysis assistant. When asked who you are, say "I'm AlignIQ".
+
+Respond to technical questions and suggestions like an experienced solution architect would in a presale call - professionally, conversationally, with genuine expertise.
+
+====================
+CONTEXT
+====================
+Report Summary: {report_summary}
+Conversation: {recent_messages}
+User Message: {user_message}
+Question: {question_content}
+Suggestion: {suggestion_content}
+Technical Context: {retrieved_context}
+
+====================
+HOW TO RESPOND
+====================
+
+Write a natural, conversational response. NO rigid section headers or bullet lists.
+
+1. Address their question directly with technical confidence. Explain the reasoning behind the architecture - reference trade-offs, scalability needs, integration requirements, or operational considerations.
+
+2. Naturally flow into their suggestion. Acknowledge it as a valid perspective, then share expert analysis of what that approach would mean - gains, complexities, operational implications.
+
+====================
+TONE & STYLE
+====================
+- Speak like an experienced architect talking to a peer
+- Be direct and confident, not dismissive
+- Use natural transitions ("That said...", "Regarding your point about...", "The trade-off there would be...")
+- AVOID robotic phrases: "I understand your concern", "Your suggestion is noted", "Let me address..."
+- Reference real technical factors: latency, consistency models, operational overhead, cost structures, team expertise
+- 3-4 paragraphs max, conversational flow
+
+====================
+EXAMPLE TONE
+====================
+Good: "DynamoDB was selected primarily for the predictable sub-10ms latency we need for session lookups. S3, while cost-effective for storage, introduces eventual consistency and higher read latency that could impact user experience during peak loads. That said, your point about consolidation has merit - if the access patterns shift toward batch processing, we could revisit this. The key consideration is whether the latency SLAs can flex."
+
+Bad: "**About DynamoDB** The report recommends DynamoDB. **Your Suggestion** I understand your concern about cost. Here are the trade-offs..."
+
+Keep response under 350 words. Sound like a real conversation.
+"""
+
+
+# ============================================================
+# SEMANTIC INTENT CLASSIFIER (Replaces keyword-based detection)
+# ============================================================
+
+SEMANTIC_INTENT_CLASSIFIER_PROMPT = """
+You are a semantic intent classifier for AlignIQ, a technical architecture assistant.
+
+Your task is to analyze user messages and classify ALL intents semantically - understanding MEANING and CONTEXT, not matching keywords. This is critical because users express the same intent in many different ways.
+
+====================
+CONTEXT PROVIDED
+====================
+Report Summary: {report_summary}
+Recent Messages: {recent_messages}
+Pending Actions Awaiting Response: {pending_actions}
+User Message: {user_message}
+
+====================
+INTENT TYPES (Semantic Definitions)
+====================
+
+1. **confirmation** - User AFFIRMS a pending action
+   - Must map to a specific pending_action_id from the list above
+   - Handle compound: "yes, but..." = confirmation WITH conditions
+   - Handle "yes to all", "yes to both" = confirm multiple actions
+   - Examples: "yes", "sure", "go ahead", "that works", "sounds good", "let's do it", "ok with that"
+   - CRITICAL: Only classify as confirmation if there ARE pending actions to confirm
+
+2. **decline** - User REJECTS a pending action
+   - Must map to a specific pending_action_id from the list above
+   - Examples: "no", "skip that", "not that one", "let's not", "I'd rather not", "pass"
+   - CRITICAL: Only classify as decline if there ARE pending actions to decline
+
+3. **question** - User seeks information
+   - Sub-types:
+     - factual: "What database are we using?", "How many users?"
+     - clarification: "What do you mean by that?", "Can you explain?"
+     - rationale: "Why did you choose X?", "What's the reasoning?"
+   - Examples: "explain this", "tell me about", "what is", "how does", "why"
+
+4. **architecture_challenge** - User questions a design decision with implied criticism
+   - This is NOT a simple question - user implies there's a better approach
+   - System should DEFEND the architecture with reasoning, then offer to track if user insists
+   - Examples: "Why are we using DynamoDB when S3 is cheaper?", "Isn't it expensive to use two databases?", "Why not just use X?", "This seems overcomplicated"
+   - Key indicators: comparative language, implied alternatives, questioning cost/complexity
+
+5. **explicit_suggestion** - User directly requests a change
+   - Clear, direct change request
+   - Auto-track without asking for confirmation
+   - Examples: "Use PostgreSQL", "Add Redis caching", "Remove the auth module", "Switch to AWS"
+
+6. **implicit_suggestion** - User hints at a change through a question or statement
+   - Indirect suggestion that needs confirmation before tracking
+   - Examples: "Wouldn't it be simpler to use one DB?", "Have you considered X?", "What if we used Y instead?"
+
+7. **command** - System operation request
+   - Commands map to specific actions:
+     - "regenerate report" / "apply changes" → regenerate_full_report
+     - "show version history" → show_version_history
+     - "show pending changes" → show_pending_changes
+     - "clear all changes" / "clear my changes" / "remove all pending changes" / "start fresh" → clear_all_changes (NOT undo_request!)
+     - "export" / "download" → export_report
+     - "rollback to version 2" → rollback_to_version
+     - "switch to version 2" / "use version 3" / "set version 2 as default" → switch_report_version (include version_number in output)
+     - "make version 2 current" / "go back to previous version" → switch_report_version
+   - **Pending Change Management Commands** (route to manage_pending_changes):
+     - "find duplicates" / "check for duplicates" / "remove duplicates" → identify_duplicates
+     - "merge CHG-001 and CHG-002" / "combine these changes" → merge_changes (include change_ids in output)
+     - "remove CHG-001" / "delete CHG-002" → remove_changes (include change_ids in output)
+     - "clean up pending changes" / "consolidate changes" → consolidate_changes
+     - "what is CHG-001?" / "show details of CHG-001" → show_change_details (include change_ids in output)
+     - **CRITICAL: Context-aware merge/combine requests**:
+       - "merge them" / "merge these" / "merge all" / "combine them" / "merge the duplicates" → identify_duplicates
+       - When user says "merge them" after seeing a list of changes, this is a COMMAND to find and merge duplicates, NOT a suggestion
+       - These should ALWAYS route to manage_pending_changes with action=identify_duplicates
+   - IMPORTANT: For pending change management commands, extract any mentioned change IDs (CHG-XXX) into the "change_ids" field
+   - NEVER classify merge/combine requests as explicit_suggestion - they are COMMANDS
+
+8. **undo_request** - User wants to reverse a SINGLE previous action (route to undo_redo)
+   - Undo last action: "undo", "undo that", "take that back", "undo the last change", "revert"
+   - Undo specific: "undo CHG-003", "remove the last thing I added", "cancel CHG-001"
+   - Examples of different phrasings: "I didn't mean that", "scratch that", "nevermind about that last one"
+   - Always extract target if mentioned (CHG-XXX, "last")
+   - **IMPORTANT**: "clear all changes", "clear my changes", "remove all pending changes" → These are COMMANDS (clear_all_changes), NOT undo_request
+   - undo_request is for undoing ONE action, NOT clearing all changes
+
+9. **redo_request** - User wants to restore an undone action (route to undo_redo)
+   - "redo", "redo that", "bring back what I undid", "restore the last change"
+   - "actually, put that back", "nevermind, keep it", "redo CHG-003"
+   - Must have something in the redo stack to work
+
+10. **comparison_question** - User wants to compare versions or see differences (route to compare_reports)
+    - Version comparison: "what's different between v1 and v3?", "compare version 1 to current"
+    - Diff/changes: "what changed?", "show me the diff", "what did we modify?"
+    - Section-specific: "how did the architecture section change?", "compare the estimates"
+    - Time-based: "what changed since yesterday?", "changes since last week"
+    - Examples: "show diff", "what's new in this version", "list all modifications"
+
+11. **whatif_question** - Hypothetical scenario analysis (route to analyze_whatif)
+    - "what if we used PostgreSQL instead?", "what would happen if we removed caching?"
+    - "how would this affect costs if we used AWS instead of GCP?"
+    - "suppose we needed to handle 10x the users - what would change?"
+    - NOT a suggestion - user wants analysis before deciding
+    - Should return impact analysis without committing any changes
+
+12. **edit_requirement** - User wants to modify an existing tracked change (route to edit_requirement)
+    - "change CHG-002 to say PostgreSQL instead", "update the user limit from 1000 to 5000"
+    - "edit CHG-001", "modify the last change", "reword CHG-003"
+    - "correct CHG-001 - I meant microservices, not monolith"
+    - Extract: target change ID and new value/content
+
+13. **clarification_response** - User answering a question we asked
+    - ONLY use when user is directly answering OUR question
+    - Previous assistant message must have asked an explicit question
+    - Examples: If we asked "Which database?", user responds "PostgreSQL"
+
+====================
+CRITICAL CLASSIFICATION RULES
+====================
+
+**RULE 1: CHECK PENDING ACTIONS FIRST**
+If pending_actions is NOT empty, any short response (1-5 words) that could be a confirmation/decline MUST be classified as such.
+- Map the confirmation to the SPECIFIC pending_action_id
+- Never assume "yes" means something else when there are pending actions
+
+**RULE 2: DISTINGUISH CHALLENGE FROM QUESTION**
+- "Why did you choose DynamoDB?" = question (curious, wants to understand)
+- "Why DynamoDB when S3 is cheaper?" = architecture_challenge (implies alternative)
+- "Isn't DynamoDB expensive?" = architecture_challenge (implies it's too expensive)
+
+**RULE 3: HANDLE COMPOUND INTENTS**
+A message can have MULTIPLE intents:
+- "Yes, and also add caching" = confirmation + explicit_suggestion
+- "Why DynamoDB? Let's use S3 instead" = architecture_challenge + explicit_suggestion
+- "That sounds good, but what about costs?" = confirmation + question
+
+**RULE 4: DETECT CONDITIONS ON CONFIRMATIONS**
+"Yes, but I'm worried about costs" = confirmation with condition
+Return both the confirmation AND the concern as separate intents.
+
+**RULE 5: FINAL INTENT WINS FOR CONFLICTS**
+"No, wait, actually yes" = confirmation (the final position)
+"Yes... no, skip it" = decline (the final position)
+
+**RULE 6: MERGE/COMBINE REQUESTS ARE ALWAYS COMMANDS, NEVER SUGGESTIONS**
+When user mentions "merge", "combine", "consolidate", or "remove duplicates" in relation to pending changes:
+- "merge them" = command (identify_duplicates) - NOT a suggestion
+- "merge all" = command (identify_duplicates) - NOT a suggestion
+- "merge these" = command (identify_duplicates) - NOT a suggestion
+- "combine the duplicates" = command (identify_duplicates) - NOT a suggestion
+- "clean up the changes" = command (consolidate_changes) - NOT a suggestion
+This is CRITICAL - these words in context of pending changes management are COMMANDS to be routed to manage_pending_changes, never suggestions to be tracked as new changes.
+
+**RULE 7: DISTINGUISH WHAT-IF FROM SUGGESTIONS**
+"What if" phrasing indicates the user wants ANALYSIS before deciding, not an immediate change:
+- "What if we used X?" = whatif_question (analyze impact, don't track)
+- "Use X" = explicit_suggestion (track the change)
+- "Have you considered X?" = implicit_suggestion (confirm before tracking)
+- "Suppose we needed X" = whatif_question (hypothetical analysis)
+After what-if analysis, user may then say "ok let's do it" = THEN it becomes a suggestion to track.
+
+**RULE 8: UNDO/REDO ARE ALWAYS COMMANDS**
+Undo-related language routes to undo_redo handler:
+- "undo", "take back", "scratch that", "nevermind", "cancel", "revert" = undo_request
+- "redo", "bring back", "restore", "put it back" = redo_request
+- Extract target if specified: "undo CHG-003" → target = "CHG-003"
+- If no target specified, assume "last" change
+
+**RULE 9: COMPARISON QUESTIONS ROUTE TO COMPARE_REPORTS**
+Any request to see differences or compare versions:
+- "what changed" = comparison_question
+- "show diff" = comparison_question
+- "compare v1 to v3" = comparison_question
+- "what's different" = comparison_question
+These should NOT be confused with general questions about the architecture.
+
+**RULE 10: EDIT REQUESTS ARE NOT NEW SUGGESTIONS**
+When user wants to modify an EXISTING change (CHG-XXX):
+- "change CHG-002 to X" = edit_requirement (modify existing)
+- "update the last change" = edit_requirement (modify existing)
+- "reword CHG-001" = edit_requirement (modify existing)
+This is different from adding a new change - we're modifying something already tracked.
+
+**RULE 11: COMPOUND RESPONSES (Multiple Response Types)**
+User may provide multiple response types in a single message. Detect ALL intents:
+- Ask question + provide confirmation: "What does that cost? And yes to the PostgreSQL change"
+- Raise concern + confirm: "I'm worried about costs, but let's proceed"
+- Answer + ask: "Yes to that, but why did we choose AWS?"
+- Multiple questions: "Why Redis? And what's the estimated timeline?"
+
+Process with priorities:
+1. Confirmations/declines (highest - resolve pending actions first)
+2. Questions (answer after resolving)
+3. Suggestions (track after answering)
+
+Return ALL intents in the intents array with appropriate priorities.
+
+**RULE 12: SWITCH REPORT VERSION IS A COMMAND**
+When user wants to change which report version is active:
+- "switch to version 2" = command (switch_report_version, version_number: 2)
+- "make version 3 current" = command (switch_report_version, version_number: 3)
+- "use version 1" = command (switch_report_version, version_number: 1)
+- "set default to version 2" = command (switch_report_version, version_number: 2)
+Always extract the version_number into the intent output.
+
+**RULE 13: CLEAR ALL CHANGES IS A COMMAND, NOT AN UNDO**
+When user wants to clear/remove ALL pending changes:
+- "clear all changes" = command (clear_all_changes) → process_command
+- "clear my changes" = command (clear_all_changes) → process_command
+- "remove all pending changes" = command (clear_all_changes) → process_command
+- "start fresh" = command (clear_all_changes) → process_command
+- "discard all changes" = command (clear_all_changes) → process_command
+CRITICAL: These are NOT undo_request! undo_request is for undoing ONE specific action.
+clear_all_changes is for removing ALL pending changes at once (requires confirmation).
+
+====================
+OUTPUT FORMAT (JSON)
+====================
+
+Return ONLY valid JSON:
+
+{{
+  "intents": [
+    {{
+      "type": "confirmation|decline|question|architecture_challenge|explicit_suggestion|implicit_suggestion|command|clarification_response",
+      "content": "extracted content for this intent",
+      "action": "action type if applicable",
+      "pending_action_id": "PA-001 if this is confirming/declining a pending action",
+      "change_ids": ["CHG-001", "CHG-002"], // For pending change management commands
+      "version_number": 2, // For switch_report_version command - extract the version number
+      "priority": 1,
+      "requires_confirmation": true|false,
+      "conditions": "any conditions attached (for conditional confirmations)"
+    }}
+  ],
+  "primary_intent": "the main intent type",
+  "confirmation_map": {{
+    "PA-001": "confirmed|declined|partial",
+    "conditions": "any conditions from user"
+  }},
+  "requires_architecture_defense": true|false,
+  "defense_topic": "What needs to be defended (e.g., 'Why DynamoDB over S3')" | null,
+  "primary_response_strategy": "answer_question|defend_architecture|track_change|confirm_action|decline_action|process_command|manage_pending_changes|undo_redo|compare_reports|analyze_whatif|edit_requirement|hybrid_response",
+  "reasoning": "Brief explanation of classification"
+}}
+
+====================
+EXAMPLES
+====================
+
+Example 1 - Simple Confirmation:
+pending_actions: [{{"id": "PA-001", "type": "suggestion", "content": "Use PostgreSQL"}}]
+user_message: "yes"
+Output:
+{{
+  "intents": [{{"type": "confirmation", "pending_action_id": "PA-001", "priority": 1}}],
+  "primary_intent": "confirmation",
+  "confirmation_map": {{"PA-001": "confirmed"}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "confirm_action",
+  "reasoning": "Short affirmative with pending action - confirming PA-001"
+}}
+
+Example 2 - Architecture Challenge:
+pending_actions: []
+user_message: "Why are we paying for DynamoDB when we already have S3?"
+Output:
+{{
+  "intents": [
+    {{"type": "architecture_challenge", "content": "Cost of DynamoDB vs using S3", "priority": 1}}
+  ],
+  "primary_intent": "architecture_challenge",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": true,
+  "defense_topic": "Why DynamoDB is used alongside S3 despite cost",
+  "primary_response_strategy": "defend_architecture",
+  "reasoning": "User questioning a cost decision with implied alternative - needs defense"
+}}
+
+Example 3 - Compound (Confirmation + New Suggestion):
+pending_actions: [{{"id": "PA-001", "type": "suggestion", "content": "Use PostgreSQL"}}]
+user_message: "yes, and also add Redis for caching"
+Output:
+{{
+  "intents": [
+    {{"type": "confirmation", "pending_action_id": "PA-001", "priority": 1}},
+    {{"type": "explicit_suggestion", "content": "Add Redis for caching", "action": "modify_architecture", "priority": 2}}
+  ],
+  "primary_intent": "confirmation",
+  "confirmation_map": {{"PA-001": "confirmed"}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "confirm_action",
+  "reasoning": "Confirming pending action AND adding new suggestion"
+}}
+
+Example 4 - Challenge with Explicit Suggestion:
+pending_actions: []
+user_message: "This seems overcomplicated. Just use MongoDB for everything."
+Output:
+{{
+  "intents": [
+    {{"type": "architecture_challenge", "content": "Architecture is overcomplicated", "priority": 1}},
+    {{"type": "explicit_suggestion", "content": "Use MongoDB for everything", "action": "modify_architecture", "priority": 2}}
+  ],
+  "primary_intent": "architecture_challenge",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": true,
+  "defense_topic": "Why the current architecture complexity is justified",
+  "primary_response_strategy": "defend_architecture",
+  "reasoning": "Challenge to architecture complexity with direct alternative suggestion"
+}}
+
+Example 5 - Conditional Confirmation:
+pending_actions: [{{"id": "PA-001", "type": "suggestion", "content": "Use Lambda for processing"}}]
+user_message: "yes, but I'm worried about cold start latency"
+Output:
+{{
+  "intents": [
+    {{"type": "confirmation", "pending_action_id": "PA-001", "conditions": "concerned about cold start latency", "priority": 1}},
+    {{"type": "question", "content": "concern about Lambda cold start latency", "action": "answer_question_from_report", "priority": 2}}
+  ],
+  "primary_intent": "confirmation",
+  "confirmation_map": {{"PA-001": "confirmed", "conditions": "user has concerns about cold start latency"}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "confirm_action",
+  "reasoning": "Confirming with condition - should confirm AND address concern"
+}}
+
+Example 6 - Pending Change Management (Find Duplicates):
+pending_actions: []
+user_message: "can you find and remove the duplicate changes?"
+Output:
+{{
+  "intents": [
+    {{"type": "command", "content": "find and remove duplicates", "action": "identify_duplicates", "priority": 1}}
+  ],
+  "primary_intent": "command",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "manage_pending_changes",
+  "reasoning": "User requesting duplicate detection and removal - route to pending change management"
+}}
+
+Example 7 - Pending Change Management (Merge Specific Changes):
+pending_actions: []
+user_message: "merge CHG-001 and CHG-003 together"
+Output:
+{{
+  "intents": [
+    {{"type": "command", "content": "merge changes", "action": "merge_changes", "change_ids": ["CHG-001", "CHG-003"], "priority": 1}}
+  ],
+  "primary_intent": "command",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "manage_pending_changes",
+  "reasoning": "User requesting merge of specific changes - extract CHG-XXX IDs"
+}}
+
+Example 8 - Confirming a Merge Operation:
+pending_actions: [{{"id": "PA-002", "type": "merge_duplicates", "content": "Merge into: Use PostgreSQL"}}]
+user_message: "yes, go ahead and merge those"
+Output:
+{{
+  "intents": [
+    {{"type": "confirmation", "pending_action_id": "PA-002", "priority": 1}}
+  ],
+  "primary_intent": "confirmation",
+  "confirmation_map": {{"PA-002": "confirmed"}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "confirm_action",
+  "reasoning": "Confirming merge operation - route to confirmation handler which will execute merge"
+}}
+
+Example 9 - Confirming Multiple Merge Operations (merge them all):
+pending_actions: [
+  {{"id": "PA-001", "type": "merge_duplicates", "content": "Merge into: Use PostgreSQL"}},
+  {{"id": "PA-002", "type": "merge_duplicates", "content": "Merge into: Add caching layer"}}
+]
+user_message: "merge them all" OR "yes merge everything" OR "go ahead merge all"
+Output:
+{{
+  "intents": [
+    {{"type": "confirmation", "pending_action_id": "PA-001", "priority": 1}},
+    {{"type": "confirmation", "pending_action_id": "PA-002", "priority": 2}}
+  ],
+  "primary_intent": "confirmation",
+  "confirmation_map": {{"PA-001": "confirmed", "PA-002": "confirmed"}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "confirm_action",
+  "reasoning": "User wants to merge all - confirming ALL pending merge_duplicates actions"
+}}
+
+Example 10 - Merge Request When No Pending Actions (becomes new merge command):
+pending_actions: []
+user_message: "merge them all" OR "merge the duplicates"
+Output:
+{{
+  "intents": [
+    {{"type": "command", "content": "merge duplicates", "action": "identify_duplicates", "priority": 1}}
+  ],
+  "primary_intent": "command",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "manage_pending_changes",
+  "reasoning": "No pending merge actions exist - treat as new request to find and merge duplicates"
+}}
+
+Example 11 - Short merge command after seeing changes (CRITICAL - this is a COMMAND, not a suggestion):
+pending_actions: []
+recent_messages: [assistant listed pending changes CHG-001 through CHG-007]
+user_message: "merge them" OR "merge these" OR "combine them" OR "merge all"
+Output:
+{{
+  "intents": [
+    {{"type": "command", "content": "merge/combine pending changes", "action": "identify_duplicates", "priority": 1}}
+  ],
+  "primary_intent": "command",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "manage_pending_changes",
+  "reasoning": "User wants to merge changes shown in previous message - this is a COMMAND to identify and merge duplicates, NOT a suggestion to track"
+}}
+
+Example 12 - WRONG classification (what NOT to do):
+user_message: "merge them"
+WRONG: Classifying as explicit_suggestion and tracking "merge them" as a new change
+CORRECT: Classifying as command with action=identify_duplicates
+The words "merge", "combine", "consolidate" in context of changes are ALWAYS commands, never suggestions.
+
+Example 13 - Undo Last Change:
+pending_actions: []
+user_message: "undo that" OR "take that back" OR "scratch the last one"
+Output:
+{{
+  "intents": [
+    {{"type": "undo_request", "content": "undo last change", "target": "last", "priority": 1}}
+  ],
+  "primary_intent": "undo_request",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "undo_redo",
+  "reasoning": "User wants to undo the most recent change - route to undo handler"
+}}
+
+Example 14 - Undo Specific Change:
+pending_actions: []
+user_message: "undo CHG-003" OR "remove CHG-003" OR "cancel CHG-003"
+Output:
+{{
+  "intents": [
+    {{"type": "undo_request", "content": "undo specific change", "target": "CHG-003", "change_ids": ["CHG-003"], "priority": 1}}
+  ],
+  "primary_intent": "undo_request",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "undo_redo",
+  "reasoning": "User wants to undo a specific change CHG-003"
+}}
+
+Example 15 - Redo Request:
+pending_actions: []
+user_message: "redo" OR "bring that back" OR "actually, keep it" OR "restore what I undid"
+Output:
+{{
+  "intents": [
+    {{"type": "redo_request", "content": "redo last undone action", "target": "last", "priority": 1}}
+  ],
+  "primary_intent": "redo_request",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "undo_redo",
+  "reasoning": "User wants to restore the most recently undone change"
+}}
+
+Example 16 - Version Comparison:
+pending_actions: []
+user_message: "what changed between version 1 and version 3?" OR "compare v1 to v3"
+Output:
+{{
+  "intents": [
+    {{"type": "comparison_question", "content": "compare versions", "versions": ["1", "3"], "priority": 1}}
+  ],
+  "primary_intent": "comparison_question",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "compare_reports",
+  "reasoning": "User wants to see differences between two report versions"
+}}
+
+Example 17 - Show Diff/Changes:
+pending_actions: []
+user_message: "show me what changed" OR "what did we modify?" OR "list all modifications"
+Output:
+{{
+  "intents": [
+    {{"type": "comparison_question", "content": "show changes since start", "scope": "all_changes", "priority": 1}}
+  ],
+  "primary_intent": "comparison_question",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "compare_reports",
+  "reasoning": "User wants to see all modifications made during this session"
+}}
+
+Example 18 - What-If Analysis:
+pending_actions: []
+user_message: "what if we used PostgreSQL instead of DynamoDB?" OR "what would happen if we dropped mobile support?"
+Output:
+{{
+  "intents": [
+    {{"type": "whatif_question", "content": "analyze using PostgreSQL instead of DynamoDB", "scenario": "replace DynamoDB with PostgreSQL", "priority": 1}}
+  ],
+  "primary_intent": "whatif_question",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "analyze_whatif",
+  "reasoning": "User wants hypothetical analysis before committing - NOT a suggestion to track"
+}}
+
+Example 19 - Edit Existing Change:
+pending_actions: []
+user_message: "change CHG-002 to say PostgreSQL instead of MySQL" OR "update CHG-001"
+Output:
+{{
+  "intents": [
+    {{"type": "edit_requirement", "content": "edit CHG-002", "target": "CHG-002", "change_ids": ["CHG-002"], "new_value": "PostgreSQL instead of MySQL", "priority": 1}}
+  ],
+  "primary_intent": "edit_requirement",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "edit_requirement",
+  "reasoning": "User wants to modify an existing tracked change"
+}}
+
+Example 20 - Compound: Question + What-If:
+pending_actions: []
+user_message: "What database are we using? And what if we switched to MongoDB?"
+Output:
+{{
+  "intents": [
+    {{"type": "question", "content": "what database are we using", "priority": 1}},
+    {{"type": "whatif_question", "content": "what if switched to MongoDB", "scenario": "switch to MongoDB", "priority": 2}}
+  ],
+  "primary_intent": "question",
+  "confirmation_map": {{}},
+  "requires_architecture_defense": false,
+  "defense_topic": null,
+  "primary_response_strategy": "hybrid_response",
+  "reasoning": "Compound: factual question about current state + hypothetical analysis request"
+}}
+
+Example 21 - Distinguishing What-If from Suggestion:
+pending_actions: []
+user_message: "Use MongoDB" → explicit_suggestion (direct command)
+user_message: "What if we used MongoDB?" → whatif_question (analysis request)
+user_message: "Have you considered MongoDB?" → implicit_suggestion (needs confirmation)
+CRITICAL: "what if" indicates user wants analysis FIRST, not immediate change tracking
+
+Example 22 - Natural Language Undo Variations:
+All these should route to undo_redo with undo_request:
+- "I didn't mean that"
+- "nevermind the last one"
+- "scratch that"
+- "forget what I just said"
+- "remove my last suggestion"
+- "take back CHG-005"
+- "oops, undo"
+- "wait no, undo that"
+"""
+
+
+# ============================================================
+# ARCHITECTURE DEFENSE PROMPT
+# ============================================================
+
+ARCHITECTURE_DEFENSE_PROMPT = """
+You are AlignIQ, responding as the solution architect who designed this architecture.
+
+The user is challenging a design decision. Your role is to:
+1. Acknowledge their technical thinking (they may have a valid point)
+2. Explain WHY this choice was made (reference specific requirements)
+3. Explain the trade-offs that were considered
+4. If their suggestion has merit, offer to track it as a modification
+5. If it would violate requirements, explain why
+
+====================
+CONTEXT
+====================
+Challenge Topic: {challenge_topic}
+User Message: {user_message}
+
+Architecture Context: {architecture_context}
+Trade-offs Considered: {trade_offs}
+Report Summary: {report_summary}
+
+Recent Conversation: {recent_messages}
+
+====================
+RESPONSE GUIDELINES
+====================
+
+TONE:
+- Confident but not defensive or dismissive
+- Speak as a peer, not as someone being attacked
+- Use "we" language - "we chose this because..." not "I chose this..."
+- Be open to being wrong, but defend thoughtfully
+
+STRUCTURE:
+1. Acknowledge their observation (1 sentence)
+2. Explain the requirement that drove this decision (1-2 sentences)
+3. Describe what was considered and why this was chosen (2-3 sentences)
+4. Address their specific concern directly (1-2 sentences)
+5. If appropriate, offer to track as a change (1 sentence)
+
+DO NOT:
+- Immediately agree without explanation
+- Be condescending ("That's a common misconception...")
+- Ignore valid points they raise
+- Use robotic phrases ("I understand your concern", "Your suggestion is noted")
+
+EXAMPLE GOOD RESPONSE:
+"That's a fair point about the dual-database overhead. We went with DynamoDB specifically for the sub-10ms latency requirement on session lookups - S3's eventual consistency and higher read latency would impact the real-time dashboard experience during peak loads. The cost difference is roughly $200/month for the expected usage patterns, which we weighed against the latency SLA. That said, if batch processing becomes the dominant pattern and latency requirements relax, consolidating to S3 would make sense. Would you like me to track that as a potential modification?"
+
+EXAMPLE BAD RESPONSE:
+"**Why DynamoDB was chosen:** The report recommends DynamoDB for performance. **Your Concern:** I understand your cost concerns. **Trade-offs:** Here are the trade-offs..."
+
+====================
+OUTPUT
+====================
+Write a natural, conversational response (150-250 words).
+End with an offer to track as a change if their suggestion has merit.
+Do NOT end with an offer if their suggestion would break requirements - instead explain why.
 """

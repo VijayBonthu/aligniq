@@ -1,6 +1,6 @@
 
-from typing import Optional, List, Dict
-from pydantic import BaseModel, UUID4
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, UUID4, ConfigDict
 from datetime import datetime
 
 class UploadDoc(BaseModel):
@@ -31,10 +31,14 @@ class JiraTokenRequest(BaseModel):
     jira_access_token:str
 
 class MessageContent(BaseModel):
-    role:str
-    content:str
-    timestamp:Optional[str] = None
-    selected:Optional[bool] = True  # Default to True for backward compatibility
+    role: str
+    content: str
+    timestamp: Optional[str] = None
+    selected: Optional[bool] = True  # Default to True for backward compatibility
+    type: Optional[str] = None  # Message type: "hybrid_response", "suggestion_confirmed", etc.
+    pending_suggestion: Optional[Dict[str, Any]] = None  # For hybrid flow: stores awaiting confirmation
+
+    model_config = ConfigDict(extra="allow")  # Allow extra fields to pass through without stripping
 
 class ChatHistoryDetails(BaseModel):
     chat_history_id:Optional[str] = None

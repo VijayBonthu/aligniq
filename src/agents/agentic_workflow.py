@@ -406,26 +406,28 @@ async def conversational_summary(chat_history: list, main_report_summary: str) -
     return validate_response(response, "conversational_summary")
 
 
-async def main_report_summary(main_report: str) -> dict:
+async def main_report_summary(main_report: str, version_number: int = 1) -> dict:
     """
     Generate a structured summary of the main report.
 
     Args:
         main_report: Full report markdown content
+        version_number: The version number of this report (default: 1)
 
     Returns:
         dict: Structured report summary
     """
-    logger.info("Starting main_report_summary")
+    logger.info(f"Starting main_report_summary for version {version_number}")
     main_summary = ChatPromptTemplate.from_template(SUMMARIAZE_MAIN_REPORT_PROMPT)
     parser = JsonOutputParser()
     chain = main_summary | llm_parser | parser
     input_dict = {
-        "full_report_markdown": main_report
+        "full_report_markdown": main_report,
+        "version_number": f"v{version_number}"
     }
 
     response = await invoke_with_timeout(chain, input_dict, agent_name="main_report_summary")
-    logger.info("Completed main_report_summary")
+    logger.info(f"Completed main_report_summary for version {version_number}")
     return validate_response(response, "main_report_summary")
 
 
@@ -499,4 +501,308 @@ async def regenerate_report_sections(
         raise AgentOutputError("Regenerated report is too short - regeneration may have failed")
 
     return validated_response
+
+
+def format_full_context_for_pipeline(
+    pending_changes: list,
+    presales_context: dict = None
+) -> str:
+    """
+    Format ALL context (constraints + presales data) as a document section.
+
+    This function creates a comprehensive markdown section that will be prepended
+    to the document for the full 9-agent pipeline. All agents will see this context
+    as part of the source document.
+
+    Creates sections for:
+    1. MANDATORY ARCHITECTURAL CONSTRAINTS (pending changes)
+    2. CLIENT CLARIFICATIONS (Q&A from presales questions)
+    3. ASSUMPTIONS (from presales analysis)
+    4. ADDITIONAL CLIENT CONTEXT (user comments)
+
+    Args:
+        pending_changes: List of pending change objects with:
+            - id: Change ID (e.g., "CHG-001")
+            - type: Change type (e.g., "modify_architecture")
+            - user_request: The user's original request
+            - affected_sections: List of affected section names
+        presales_context: Dict containing:
+            - scanned_requirements: dict
+            - blind_spots: dict
+            - assumptions_list: list of assumption objects
+            - questions_and_answers: list of {question_text, answer, answer_quality}
+            - additional_context: str (user comments)
+            - user_answers: dict
+
+    Returns:
+        str: Formatted markdown context section to prepend to document
+    """
+    context_parts = []
+
+    # Section 1: MANDATORY CONSTRAINTS (Pending Changes)
+    if pending_changes:
+        constraints_section = """
+## MANDATORY ARCHITECTURAL CONSTRAINTS
+
+The following changes have been requested by the client and MUST be incorporated
+into all analysis and recommendations. These override any conflicting decisions
+from the original analysis.
+
+"""
+        for change in pending_changes:
+            change_id = change.get('id', 'CHG-XXX')
+            change_type = change.get('type', 'modification')
+            user_request = change.get('user_request', '')
+            affected = change.get('affected_sections', [])
+
+            constraints_section += f"""
+### Constraint {change_id}
+- **Type**: {change_type}
+- **Requirement**: {user_request}
+- **Affected Areas**: {', '.join(affected) if affected else 'General'}
+"""
+        context_parts.append(constraints_section)
+
+    if presales_context:
+        # Section 2: CLIENT Q&A CLARIFICATIONS (Answered Questions)
+        qa_list = presales_context.get("questions_and_answers", [])
+        if qa_list:
+            qa_section = """
+## CLIENT CLARIFICATIONS (Questions & Answers)
+
+The following questions were asked and answered during the pre-sales phase.
+These answers represent confirmed client requirements and should be treated
+as authoritative input for the analysis.
+
+"""
+            for qa in qa_list:
+                if qa.get("answer"):  # Only include answered questions
+                    q_num = qa.get('question_number', 'Q')
+                    q_text = qa.get('question_text', '')
+                    answer = qa.get('answer', '')
+                    quality = qa.get('answer_quality', 'unknown')
+                    area = qa.get('area_or_category', '')
+
+                    qa_section += f"""
+### {q_num} ({area})
+- **Question**: {q_text}
+- **Answer**: {answer}
+- **Answer Quality**: {quality}
+"""
+            context_parts.append(qa_section)
+
+        # Section 3: ASSUMPTIONS
+        assumptions = presales_context.get("assumptions_list", [])
+        if assumptions:
+            assumptions_section = """
+## ASSUMPTIONS
+
+The following assumptions were made during the pre-sales analysis phase.
+Treat these as working assumptions unless contradicted by the mandatory
+constraints above or by explicit client clarifications.
+
+"""
+            for assumption in assumptions:
+                if isinstance(assumption, dict):
+                    assumption_text = assumption.get('assumption', str(assumption))
+                    basis = assumption.get('basis', '')
+                    impact = assumption.get('impact_if_wrong', '')
+
+                    assumptions_section += f"""
+- **Assumption**: {assumption_text}
+"""
+                    if basis:
+                        assumptions_section += f"  - **Basis**: {basis}\n"
+                    if impact:
+                        assumptions_section += f"  - **Risk if wrong**: {impact}\n"
+                else:
+                    assumptions_section += f"- {assumption}\n"
+
+            context_parts.append(assumptions_section)
+
+        # Section 4: ADDITIONAL CLIENT CONTEXT
+        additional = presales_context.get("additional_context", "")
+        if additional and additional.strip():
+            additional_section = f"""
+## ADDITIONAL CLIENT CONTEXT
+
+The client provided the following additional information/comments that should
+be considered in the analysis:
+
+{additional}
+"""
+            context_parts.append(additional_section)
+
+        # Section 5: BLIND SPOTS (from presales analysis)
+        blind_spots = presales_context.get("blind_spots", {})
+        if blind_spots:
+            blind_spots_section = """
+## IDENTIFIED BLIND SPOTS
+
+The following blind spots were identified during pre-sales analysis.
+These areas require special attention in the full analysis:
+
+"""
+            if isinstance(blind_spots, dict):
+                for category, items in blind_spots.items():
+                    if items:
+                        blind_spots_section += f"\n### {category}\n"
+                        if isinstance(items, list):
+                            for item in items:
+                                if isinstance(item, dict):
+                                    blind_spots_section += f"- {item.get('description', str(item))}\n"
+                                else:
+                                    blind_spots_section += f"- {item}\n"
+                        else:
+                            blind_spots_section += f"- {items}\n"
+            context_parts.append(blind_spots_section)
+
+    # Combine all sections
+    if context_parts:
+        full_context = """
+# REGENERATION CONTEXT - READ CAREFULLY
+
+This report is being regenerated with the following context and constraints.
+All agents MUST consider this information when producing their analysis.
+
+---
+""" + "\n---\n".join(context_parts) + """
+
+---
+## END OF REGENERATION CONTEXT
+---
+
+"""
+        return full_context
+
+    return ""
+
+
+async def run_pipeline_with_constraints(
+    document: list[str],
+    pending_changes: list,
+    presales_context: dict = None,
+    timeout: int = None
+) -> dict:
+    """
+    Run the full 9-agent pipeline with pending changes as mandatory constraints
+    AND full presales context (questions, answers, assumptions, additional context).
+
+    This function wraps the existing run_agent_pipeline() but prepends
+    all context information to the document so all agents consider them.
+
+    Args:
+        document: Original document text as list of chunks
+        pending_changes: List of pending change objects as constraints
+        presales_context: Dict containing:
+            - scanned_requirements: dict
+            - blind_spots: dict
+            - assumptions_list: list
+            - questions_and_answers: list of {question, answer, quality}
+            - additional_context: str (user comments)
+            - user_answers: dict
+        timeout: Pipeline timeout in seconds (defaults to settings.PIPELINE_TIMEOUT)
+
+    Returns:
+        {
+            "report": str,              # Generated markdown report from final agent
+            "processing_time": float,   # Time taken in seconds
+            "constraints_applied": int, # Number of constraints applied
+            "context_included": dict,   # What context was included
+            "error": str or None        # Error message if failed
+        }
+
+    Raises:
+        PipelineError: If the pipeline fails catastrophically
+    """
+    import time
+    from agents.workflow_graph import run_agent_pipeline
+
+    start_time = time.time()
+    timeout = timeout or settings.PIPELINE_TIMEOUT
+
+    # Track what context we're including
+    context_included = {
+        "constraints": len(pending_changes),
+        "questions_answered": len(presales_context.get("questions_and_answers", [])) if presales_context else 0,
+        "assumptions": len(presales_context.get("assumptions_list", [])) if presales_context else 0,
+        "has_additional_context": bool(presales_context and presales_context.get("additional_context")),
+        "has_blind_spots": bool(presales_context and presales_context.get("blind_spots"))
+    }
+
+    logger.info(
+        f"Starting pipeline with constraints: {context_included['constraints']} constraints, "
+        f"{context_included['questions_answered']} Q&A pairs, "
+        f"{context_included['assumptions']} assumptions"
+    )
+
+    try:
+        # Format all context as document section
+        context_section = format_full_context_for_pipeline(
+            pending_changes=pending_changes,
+            presales_context=presales_context
+        )
+
+        # Prepend context to document
+        if context_section:
+            enhanced_document = [context_section] + document
+            logger.info(f"Enhanced document with {len(context_section)} chars of context")
+        else:
+            enhanced_document = document
+            logger.info("No context to prepend, using original document")
+
+        # Run full 9-agent pipeline
+        result = await run_agent_pipeline(
+            document=enhanced_document,
+            timeout=timeout
+        )
+
+        # Extract final report from result
+        if not result.get("message") or len(result["message"]) == 0:
+            raise AgentOutputError("Pipeline completed but no report was generated")
+
+        final_message = result["message"][-1]
+        final_report = final_message.content if hasattr(final_message, 'content') else str(final_message)
+
+        processing_time = time.time() - start_time
+        logger.info(f"Pipeline with constraints completed in {processing_time:.2f}s")
+
+        return {
+            "report": final_report,
+            "processing_time": processing_time,
+            "constraints_applied": len(pending_changes),
+            "context_included": context_included,
+            "error": None
+        }
+
+    except (LLMTimeoutError, LLMRetryExhaustedError) as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Pipeline failed due to LLM error: {str(e)}")
+        return {
+            "report": None,
+            "processing_time": processing_time,
+            "constraints_applied": len(pending_changes),
+            "context_included": context_included,
+            "error": f"LLM error: {str(e)}"
+        }
+    except AgentOutputError as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Pipeline failed due to agent output error: {str(e)}")
+        return {
+            "report": None,
+            "processing_time": processing_time,
+            "constraints_applied": len(pending_changes),
+            "context_included": context_included,
+            "error": f"Agent error: {str(e)}"
+        }
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Pipeline failed unexpectedly: {str(e)}")
+        return {
+            "report": None,
+            "processing_time": processing_time,
+            "constraints_applied": len(pending_changes),
+            "context_included": context_included,
+            "error": f"Unexpected error: {str(e)}"
+        }
 

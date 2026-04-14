@@ -102,20 +102,20 @@ async def retrieve_similar_embeddings(query_text:str,chat_history_id:str, model:
     raise RuntimeError(f"failed to retrieve similar embeddings: {e}")
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
    
-  import asyncio
+#   import asyncio
 #   text = "third sample text"
 #   model = "text-embedding-3-small"
 #   chat_history_id = "chat_history_123"
 #   chunk_id = "chunk_123"
 #   result = asyncio.run(create_embeddings(text, model, chat_history_id, chunk_id))
 #   print(result)
-  query_text = "what is the company we are doing this project for?"
-  model = "text-embedding-3-small"
-  # chat_history_id = "a4bf7ade-5588-4746-81e0-890921e9fd96"
-  chat_history_id = "d7fff20d-40c1-4653-8556-dad60830b697"
-  answer = asyncio.run(retrieve_similar_embeddings(query_text=query_text, chat_history_id=chat_history_id, model=model, top_k=5))
-  print(answer)
+  # query_text = "what is the company we are doing this project for?"
+  # model = "text-embedding-3-small"
+  # # chat_history_id = "a4bf7ade-5588-4746-81e0-890921e9fd96"
+  # chat_history_id = "d7fff20d-40c1-4653-8556-dad60830b697"
+  # answer = asyncio.run(retrieve_similar_embeddings(query_text=query_text, chat_history_id=chat_history_id, model=model, top_k=5))
+  # print(answer)
   
 

@@ -118,6 +118,7 @@ SECTION_DEPENDENCIES = {
     "modify_requirements": ["requirements", "architecture", "estimates", "executive_summary"],
     "modify_architecture": ["architecture", "components", "risks", "estimates", "executive_summary"],
     "correct_assumptions": ["assumptions", "architecture", "risks", "estimates"],
+    "improve_section": [],  # Affected sections are specified dynamically based on user request
 }
 
 def get_affected_sections(action_type: str) -> list:
@@ -182,6 +183,36 @@ async def add_pending_change(chat_history_id: str, change: dict, db: Session) ->
         # IMPORTANT: Create a deep copy of the existing changes
         # SQLAlchemy doesn't detect in-place mutations of JSON columns
         current_changes = copy.deepcopy(record.pending_changes) if record.pending_changes else []
+
+        # Check for duplicate content to prevent tracking same change twice
+        new_request = change.get("user_request", "").lower().strip()
+        if new_request:
+            for existing in current_changes:
+                existing_request = existing.get("user_request", "").lower().strip()
+                if existing_request == new_request:
+                    # Exact duplicate - return existing without adding
+                    logger.info(f"Skipping duplicate change: {new_request[:50]}...")
+                    return {
+                        "status": "duplicate",
+                        "pending_changes": current_changes,
+                        "change_id": existing.get("id", "CHG-XXX"),
+                        "message": f"This change already exists as {existing.get('id')}"
+                    }
+                # Also check for high similarity (Jaccard > 0.8)
+                new_words = set(new_request.split())
+                existing_words = set(existing_request.split())
+                if new_words and existing_words:
+                    intersection = len(new_words & existing_words)
+                    union = len(new_words | existing_words)
+                    similarity = intersection / union if union > 0 else 0
+                    if similarity > 0.8:
+                        logger.info(f"Skipping highly similar change (similarity={similarity:.2f}): {new_request[:50]}...")
+                        return {
+                            "status": "similar",
+                            "pending_changes": current_changes,
+                            "change_id": existing.get("id", "CHG-XXX"),
+                            "message": f"A very similar change already exists as {existing.get('id')}"
+                        }
 
         # Add change ID if not present
         if "id" not in change:
@@ -894,6 +925,194 @@ async def get_report_diff(
 
 
 # ============================================================
+# REPORT VERSION DEFAULT/RETRIEVAL FUNCTIONS
+# ============================================================
+
+async def get_default_report(chat_history_id: str, user_id: str, db: Session) -> dict:
+    """
+    Get the default (recommended) version of the report.
+    Falls back to latest version if no default is explicitly set.
+
+    Args:
+        chat_history_id: The chat history ID
+        user_id: The user ID (for security validation)
+        db: Database session
+
+    Returns:
+        Full report version record with report_content
+
+    Raises:
+        HTTPException: If no report exists or user validation fails
+    """
+    try:
+        # First try to get explicitly marked default version
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.user_id == user_id,
+            models.ReportVersions.is_default == True
+        ).first()
+
+        # Fall back to latest version if no default set
+        if not record:
+            record = db.query(models.ReportVersions).filter(
+                models.ReportVersions.chat_history_id == chat_history_id,
+                models.ReportVersions.user_id == user_id
+            ).order_by(models.ReportVersions.version_number.desc()).first()
+
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No report found for chat_history_id: {chat_history_id}"
+            )
+
+        return {
+            "report_version_id": record.report_version_id,
+            "chat_history_id": record.chat_history_id,
+            "user_id": record.user_id,
+            "version_number": record.version_number,
+            "report_content": record.report_content,
+            "summary_report": record.summary_report,
+            "is_default": record.is_default,
+            "created_at": record.created_at.isoformat() if record.created_at else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving default report: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving default report: {str(e)}"
+        )
+
+
+async def set_default_version(chat_history_id: str, user_id: str, version_number: int, db: Session) -> dict:
+    """
+    Mark a specific version as the default/recommended version.
+    Ensures only one version is marked as default per chat_history_id.
+
+    Args:
+        chat_history_id: The chat history ID
+        user_id: The user ID (for security validation)
+        version_number: The version to mark as default
+        db: Database session
+
+    Returns:
+        Status dict with updated default version info
+
+    Raises:
+        HTTPException: If version not found or user validation fails
+    """
+    try:
+        # First verify the version exists and belongs to this user
+        target_version = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.user_id == user_id,
+            models.ReportVersions.version_number == version_number
+        ).first()
+
+        if not target_version:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Version {version_number} not found for this report"
+            )
+
+        # Clear existing default for this chat_history_id
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).update({"is_default": False})
+
+        # Set new default
+        target_version.is_default = True
+        flag_modified(target_version, "is_default")
+
+        db.commit()
+        db.refresh(target_version)
+
+        logger.info(f"Set version {version_number} as default for chat_history_id: {chat_history_id}")
+
+        return {
+            "status": "success",
+            "version_number": version_number,
+            "report_version_id": target_version.report_version_id,
+            "message": f"Version {version_number} is now the default version"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error setting default version: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error setting default version: {str(e)}"
+        )
+
+
+async def get_all_report_versions_enhanced(chat_history_id: str, user_id: str, db: Session) -> list:
+    """
+    Get all report versions with distinguishing summaries showing what changed in each.
+
+    Args:
+        chat_history_id: The chat history ID
+        user_id: The user ID (for security)
+        db: Database session
+
+    Returns:
+        List of version records with change summaries
+    """
+    try:
+        records = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.user_id == user_id
+        ).order_by(models.ReportVersions.version_number.desc()).all()
+
+        if not records:
+            return []
+
+        versions = []
+
+        # Process in ascending order to compare with previous
+        for record in reversed(records):
+            version_info = {
+                "report_version_id": record.report_version_id,
+                "version_number": record.version_number,
+                "is_default": record.is_default if hasattr(record, 'is_default') else False,
+                "is_latest": record.version_number == records[0].version_number,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+            }
+
+            # Get executive summary
+            exec_summary = ""
+            if record.summary_report and isinstance(record.summary_report, dict):
+                exec_summary = record.summary_report.get("executive_summary", "")
+                if isinstance(exec_summary, str) and len(exec_summary) > 150:
+                    exec_summary = exec_summary[:150] + "..."
+
+            version_info["executive_summary"] = exec_summary
+
+            # Generate change description
+            if record.version_number == 1:
+                version_info["change_description"] = "Initial report generation"
+            else:
+                # Extract change hints from summary_report if available
+                notes = record.summary_report.get("notes_for_router_llm", {}) if record.summary_report else {}
+                if notes:
+                    version_info["change_description"] = "Updated based on modifications"
+                else:
+                    version_info["change_description"] = "Report regeneration"
+
+            versions.append(version_info)
+
+        # Return in descending order (latest first)
+        return list(reversed(versions))
+    except Exception as e:
+        logger.error(f"Error retrieving report versions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving report versions: {str(e)}"
+        )
+
+
+# ============================================================
 # PRE-SALES WORKFLOW DATABASE FUNCTIONS
 # ============================================================
 
@@ -1243,6 +1462,50 @@ async def get_analysis_link_by_presales_id(presales_id: str, user_id: str, db: S
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving analysis link: {str(e)}"
         )
+
+
+def get_analysis_mode(chat_history_id: str, db: Session) -> dict:
+    """
+    Get analysis mode for a chat history.
+
+    Determines if a chat is in 'presales' or 'full' mode based on the AnalysisLink.
+    - If full_report_generated is True → 'full' mode
+    - If presales_id exists but full_report_generated is False → 'presales' mode
+    - If no link exists → 'full' mode (default)
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Dict with analysis_mode ('full' or 'presales') and presales_id
+    """
+    try:
+        link = db.query(models.AnalysisLink).filter(
+            models.AnalysisLink.chat_history_id == chat_history_id
+        ).first()
+
+        if not link:
+            # No link found - could be a direct full report or old chat
+            # Default to 'full' mode
+            return {"analysis_mode": "full", "presales_id": None}
+
+        # Determine mode based on full_report_generated flag
+        if link.full_report_generated:
+            return {
+                "analysis_mode": "full",
+                "presales_id": link.presales_id
+            }
+        else:
+            return {
+                "analysis_mode": "presales",
+                "presales_id": link.presales_id
+            }
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting analysis mode for chat_history_id {chat_history_id}: {str(e)}")
+        # Return default on error
+        return {"analysis_mode": "full", "presales_id": None}
 
 
 async def update_analysis_link_with_full_report(
@@ -2057,3 +2320,998 @@ async def get_presales_with_questions(
             detail=f"Error retrieving presales: {str(e)}"
         )
 
+
+# ============================================================================
+# PENDING ACTIONS - For Conversation State Management
+# ============================================================================
+
+async def load_pending_actions(chat_history_id: str, db: Session) -> list:
+    """
+    Load all pending actions for a chat session from the database.
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        List of pending action dictionaries
+    """
+    try:
+        actions = db.query(models.PendingAction).filter(
+            models.PendingAction.chat_history_id == chat_history_id
+        ).order_by(models.PendingAction.created_at).all()
+
+        return [
+            {
+                "action_id": a.id,
+                "action_type": a.action_type,
+                "content": a.content,
+                "context": a.context,
+                "category": a.category,
+                "awaiting_response": a.awaiting_response,
+                "resolution": a.resolution,
+                "created_at": a.created_at.isoformat() if a.created_at else None
+            }
+            for a in actions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error loading pending actions: {str(e)}")
+        return []
+
+
+async def save_pending_action(
+    chat_history_id: str,
+    action_id: str,
+    action_type: str,
+    content: str,
+    db: Session,
+    context: str = None,
+    category: str = None
+) -> dict:
+    """
+    Save a new pending action to the database.
+
+    Args:
+        chat_history_id: The chat history ID
+        action_id: The action ID (e.g., "PA-001")
+        action_type: Type of action (suggestion, rollback, clear_all)
+        content: What the action does
+        db: Database session
+        context: Why this was offered
+        category: Change category (modify_architecture, etc.)
+
+    Returns:
+        Dict with action details
+    """
+    try:
+        pending_action = models.PendingAction(
+            id=action_id,
+            chat_history_id=chat_history_id,
+            action_type=action_type,
+            content=content,
+            context=context,
+            category=category,
+            awaiting_response=True
+        )
+
+        db.add(pending_action)
+        db.commit()
+        db.refresh(pending_action)
+
+        logger.info(f"Saved pending action {action_id} for chat {chat_history_id}")
+
+        return {
+            "action_id": pending_action.id,
+            "action_type": pending_action.action_type,
+            "content": pending_action.content,
+            "awaiting_response": pending_action.awaiting_response
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error saving pending action: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving pending action: {str(e)}"
+        )
+
+
+async def resolve_pending_action(
+    action_id: str,
+    chat_history_id: str,
+    resolution: str,
+    db: Session,
+    resolution_message: str = None
+) -> dict:
+    """
+    Resolve a pending action (confirm, decline, expire, supersede).
+
+    Args:
+        action_id: The action ID to resolve
+        chat_history_id: The chat history ID
+        resolution: The resolution type (confirmed, declined, expired, superseded)
+        db: Database session
+        resolution_message: Optional message about conditions
+
+    Returns:
+        Dict with resolution details
+    """
+    from datetime import datetime
+
+    try:
+        action = db.query(models.PendingAction).filter(
+            models.PendingAction.id == action_id,
+            models.PendingAction.chat_history_id == chat_history_id
+        ).first()
+
+        if not action:
+            logger.warning(f"Pending action {action_id} not found for resolution")
+            return {"status": "not_found", "action_id": action_id}
+
+        action.awaiting_response = False
+        action.resolution = resolution
+        action.resolution_message = resolution_message
+        action.resolved_at = datetime.now()
+
+        db.commit()
+
+        logger.info(f"Resolved pending action {action_id} as {resolution}")
+
+        return {
+            "status": "resolved",
+            "action_id": action_id,
+            "resolution": resolution,
+            "content": action.content
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error resolving pending action: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error resolving pending action: {str(e)}"
+        )
+
+
+async def get_active_pending_actions(chat_history_id: str, db: Session) -> list:
+    """
+    Get only pending actions that are still awaiting response.
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        List of active pending action dictionaries
+    """
+    try:
+        actions = db.query(models.PendingAction).filter(
+            models.PendingAction.chat_history_id == chat_history_id,
+            models.PendingAction.awaiting_response == True
+        ).order_by(models.PendingAction.created_at).all()
+
+        return [
+            {
+                "action_id": a.id,
+                "action_type": a.action_type,
+                "content": a.content,
+                "context": a.context,
+                "category": a.category,
+                "created_at": a.created_at.isoformat() if a.created_at else None
+            }
+            for a in actions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting active pending actions: {str(e)}")
+        return []
+
+
+async def get_next_pending_action_id(chat_history_id: str, db: Session) -> str:
+    """
+    Get the next available pending action ID for a chat session.
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Next action ID (e.g., "PA-003" if PA-001 and PA-002 exist)
+    """
+    try:
+        actions = db.query(models.PendingAction).filter(
+            models.PendingAction.chat_history_id == chat_history_id
+        ).all()
+
+        max_num = 0
+        for action in actions:
+            try:
+                num = int(action.id.split('-')[1])
+                max_num = max(max_num, num)
+            except (IndexError, ValueError):
+                pass
+
+        return f"PA-{max_num + 1:03d}"
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting next action ID: {str(e)}")
+        return "PA-001"
+
+
+async def clear_pending_actions(chat_history_id: str, db: Session) -> int:
+    """
+    Clear all pending actions for a chat session (typically when conversation ends or resets).
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Number of actions cleared
+    """
+    from datetime import datetime
+
+    try:
+        count = db.query(models.PendingAction).filter(
+            models.PendingAction.chat_history_id == chat_history_id,
+            models.PendingAction.awaiting_response == True
+        ).update({
+            "awaiting_response": False,
+            "resolution": "expired",
+            "resolved_at": datetime.now()
+        })
+
+        db.commit()
+        logger.info(f"Cleared {count} pending actions for chat {chat_history_id}")
+        return count
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error clearing pending actions: {str(e)}")
+        return 0
+
+
+async def find_duplicate_changes(changes: list, threshold: float = 0.6) -> list:
+    """
+    Find groups of similar/duplicate changes using Jaccard similarity.
+
+    Uses word overlap to detect potential duplicates without requiring embeddings.
+    Changes with similarity above threshold are grouped together.
+
+    Args:
+        changes: List of change dictionaries with 'id' and 'user_request' fields
+        threshold: Similarity threshold (0-1). Default 0.6 (60% overlap)
+
+    Returns:
+        List of duplicate groups:
+        [
+            {
+                "ids": ["CHG-001", "CHG-003"],
+                "similarity": 0.75,
+                "preview": "Use PostgreSQL instead of..."
+            }
+        ]
+    """
+    if not changes or len(changes) < 2:
+        return []
+
+    duplicates = []
+    processed = set()
+
+    for i, change1 in enumerate(changes):
+        change1_id = change1.get('id', change1.get('change_id', ''))
+        if change1_id in processed:
+            continue
+
+        group = [change1_id]
+        request1 = change1.get('user_request', change1.get('content', ''))
+        words1 = set(request1.lower().split())
+
+        if len(words1) < 2:
+            continue
+
+        max_similarity = 0
+
+        for j, change2 in enumerate(changes[i+1:], i+1):
+            change2_id = change2.get('id', change2.get('change_id', ''))
+            if change2_id in processed:
+                continue
+
+            request2 = change2.get('user_request', change2.get('content', ''))
+            words2 = set(request2.lower().split())
+
+            if len(words2) < 2:
+                continue
+
+            # Jaccard similarity
+            intersection = len(words1 & words2)
+            union = len(words1 | words2)
+            similarity = intersection / union if union > 0 else 0
+
+            if similarity >= threshold:
+                group.append(change2_id)
+                processed.add(change2_id)
+                max_similarity = max(max_similarity, similarity)
+
+        if len(group) > 1:
+            duplicates.append({
+                "ids": group,
+                "similarity": round(max_similarity, 2),
+                "preview": request1[:60] + "..." if len(request1) > 60 else request1
+            })
+            processed.add(change1_id)
+
+    logger.info(f"Found {len(duplicates)} duplicate groups from {len(changes)} changes")
+    return duplicates
+
+
+async def merge_pending_changes(
+    chat_history_id: str,
+    change_ids: list,
+    merged_content: str,
+    db: Session
+) -> dict:
+    """
+    Merge multiple pending changes into one consolidated change.
+
+    This removes the specified changes and creates a new merged change that
+    combines their affected sections and tracks the source changes.
+
+    Args:
+        chat_history_id: The chat history ID
+        change_ids: List of change IDs to merge (e.g., ["CHG-001", "CHG-003"])
+        merged_content: The consolidated user request text
+        db: Database session
+
+    Returns:
+        {
+            "status": "success|error",
+            "removed_ids": ["CHG-001", "CHG-003"],
+            "new_change": {...},
+            "message": "..."
+        }
+    """
+    import copy
+    from datetime import datetime
+
+    try:
+        # Get current report version with pending changes
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.version.desc()).first()
+
+        if not record:
+            return {
+                "status": "error",
+                "message": f"No report found for chat {chat_history_id}"
+            }
+
+        current_changes = copy.deepcopy(record.pending_changes or [])
+
+        if not current_changes:
+            return {
+                "status": "error",
+                "message": "No pending changes to merge"
+            }
+
+        # Find the changes to merge
+        changes_to_merge = [c for c in current_changes if c.get('id') in change_ids]
+
+        if len(changes_to_merge) < 2:
+            return {
+                "status": "error",
+                "message": f"Need at least 2 changes to merge, found {len(changes_to_merge)}"
+            }
+
+        # Extract affected sections from all changes being merged
+        affected_sections = set()
+        change_types = set()
+        for change in changes_to_merge:
+            sections = change.get('affected_sections', [])
+            if isinstance(sections, list):
+                affected_sections.update(sections)
+            change_types.add(change.get('type', 'modify_architecture'))
+
+        # Remove the old changes
+        remaining_changes = [c for c in current_changes if c.get('id') not in change_ids]
+
+        # Generate new change ID
+        max_num = 0
+        for change in current_changes:
+            try:
+                num = int(change.get('id', '').split('-')[1])
+                max_num = max(max_num, num)
+            except (IndexError, ValueError):
+                pass
+        new_id = f"CHG-{max_num + 1:03d}"
+
+        # Create merged change
+        merged_change = {
+            "id": new_id,
+            "type": list(change_types)[0] if len(change_types) == 1 else "modify_architecture",
+            "user_request": merged_content,
+            "affected_sections": list(affected_sections),
+            "timestamp": datetime.now().isoformat(),
+            "merged_from": change_ids,
+            "status": "pending"
+        }
+
+        remaining_changes.append(merged_change)
+
+        # Save to database
+        record.pending_changes = remaining_changes
+        flag_modified(record, "pending_changes")
+        db.commit()
+
+        logger.info(f"Merged changes {change_ids} into {new_id}")
+
+        return {
+            "status": "success",
+            "removed_ids": change_ids,
+            "new_change": merged_change,
+            "message": f"Successfully merged {len(change_ids)} changes into {new_id}"
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error merging pending changes: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Database error: {str(e)}"
+        }
+
+
+async def remove_pending_change(
+    chat_history_id: str,
+    change_id: str,
+    db: Session
+) -> dict:
+    """
+    Remove a specific pending change by ID.
+
+    Args:
+        chat_history_id: The chat history ID
+        change_id: The change ID to remove (e.g., "CHG-001")
+        db: Database session
+
+    Returns:
+        {
+            "status": "success|error",
+            "removed_change": {...},
+            "remaining_count": int,
+            "message": "..."
+        }
+    """
+    import copy
+
+    try:
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.version.desc()).first()
+
+        if not record:
+            return {
+                "status": "error",
+                "message": f"No report found for chat {chat_history_id}"
+            }
+
+        current_changes = copy.deepcopy(record.pending_changes or [])
+
+        # Find and remove the specified change
+        removed_change = None
+        remaining_changes = []
+
+        for change in current_changes:
+            if change.get('id') == change_id:
+                removed_change = change
+            else:
+                remaining_changes.append(change)
+
+        if not removed_change:
+            return {
+                "status": "error",
+                "message": f"Change {change_id} not found in pending changes"
+            }
+
+        # Save to database
+        record.pending_changes = remaining_changes
+        flag_modified(record, "pending_changes")
+        db.commit()
+
+        logger.info(f"Removed pending change {change_id}")
+
+        return {
+            "status": "success",
+            "removed_change": removed_change,
+            "remaining_count": len(remaining_changes),
+            "message": f"Successfully removed {change_id}"
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error removing pending change: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Database error: {str(e)}"
+        }
+
+
+# ============================================================
+# TRANSACTION HISTORY FOR UNDO/REDO OPERATIONS
+# ============================================================
+
+async def record_transaction(
+    chat_history_id: str,
+    action_type: str,
+    action_data: dict,
+    description: str,
+    db: Session
+) -> dict:
+    """
+    Record a reversible transaction for undo/redo functionality.
+
+    Args:
+        chat_history_id: The chat history ID
+        action_type: Type of action (add_change, remove_change, merge_changes, etc.)
+        action_data: Data needed to reverse/redo the action
+        description: Human-readable description
+        db: Database session
+
+    Returns:
+        Dict with transaction ID and status
+    """
+    try:
+        # Get the next sequence number for this chat
+        last_tx = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id
+        ).order_by(models.TransactionHistory.sequence_number.desc()).first()
+
+        next_sequence = (last_tx.sequence_number + 1) if last_tx else 1
+
+        # Clear any undone transactions (they can no longer be redone after new action)
+        db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == True
+        ).delete()
+
+        # Create new transaction record
+        transaction = models.TransactionHistory(
+            id=str(uuid.uuid4()),
+            chat_history_id=chat_history_id,
+            action_type=action_type,
+            action_description=description,
+            action_data=action_data,
+            sequence_number=next_sequence
+        )
+
+        db.add(transaction)
+        db.commit()
+        db.refresh(transaction)
+
+        logger.info(f"Recorded transaction {transaction.id}: {action_type} - {description}")
+
+        return {
+            "status": "success",
+            "transaction_id": transaction.id,
+            "sequence_number": next_sequence
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error recording transaction: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to record transaction: {str(e)}"
+        }
+
+
+async def get_undo_stack(chat_history_id: str, db: Session) -> list:
+    """
+    Get the stack of transactions that can be undone (not yet undone).
+
+    Returns:
+        List of transactions ordered by most recent first
+    """
+    try:
+        transactions = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == False
+        ).order_by(models.TransactionHistory.sequence_number.desc()).all()
+
+        return [
+            {
+                "id": tx.id,
+                "action_type": tx.action_type,
+                "description": tx.action_description,
+                "action_data": tx.action_data,
+                "sequence_number": tx.sequence_number,
+                "created_at": tx.created_at.isoformat() if tx.created_at else None
+            }
+            for tx in transactions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting undo stack: {str(e)}")
+        return []
+
+
+async def get_redo_stack(chat_history_id: str, db: Session) -> list:
+    """
+    Get the stack of transactions that can be redone (currently undone).
+
+    Returns:
+        List of transactions ordered by most recently undone first
+    """
+    try:
+        transactions = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == True
+        ).order_by(models.TransactionHistory.sequence_number.desc()).all()
+
+        return [
+            {
+                "id": tx.id,
+                "action_type": tx.action_type,
+                "description": tx.action_description,
+                "action_data": tx.action_data,
+                "sequence_number": tx.sequence_number,
+                "undone_at": tx.undone_at.isoformat() if tx.undone_at else None
+            }
+            for tx in transactions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting redo stack: {str(e)}")
+        return []
+
+
+async def undo_last_transaction(chat_history_id: str, db: Session) -> dict:
+    """
+    Undo the last transaction and return the data needed to reverse it.
+
+    Returns:
+        Dict with action_type, action_data, and status
+    """
+    from datetime import datetime
+
+    try:
+        # Get the most recent non-undone transaction
+        transaction = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == False
+        ).order_by(models.TransactionHistory.sequence_number.desc()).first()
+
+        if not transaction:
+            return {
+                "status": "nothing_to_undo",
+                "message": "No transactions to undo"
+            }
+
+        # Mark as undone
+        transaction.is_undone = True
+        transaction.undone_at = datetime.now()
+        db.commit()
+
+        logger.info(f"Undone transaction {transaction.id}: {transaction.action_description}")
+
+        return {
+            "status": "success",
+            "transaction_id": transaction.id,
+            "action_type": transaction.action_type,
+            "action_data": transaction.action_data,
+            "description": transaction.action_description
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error undoing transaction: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to undo: {str(e)}"
+        }
+
+
+async def undo_specific_transaction(chat_history_id: str, change_id: str, db: Session) -> dict:
+    """
+    Undo a specific change by its CHG-XXX ID.
+
+    Args:
+        chat_history_id: The chat history ID
+        change_id: The change ID (e.g., "CHG-003")
+        db: Database session
+
+    Returns:
+        Dict with action_type, action_data, and status
+    """
+    from datetime import datetime
+
+    try:
+        # Find the transaction that added this change
+        transactions = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == False
+        ).all()
+
+        target_tx = None
+        for tx in transactions:
+            action_data = tx.action_data or {}
+            if action_data.get("change_id") == change_id:
+                target_tx = tx
+                break
+
+        if not target_tx:
+            return {
+                "status": "not_found",
+                "message": f"No transaction found for {change_id}"
+            }
+
+        # Mark as undone
+        target_tx.is_undone = True
+        target_tx.undone_at = datetime.now()
+        db.commit()
+
+        logger.info(f"Undone specific transaction for {change_id}")
+
+        return {
+            "status": "success",
+            "transaction_id": target_tx.id,
+            "action_type": target_tx.action_type,
+            "action_data": target_tx.action_data,
+            "description": target_tx.action_description
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error undoing specific transaction: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to undo: {str(e)}"
+        }
+
+
+async def redo_last_transaction(chat_history_id: str, db: Session) -> dict:
+    """
+    Redo the most recently undone transaction.
+
+    Returns:
+        Dict with action_type, action_data, and status
+    """
+    from datetime import datetime
+
+    try:
+        # Get the most recently undone transaction
+        transaction = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id,
+            models.TransactionHistory.is_undone == True
+        ).order_by(models.TransactionHistory.sequence_number.desc()).first()
+
+        if not transaction:
+            return {
+                "status": "nothing_to_redo",
+                "message": "No transactions to redo"
+            }
+
+        # Mark as not undone (redone)
+        transaction.is_undone = False
+        transaction.redone_at = datetime.now()
+        db.commit()
+
+        logger.info(f"Redone transaction {transaction.id}: {transaction.action_description}")
+
+        return {
+            "status": "success",
+            "transaction_id": transaction.id,
+            "action_type": transaction.action_type,
+            "action_data": transaction.action_data,
+            "description": transaction.action_description
+        }
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error redoing transaction: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to redo: {str(e)}"
+        }
+
+
+async def get_transaction_history(chat_history_id: str, db: Session, limit: int = 20) -> list:
+    """
+    Get the full transaction history for a chat session.
+
+    Returns:
+        List of all transactions ordered by sequence
+    """
+    try:
+        transactions = db.query(models.TransactionHistory).filter(
+            models.TransactionHistory.chat_history_id == chat_history_id
+        ).order_by(models.TransactionHistory.sequence_number.desc()).limit(limit).all()
+
+        return [
+            {
+                "id": tx.id,
+                "action_type": tx.action_type,
+                "description": tx.action_description,
+                "is_undone": tx.is_undone,
+                "sequence_number": tx.sequence_number,
+                "created_at": tx.created_at.isoformat() if tx.created_at else None,
+                "undone_at": tx.undone_at.isoformat() if tx.undone_at else None,
+                "redone_at": tx.redone_at.isoformat() if tx.redone_at else None
+            }
+            for tx in transactions
+        ]
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting transaction history: {str(e)}")
+        return []
+
+
+# ============================================================
+# REPORT REGENERATION CONTEXT
+# ============================================================
+
+async def get_regeneration_context(
+    chat_history_id: str,
+    user_id: str,
+    db: Session
+) -> dict:
+    """
+    Get ALL context needed for full report regeneration, including presales data.
+
+    This function retrieves:
+    - Analysis link (presales_id, document_id, user_answers)
+    - Presales analysis (scanned_requirements, blind_spots, assumptions, etc.)
+    - Presales questions with answers
+    - Pending changes from current report version
+    - Current report summary
+
+    Args:
+        chat_history_id: The chat history ID
+        user_id: The user ID (for security filtering)
+        db: Database session
+
+    Returns:
+        {
+            "presales_id": str or None,
+            "document_id": str,
+            "document_text": str,              # JSON of extracted_requirements
+            "scanned_requirements": dict,
+            "blind_spots": dict,
+            "assumptions_list": list,          # Assumptions from presales
+            "questions_and_answers": list,     # Q&A from presales questions
+            "additional_context": str,         # User comments/context (from user_answers)
+            "user_answers": dict,              # Answers from AnalysisLink
+            "pending_changes": list,
+            "current_report_summary": dict,
+            "current_version": int
+        }
+
+    Raises:
+        HTTPException: If chat_history not found or access denied
+    """
+    import json
+
+    try:
+        # Step 1: Get AnalysisLink by chat_history_id
+        analysis_link = db.query(models.AnalysisLink).filter(
+            models.AnalysisLink.chat_history_id == chat_history_id,
+            models.AnalysisLink.user_id == user_id
+        ).first()
+
+        presales_id = None
+        presales_data = {}
+        questions_and_answers = []
+        user_answers = {}
+
+        if analysis_link:
+            presales_id = analysis_link.presales_id
+            user_answers = analysis_link.user_answers or {}
+
+            # Step 2: Get PresalesAnalysis if presales_id exists
+            if presales_id:
+                presales = db.query(models.PresalesAnalysis).filter(
+                    models.PresalesAnalysis.presales_id == presales_id,
+                    models.PresalesAnalysis.user_id == user_id
+                ).first()
+
+                if presales:
+                    presales_data = {
+                        "extracted_requirements": presales.extracted_requirements or {},
+                        "blind_spots": presales.blind_spots or {},
+                        "p1_blockers": presales.p1_blockers or {},
+                        "technology_risks": presales.technology_risks or {},
+                        "assumptions_list": presales.assumptions_list or [],
+                        "contradictions_list": presales.contradictions_list or [],
+                        "presales_brief": presales.presales_brief or ""
+                    }
+
+                # Step 3: Get PresalesQuestions with answers
+                questions = db.query(models.PresalesQuestion).filter(
+                    models.PresalesQuestion.presales_id == presales_id,
+                    models.PresalesQuestion.user_id == user_id,
+                    models.PresalesQuestion.status != models.QuestionStatus.INVALID
+                ).order_by(models.PresalesQuestion.display_order).all()
+
+                questions_and_answers = [
+                    {
+                        "question_id": q.question_id,
+                        "question_number": q.question_number,
+                        "question_type": q.question_type,
+                        "area_or_category": q.area_or_category,
+                        "title": q.title,
+                        "question_text": q.question_text,
+                        "answer": q.answer,
+                        "answer_quality": q.answer_quality
+                    }
+                    for q in questions if q.answer  # Only include answered questions
+                ]
+
+        # Step 4: Get document_id from ChatHistory if not from AnalysisLink
+        document_id = analysis_link.document_id if analysis_link else None
+        if not document_id:
+            chat_history = db.query(models.ChatHistory).filter(
+                models.ChatHistory.chat_history_id == chat_history_id,
+                models.ChatHistory.user_id == user_id
+            ).first()
+            if chat_history:
+                document_id = chat_history.document_id
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Chat history not found: {chat_history_id}"
+                )
+
+        # Step 5: Get pending changes and current report from ReportVersions
+        report_version = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+
+        pending_changes = []
+        current_report_summary = {}
+        current_version = 0
+
+        if report_version:
+            pending_changes = copy.deepcopy(report_version.pending_changes) if report_version.pending_changes else []
+            current_report_summary = report_version.summary_report or {}
+            current_version = report_version.version_number or 1
+
+        # Build document_text from extracted_requirements (as done in services.py)
+        document_text = json.dumps(presales_data.get("extracted_requirements", {}))
+
+        # Extract additional_context from user_answers if present
+        additional_context = user_answers.get("additional_context", "") if user_answers else ""
+
+        logger.info(
+            f"Regeneration context retrieved for chat_history_id: {chat_history_id}, "
+            f"presales_id: {presales_id}, questions: {len(questions_and_answers)}, "
+            f"pending_changes: {len(pending_changes)}"
+        )
+
+        return {
+            "presales_id": presales_id,
+            "document_id": document_id,
+            "document_text": document_text,
+            "scanned_requirements": presales_data.get("extracted_requirements", {}),
+            "blind_spots": presales_data.get("blind_spots", {}),
+            "p1_blockers": presales_data.get("p1_blockers", {}),
+            "technology_risks": presales_data.get("technology_risks", {}),
+            "assumptions_list": presales_data.get("assumptions_list", []),
+            "contradictions_list": presales_data.get("contradictions_list", []),
+            "presales_brief": presales_data.get("presales_brief", ""),
+            "questions_and_answers": questions_and_answers,
+            "additional_context": additional_context,
+            "user_answers": user_answers,
+            "pending_changes": pending_changes,
+            "current_report_summary": current_report_summary,
+            "current_version": current_version
+        }
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting regeneration context: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving regeneration context: {str(e)}"
+        )

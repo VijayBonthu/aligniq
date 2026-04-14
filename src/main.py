@@ -19,8 +19,19 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI(lifespan=lifespan)
 # app = FastAPI()
 
-origins = [ 
-    
+origins = [
+    "https://immense-finally-giraffe.ngrok-free.app",
+    "https://7ede-142-198-208-131.ngrok-free.app",
+    "http://localhost",
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+    "http://192.168.2.26:3000",
+    "http://172.26.80.1:3000",
+    "https://2jzp70s0-3000.use.devtunnels.ms",
+    "https://2jzp70s0-5173.use.devtunnels.ms",
+    "https://2jzp70s0-8080.use.devtunnels.ms",
     # Add any other domains that need to access your API
 ]
 app.add_middleware(

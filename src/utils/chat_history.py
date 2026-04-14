@@ -1,13 +1,134 @@
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
-from typing import Dict, List
+from typing import Dict, List, Optional
 import models
 import json
 from sqlalchemy import text, and_
 import uuid
 from fastapi import HTTPException
 from utils.logger import logger
+from database_scripts import get_analysis_mode
+
+
+# Constants for context building
+MAX_CONVERSATION_TURNS = 10  # Number of conversation turns (user + assistant pairs)
+MAX_MESSAGE_LENGTH = 2000     # Messages longer than this are considered report content
+REPORT_MESSAGE_TYPES = ["report_regeneration", "full_report", "report_content"]
+
+
+async def build_conversation_context(
+    messages: List[Dict],
+    max_turns: int = MAX_CONVERSATION_TURNS,
+    max_tokens: int = 3000
+) -> Dict:
+    """
+    Build optimized conversation context for the semantic classifier.
+    Always excludes report regeneration messages to keep context focused.
+
+    This function:
+    1. Filters out report regeneration messages (type or length-based)
+    2. Takes last N conversation turns (user + assistant pairs)
+    3. Summarizes older messages if over token threshold
+
+    Args:
+        messages: List of message dicts with 'role', 'content', and optionally 'type'
+        max_turns: Maximum number of conversation turns to include (default: 10)
+        max_tokens: Token threshold for summarization (default: 3000)
+
+    Returns:
+        {
+            "recent_messages": [...],      # Filtered messages for context
+            "conversation_summary": str,   # Summary of older context (if any)
+            "context_type": "full" | "summarized" | "recent_only",
+            "filtered_count": int,         # Number of messages filtered out
+            "total_included": int          # Number of messages included
+        }
+    """
+    if not messages:
+        return {
+            "recent_messages": [],
+            "conversation_summary": None,
+            "context_type": "recent_only",
+            "filtered_count": 0,
+            "total_included": 0
+        }
+
+    # Step 1: Filter out report regeneration messages
+    filtered_messages = []
+    filtered_count = 0
+
+    for msg in messages:
+        # Skip report regeneration messages based on type
+        msg_type = msg.get("type", "")
+        if msg_type in REPORT_MESSAGE_TYPES:
+            filtered_count += 1
+            continue
+
+        # Skip messages that are too long (likely report content)
+        content = msg.get("content", "")
+        if len(content) > MAX_MESSAGE_LENGTH:
+            filtered_count += 1
+            continue
+
+        filtered_messages.append(msg)
+
+    logger.info(f"Context filtering: {len(messages)} total, {filtered_count} filtered, {len(filtered_messages)} remaining")
+
+    if not filtered_messages:
+        return {
+            "recent_messages": [],
+            "conversation_summary": None,
+            "context_type": "recent_only",
+            "filtered_count": filtered_count,
+            "total_included": 0
+        }
+
+    # Step 2: Take last N turns (each turn = user + assistant = 2 messages)
+    max_messages = max_turns * 2  # Convert turns to message count
+
+    if len(filtered_messages) <= max_messages:
+        # All messages fit within limit
+        return {
+            "recent_messages": filtered_messages,
+            "conversation_summary": None,
+            "context_type": "recent_only",
+            "filtered_count": filtered_count,
+            "total_included": len(filtered_messages)
+        }
+
+    # Step 3: Split into older and recent, then potentially summarize
+    recent_messages = filtered_messages[-max_messages:]
+    older_messages = filtered_messages[:-max_messages]
+
+    # Try to summarize older messages using existing hybrid context builder
+    try:
+        from utils.router_llm import build_hybrid_context
+
+        # Use existing summarization for older messages
+        hybrid_result = await build_hybrid_context(older_messages)
+        conversation_summary = hybrid_result.get("older_summary")
+
+        # If the hybrid result has a summary, use it
+        if conversation_summary and hybrid_result.get("context_type") == "hybrid":
+            return {
+                "recent_messages": recent_messages,
+                "conversation_summary": conversation_summary,
+                "context_type": "summarized",
+                "filtered_count": filtered_count,
+                "total_included": len(recent_messages)
+            }
+    except Exception as e:
+        logger.warning(f"Failed to build hybrid context for summarization: {str(e)}")
+
+    # Fallback: just return recent messages without summary
+    return {
+        "recent_messages": recent_messages,
+        "conversation_summary": None,
+        "context_type": "recent_only",
+        "filtered_count": filtered_count,
+        "total_included": len(recent_messages)
+    }
 
 async def save_chat_history(chat:Dict, db:Session) -> Dict:
     """
@@ -164,6 +285,10 @@ async def get_user_chat_history_details(user_id:str, db:Session):
                 full_history["chat_history_id"] = details.chat_history_id
                 full_history["title"] = details.title
                 full_history["modified_at"] = details.modified_at
+                # Get analysis mode (presales vs full) from AnalysisLink
+                analysis_info = get_analysis_mode(details.chat_history_id, db)
+                full_history["analysis_mode"] = analysis_info.get("analysis_mode", "full")
+                full_history["presales_id"] = analysis_info.get("presales_id")
                 full_chat_history.append(full_history)
             return full_chat_history
         else:
@@ -183,6 +308,10 @@ async def get_single_user_chat_history(user_id:str, chat_history_id:str, db:Sess
             full_history["title"] = user_chat_details.title
             full_history["modified_at"] = user_chat_details.modified_at
             full_history["message"] = user_chat_details.message
+            # Get analysis mode (presales vs full) from AnalysisLink
+            analysis_info = get_analysis_mode(chat_history_id, db)
+            full_history["analysis_mode"] = analysis_info.get("analysis_mode", "full")
+            full_history["presales_id"] = analysis_info.get("presales_id")
             return full_history
         else:
             raise HTTPException(status_code=404, detail="Chat history not found")

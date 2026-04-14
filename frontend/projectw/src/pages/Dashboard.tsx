@@ -676,6 +676,8 @@ const Dashboard: React.FC = () => {
       let presalesId = presalesMessage?.presales_id;
 
       // Create base conversation object
+      // Use analysis_mode from API response if available (persisted state),
+      // otherwise fall back to inference logic (backward compatibility)
       let conversation: Conversation = {
         id: details.chat_history_id,
         title: details.title,
@@ -684,8 +686,8 @@ const Dashboard: React.FC = () => {
         document_id: details.document_id || '',
         chat_history_id: details.chat_history_id,
         modified_at: details.modified_at,
-        analysis_mode: presalesId ? 'presales' : 'full',
-        presales_id: presalesId
+        analysis_mode: details.analysis_mode || (presalesId ? 'presales' : 'full'),
+        presales_id: details.presales_id || presalesId
       };
 
       // Step 2: Fetch additional data in PARALLEL based on conversation type
@@ -718,17 +720,29 @@ const Dashboard: React.FC = () => {
         const presalesData = presalesResponse?.data;
         if (presalesData?.presales_id) {
           presalesId = presalesData.presales_id;
+
+          // IMPORTANT: Only set analysis_mode to 'presales' if backend didn't return 'full'
+          // This preserves full report mode after user generates a full report
+          const shouldBePresalesMode = details.analysis_mode !== 'full';
+
           conversation = {
             ...conversation,
             presales_id: presalesId,
-            analysis_mode: 'presales',
+            // Keep 'full' if backend says so, otherwise use 'presales'
+            analysis_mode: shouldBePresalesMode ? 'presales' : 'full',
             presales_brief: presalesData.presales_brief,
             p1_blockers: presalesData.p1_blockers || [],
             kickstart_questions: presalesData.kickstart_questions || [],
             blind_spots: presalesData.blind_spots,
             extracted_requirements: presalesData.extracted_requirements
           };
-          setShowKickstartPanel(true);
+
+          // Only show kickstart panel if still in presales mode
+          if (shouldBePresalesMode) {
+            setShowKickstartPanel(true);
+          } else {
+            setShowKickstartPanel(false);
+          }
 
           // Process questions if we got them, otherwise fetch now
           let questionsData = questionsResponse?.data;

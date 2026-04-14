@@ -47,4 +47,7 @@ rules_frontend.mdc
 checking_json.json
 client_secret_g.json
 output/
+CLAUDE.md
 project.md
+
+.claude

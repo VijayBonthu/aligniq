@@ -114,8 +114,61 @@ class ReportVersions(Base):
     summary_report = Column(JSON, nullable=False)
     pending_changes = Column(JSON, nullable=True, default=[])  # Track modifications before regeneration
     schema_version = Column(String, nullable=False, default="1.0")  # For future migrations
+    is_default = Column(Boolean, nullable=False, default=False, index=True)  # Mark as default/recommended version
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=True, onupdate=text("now()"))
+
+
+# ============================================================================
+# PENDING ACTIONS FOR CONVERSATION STATE MANAGEMENT
+# ============================================================================
+
+class PendingActionType:
+    """Types of pending actions that can await user confirmation"""
+    SUGGESTION = "suggestion"             # Architecture/requirement suggestion
+    ROLLBACK = "rollback"                 # Rollback to previous version
+    CLEAR_ALL = "clear_all"               # Clear all pending changes
+    CONFIRMATION_REQUEST = "confirmation_request"  # Generic confirmation request
+
+
+class PendingActionResolution:
+    """Resolution statuses for pending actions"""
+    CONFIRMED = "confirmed"
+    DECLINED = "declined"
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
+
+
+class PendingAction(Base):
+    """
+    Tracks pending actions awaiting user confirmation in chat conversations.
+
+    Replaces fragile string-based extraction with explicit state tracking.
+    Each pending action has a unique ID (PA-001, PA-002, etc.) that the
+    semantic classifier uses to map confirmations to specific actions.
+    """
+    __tablename__ = "pending_actions"
+
+    id = Column(String(50), primary_key=True, nullable=False)  # Format: PA-001
+    chat_history_id = Column(String, ForeignKey(ChatHistory.chat_history_id),
+                             nullable=False, index=True)
+
+    # Action details
+    action_type = Column(String(50), nullable=False)  # suggestion, rollback, clear_all
+    content = Column(Text, nullable=False)  # What the action does
+    context = Column(Text, nullable=True)   # Why this was offered
+    category = Column(String(50), nullable=True)  # modify_architecture, modify_requirements, etc.
+
+    # State
+    awaiting_response = Column(Boolean, nullable=False, default=True, index=True)
+
+    # Resolution (when resolved)
+    resolution = Column(String(50), nullable=True)  # confirmed, declined, expired, superseded
+    resolution_message = Column(Text, nullable=True)  # Conditions or notes
+    resolved_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
+    # Timestamps
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
 
 # ============================================================================
@@ -394,3 +447,54 @@ class PresalesAnalysisHistory(Base):
                          server_default=text("now()"))
     analyzed_by = Column(String, nullable=True)          # user_id who triggered
     processing_time_ms = Column(Integer, nullable=True)
+
+
+# ============================================================================
+# TRANSACTION HISTORY FOR UNDO/REDO OPERATIONS
+# ============================================================================
+
+class TransactionActionType:
+    """Types of actions that can be undone/redone"""
+    ADD_CHANGE = "add_change"           # Added a pending change
+    REMOVE_CHANGE = "remove_change"     # Removed a pending change
+    MERGE_CHANGES = "merge_changes"     # Merged multiple changes
+    EDIT_CHANGE = "edit_change"         # Modified a change
+    CONFIRM_ACTION = "confirm_action"   # Confirmed a pending action
+    CLEAR_ALL = "clear_all"             # Cleared all changes
+
+
+class TransactionHistory(Base):
+    """
+    Tracks all reversible actions for undo/redo functionality.
+
+    Each transaction stores enough data to reverse the action.
+    The undo/redo stacks are managed per chat session.
+    """
+    __tablename__ = "transaction_history"
+
+    id = Column(String, primary_key=True, nullable=False, index=True,
+                default=lambda: str(uuid.uuid4()))
+    chat_history_id = Column(String, ForeignKey(ChatHistory.chat_history_id),
+                             nullable=False, index=True)
+
+    # Action details
+    action_type = Column(String(50), nullable=False)  # add_change, remove_change, merge, etc.
+    action_description = Column(Text, nullable=True)   # Human-readable description
+
+    # Data to reverse/redo the action (JSON)
+    # For add_change: {"change_id": "CHG-001", "change_data": {...}}
+    # For remove_change: {"change_id": "CHG-001", "change_data": {...}}
+    # For merge: {"merged_ids": ["CHG-001", "CHG-002"], "result_id": "CHG-003", "original_data": [...]}
+    action_data = Column(JSON, nullable=False)
+
+    # Stack position (for ordering undo/redo)
+    sequence_number = Column(Integer, nullable=False, index=True)
+
+    # State tracking
+    is_undone = Column(Boolean, nullable=False, default=False, index=True)
+    undone_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    redone_at = Column(TIMESTAMP(timezone=True), nullable=True)
+
+    # Timestamps
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False,
+                        server_default=text("now()"))

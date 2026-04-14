@@ -36,7 +36,9 @@ from agents import (
 from agents.presales_workflow import generate_report_with_assumptions
 import asyncio
 from utils.helper_utils import save_file, upload_to_s3
+from utils.pdf_generator import generate_pdf_from_markdown
 from vectordb import vector_db, chunking
+
 from utils.router_llm import (
     router_query_llm,
     conversation_summary_llm,
@@ -45,8 +47,31 @@ from utils.router_llm import (
     is_change_tracking_action,
     generate_change_acknowledgment,
     generate_conflict_resolution,
-    generate_regeneration_plan
+    generate_regeneration_plan,
+    detect_multi_part_request,
+    needs_clarification,
+    get_clarification_question,
+    # Hybrid intent classification
+    build_hybrid_context,
+    classify_hybrid_intent,
+    generate_hybrid_response,
+    # Multi-intent classification (enhanced)
+    extract_pending_actions,
+    classify_multi_intent,
+    is_short_affirmative,
+    is_short_negative,
+    # Unified intent classification (replaces hybrid + multi-intent)
+    classify_unified_intent,
+    process_intents_by_priority,
+    get_last_assistant_message,
+    # NEW: Semantic intent classification (replaces keyword-based)
+    classify_semantic_intent,
+    generate_architecture_defense
 )
+# NEW: Conversation state management
+from utils.conversation_state import load_conversation_state, warn_if_similar_change
+# NEW: Intent handlers
+from handlers.intent_handlers import get_intent_handler
 from database_scripts import (
     user_documents,
     get_summary_report,
@@ -63,6 +88,10 @@ from database_scripts import (
     create_new_report_version,
     rollback_to_version,
     get_report_diff,
+    # Report Version Default Functions
+    get_default_report,
+    set_default_version,
+    get_all_report_versions_enhanced,
     # Pre-Sales Database Functions
     save_presales_analysis,
     save_technology_risks,
@@ -87,10 +116,18 @@ from database_scripts import (
     save_question_answer,
     # Undo/Rollback Functions
     get_last_pending_change,
-    remove_last_pending_change
+    remove_last_pending_change,
+    # NEW: Pending Actions for Conversation State
+    load_pending_actions,
+    save_pending_action,
+    resolve_pending_action,
+    get_active_pending_actions,
+    get_next_pending_action_id,
+    clear_pending_actions
 )
 from agents.agentic_workflow import main_report_summary, regenerate_report_sections
 import models
+from vectordb.vector_db import retrieve_similar_embeddings
 
 
 router = APIRouter()
@@ -395,9 +432,9 @@ async def upload_file(
             logger.error(f"Error during embedding creation for chat_history_id: {save_chat['chat_history_id']}, error: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Embedding creation failed: {e}")
 
-        # Create summary of the report
+        # Create summary of the report (version 1 for initial generation)
         try:
-            summary_report = await main_report_summary(main_report=agent_response_message)
+            summary_report = await main_report_summary(main_report=agent_response_message, version_number=1)
             summary_detail_report = {
                 "chat_history_id": save_chat["chat_history_id"],
                 "user_id": save_chat["user_id"],
@@ -875,9 +912,9 @@ async def generate_full_report_from_presales(
         except Exception as e:
             logger.error(f"Error creating embeddings: {str(e)}")
 
-        # Create summary
+        # Create summary (version 1 for initial generation)
         try:
-            summary_report = await main_report_summary(main_report=agent_response_message)
+            summary_report = await main_report_summary(main_report=agent_response_message, version_number=1)
             summary_detail_report = {
                 "chat_history_id": chat_history_id,
                 "user_id": user_id,
@@ -1865,7 +1902,6 @@ async def add_chat_history(request: ChatHistoryDetails,db:Session=Depends(get_db
         chat = request.model_dump()
         logger.info(f"got the details in api ,saving the chat history for user: {chat['user_id']}")
         save_chat = await save_chat_history(chat=chat, db=db)
-        print(f"save_chat: {save_chat}")
         return {"status":save_chat["status"], "chat_history_id":save_chat["chat_history_id"], "user_id":save_chat["user_id"],"message":save_chat["message"]}
     except Exception as e:
         logger.error(f"error occured while saving the chat history for user: {chat['user_id']}, error: {str(e)}")
@@ -2104,7 +2140,383 @@ async def get_user_chat_history_by_id(chat_history_id:str,current_user = Depends
 CONVERSATION_TOKEN_THRESHOLD = 3000
 
 
-@router.post('/chat-with-doc')
+# ============================================================
+# PARALLEL INTENT EXECUTION HELPERS
+# ============================================================
+
+async def execute_intents_parallel(
+    intents: list,
+    context: dict,
+    chat_history_id: str,
+    db: Session
+) -> dict:
+    """
+    Execute multiple intents in parallel using asyncio.gather.
+
+    Args:
+        intents: List of intents from classify_multi_intent()
+        context: Dict containing report_summary and hybrid_context
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Dict with results and metadata for each executed intent
+    """
+    import asyncio
+
+    tasks = []
+    task_metadata = []
+
+    for intent in intents:
+        intent_type = intent.get("type")
+        priority = intent.get("priority", 99)
+
+        if intent_type == "question":
+            # Create task to answer question from report/vector store
+            async def answer_question_task(q_intent=intent):
+                question_content = q_intent.get("content", "")
+                try:
+                    # Retrieve context from vector DB
+                    vector_results = await retrieve_similar_embeddings(
+                        query_text=question_content,
+                        model=settings.EMBEDDING_MODEL,
+                        chat_history_id=chat_history_id,
+                        top_k=3
+                    )
+                    retrieved_context = ""
+                    if vector_results and "documents" in vector_results and vector_results["documents"]:
+                        retrieved_context = "\n\n".join(vector_results["documents"][0])
+
+                    # Generate answer
+                    answer = await generate_action_response(
+                        action="answer_question_from_report",
+                        user_message=question_content,
+                        report_summary=context.get("report_summary", {}),
+                        conversation_context=context.get("hybrid_context", {}).get("recent_messages", []),
+                        retrieved_context=retrieved_context
+                    )
+                    return {"type": "question", "content": question_content, "answer": answer}
+                except Exception as e:
+                    logger.error(f"Error answering question: {str(e)}")
+                    return {"type": "question", "content": question_content, "answer": None, "error": str(e)}
+
+            tasks.append(answer_question_task())
+            task_metadata.append({"type": "question", "intent": intent, "priority": priority})
+
+        elif intent_type in ["explicit_suggestion", "implicit_suggestion"]:
+            # Suggestions that require confirmation are stored, not executed
+            if intent.get("requires_confirmation", True):
+                # Don't execute, just track for response
+                task_metadata.append({"type": "pending_suggestion", "intent": intent, "priority": priority})
+            else:
+                # Auto-track explicit suggestions that don't require confirmation
+                async def track_suggestion_task(s_intent=intent):
+                    try:
+                        suggestion_content = s_intent.get("content", "")
+                        suggestion_category = s_intent.get("action", "modify_architecture")
+                        affected_sections = get_affected_sections(suggestion_category)
+
+                        change_record = {
+                            "type": suggestion_category,
+                            "user_request": suggestion_content,
+                            "affected_sections": affected_sections,
+                            "timestamp": datetime.now().isoformat(),
+                            "status": "pending",
+                            "source": "multi_intent_auto_track"
+                        }
+
+                        add_result = await add_pending_change(
+                            chat_history_id=chat_history_id,
+                            change=change_record,
+                            db=db
+                        )
+                        return {
+                            "type": "tracked_suggestion",
+                            "content": suggestion_content,
+                            "change_id": add_result.get("change_id", "CHG-XXX")
+                        }
+                    except Exception as e:
+                        logger.error(f"Error tracking suggestion: {str(e)}")
+                        return {"type": "tracked_suggestion", "content": suggestion_content, "error": str(e)}
+
+                tasks.append(track_suggestion_task())
+                task_metadata.append({"type": "tracked_suggestion", "intent": intent, "priority": priority})
+
+        elif intent_type == "command":
+            # Create task to execute command
+            async def execute_command_task(c_intent=intent):
+                action = c_intent.get("action", "")
+                content = c_intent.get("content", "")
+
+                # Action name normalization (handle LLM variations)
+                ACTION_NORMALIZATION = {
+                    "remove_pending_changes": "clear_all_changes",
+                    "remove_all_changes": "clear_all_changes",
+                    "delete_pending_changes": "clear_all_changes",
+                    "clear_changes": "clear_all_changes",
+                    "delete_all_changes": "clear_all_changes",
+                    "show_changes": "show_pending_changes",
+                    "list_changes": "show_pending_changes",
+                    "view_changes": "show_pending_changes",
+                    "show_versions": "show_version_history",
+                    "view_history": "show_version_history",
+                    "list_versions": "show_version_history",
+                    "regenerate": "regenerate_full_report",
+                    "regenerate_report": "regenerate_full_report",
+                    "apply_changes": "regenerate_full_report",
+                    "undo": "undo_last_change",
+                    "undo_change": "undo_last_change",
+                }
+                normalized_action = ACTION_NORMALIZATION.get(action, action)
+                logger.info(f"Executing command: {action} -> normalized: {normalized_action}")
+
+                try:
+                    # Execute the command based on action
+                    if normalized_action == "clear_all_changes":
+                        result = await clear_pending_changes(chat_history_id, db)
+                        return {
+                            "type": "command",
+                            "action": "clear_all_changes",
+                            "result": "success",
+                            "cleared_count": result.get("cleared_count", 0),
+                            "message": f"Cleared {result.get('cleared_count', 0)} pending changes."
+                        }
+
+                    elif normalized_action == "show_pending_changes":
+                        changes = await get_pending_changes(chat_history_id, db)
+                        return {
+                            "type": "command",
+                            "action": "show_pending_changes",
+                            "result": "success",
+                            "changes": changes,
+                            "count": len(changes) if changes else 0
+                        }
+
+                    elif normalized_action == "show_version_history":
+                        versions = await get_all_report_versions(chat_history_id, db)
+                        return {
+                            "type": "command",
+                            "action": "show_version_history",
+                            "result": "success",
+                            "versions": versions,
+                            "count": len(versions) if versions else 0
+                        }
+
+                    elif normalized_action == "undo_last_change":
+                        result = await remove_last_pending_change(chat_history_id, db)
+                        if result.get("status") == "no_changes":
+                            return {
+                                "type": "command",
+                                "action": "undo_last_change",
+                                "result": "no_changes",
+                                "message": "No pending changes to undo."
+                            }
+                        return {
+                            "type": "command",
+                            "action": "undo_last_change",
+                            "result": "success",
+                            "removed_change": result.get("removed_change"),
+                            "remaining_count": result.get("remaining_count", 0)
+                        }
+
+                    elif normalized_action in ["regenerate_full_report", "rollback_to_version",
+                                               "view_specific_version", "compare_versions",
+                                               "set_default_version", "export_report"]:
+                        # These require more complex handling - mark for router fallback
+                        return {
+                            "type": "command",
+                            "action": normalized_action,
+                            "result": "needs_router",
+                            "original_action": action
+                        }
+
+                    else:
+                        # Unknown command - fall back to router
+                        return {
+                            "type": "command",
+                            "action": normalized_action,
+                            "result": "unhandled",
+                            "needs_router": True,
+                            "original_action": action
+                        }
+
+                except Exception as e:
+                    logger.error(f"Error executing command {action}: {str(e)}")
+                    return {"type": "command", "action": action, "result": "error", "error": str(e)}
+
+            tasks.append(execute_command_task())
+            task_metadata.append({"type": "command", "intent": intent, "priority": priority})
+
+    # Execute all tasks in parallel
+    results = []
+    if tasks:
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error in parallel execution: {str(e)}")
+
+    return {
+        "results": results,
+        "metadata": task_metadata
+    }
+
+
+async def compose_multi_intent_response(
+    execution_results: dict,
+    classification: dict,
+    user_message: str,
+    chat_history_id: str,
+    db: Session
+) -> dict:
+    """
+    Compose a single response from multiple intent results.
+
+    Args:
+        execution_results: Results from execute_intents_parallel()
+        classification: Classification result from classify_multi_intent()
+        user_message: Original user message
+        chat_history_id: Chat history ID
+        db: Database session
+
+    Returns:
+        Dict with composed response, pending_suggestion if any, and action info
+    """
+    response_parts = []
+    pending_suggestions = []
+    tracked_changes = []
+
+    results = execution_results.get("results", [])
+    metadata = execution_results.get("metadata", [])
+
+    # Match results with metadata
+    result_idx = 0
+    for meta in metadata:
+        if meta["type"] == "question":
+            if result_idx < len(results):
+                result = results[result_idx]
+                result_idx += 1
+                if isinstance(result, dict) and result.get("answer"):
+                    response_parts.append(f"**Answer:**\n{result['answer']}")
+                elif isinstance(result, dict) and result.get("error"):
+                    response_parts.append(f"I encountered an issue answering that question: {result['error']}")
+
+        elif meta["type"] == "pending_suggestion":
+            intent = meta["intent"]
+            pending_suggestions.append(intent)
+
+        elif meta["type"] == "tracked_suggestion":
+            if result_idx < len(results):
+                result = results[result_idx]
+                result_idx += 1
+                if isinstance(result, dict) and result.get("change_id"):
+                    tracked_changes.append({
+                        "change_id": result["change_id"],
+                        "content": result.get("content", "")
+                    })
+
+        elif meta["type"] == "command":
+            if result_idx < len(results):
+                result = results[result_idx]
+                result_idx += 1
+                if isinstance(result, dict):
+                    action = result.get("action", "")
+
+                    if result.get("result") == "success":
+                        if action == "clear_all_changes":
+                            cleared = result.get("cleared_count", 0)
+                            response_parts.append(f"**All Pending Changes Cleared**\n\nCleared {cleared} pending change{'s' if cleared != 1 else ''}. Your changes list is now empty.")
+
+                        elif action == "show_pending_changes":
+                            changes = result.get("changes", [])
+                            if changes:
+                                changes_text = "\n".join([
+                                    f"- **{c.get('id', 'CHG-?')}**: {c.get('user_request', '')} ({c.get('type', 'unknown').replace('_', ' ').title()})"
+                                    for c in changes
+                                ])
+                                response_parts.append(f"**Pending Changes ({len(changes)}):**\n{changes_text}\n\nSay **\"regenerate report\"** to apply these changes.")
+                            else:
+                                response_parts.append("**No Pending Changes**\n\nYour changes list is empty.")
+
+                        elif action == "show_version_history":
+                            versions = result.get("versions", [])
+                            if versions:
+                                versions_text = "\n".join([
+                                    f"- **Version {v.get('version_number', '?')}**{' (Default)' if v.get('is_default') else ''}: Created {v.get('created_at', 'unknown')}"
+                                    for v in versions
+                                ])
+                                response_parts.append(f"**Version History ({len(versions)} versions):**\n{versions_text}")
+                            else:
+                                response_parts.append("**No Versions Found**\n\nNo report versions exist yet.")
+
+                        elif action == "undo_last_change":
+                            removed = result.get("removed_change", {})
+                            remaining = result.get("remaining_count", 0)
+                            response_parts.append(
+                                f"**Change Undone**\n\n"
+                                f"Removed: **{removed.get('id', 'CHG-?')}** - {removed.get('user_request', 'Unknown change')}\n\n"
+                                f"**Remaining changes:** {remaining}"
+                            )
+
+                    elif result.get("result") == "no_changes":
+                        response_parts.append("**No Changes to Undo**\n\nYour pending changes list is already empty.")
+
+                    elif result.get("result") == "needs_router":
+                        # Skip - will be handled by router fallback
+                        pass
+
+                    elif result.get("result") == "unhandled":
+                        # Unknown command - will be handled by router
+                        pass
+
+                    elif result.get("error"):
+                        response_parts.append(f"**Error executing command:** {result['error']}")
+
+    # Add tracked changes to response
+    if tracked_changes:
+        changes_text = "\n".join([
+            f"- **{c['change_id']}**: {c['content']}"
+            for c in tracked_changes
+        ])
+        response_parts.append(f"**Changes Tracked:**\n{changes_text}")
+
+    # Add pending suggestion acknowledgment
+    pending_suggestion_data = None
+    if pending_suggestions:
+        suggestion = pending_suggestions[0]  # Take the first pending suggestion
+        suggestion_content = suggestion.get("content", "")
+        suggestion_category = suggestion.get("action", "modify_architecture")
+
+        response_parts.append(
+            f"\n---\n**Your Suggestion:** {suggestion_content}\n\n"
+            f"Would you like me to add this as a requirement to track?"
+        )
+
+        pending_suggestion_data = {
+            "content": suggestion_content,
+            "category": suggestion_category,
+            "awaiting_confirmation": True
+        }
+
+    # Compose final response
+    final_response = "\n\n".join(response_parts) if response_parts else "I understood your message."
+
+    # Get pending changes count
+    try:
+        all_pending = await get_pending_changes(chat_history_id, db)
+        pending_count = len(all_pending) if all_pending else 0
+    except:
+        pending_count = 0
+
+    return {
+        "response": final_response,
+        "pending_suggestion": pending_suggestion_data,
+        "tracked_changes": tracked_changes,
+        "pending_count": pending_count,
+        "has_pending_suggestion": pending_suggestion_data is not None
+    }
+
+
+@router.post('/chat-with-doc-v3')
 async def conversation_with_doc_v2(
     request: ChatHistoryDetails,
     current_user = Depends(token_validator),
@@ -2152,31 +2564,30 @@ async def conversation_with_doc_v2(
         if len(selected_messages) == 0:
             raise HTTPException(status_code=400, detail="No selected messages to process")
 
-        # 3. Token counting on selected messages (skip first message - initial report)
+        # 3. Build hybrid context (last 5 messages verbatim + summarized older context)
         messages_for_processing = selected_messages[1:] if len(selected_messages) > 1 else []
 
-        if len(messages_for_processing) > 0:
-            token_count = await count_token(messages_for_processing)
-            logger.info(f"Token count for selected messages: {token_count}")
+        try:
+            hybrid_context = await build_hybrid_context(messages_for_processing)
+            logger.info(f"Built hybrid context: type={hybrid_context['context_type']}, recent_msgs={len(hybrid_context['recent_messages'])}")
+            logger.info(f"hybrid_context details: {hybrid_context}")
+            # For backward compatibility, also set conversation_context
+            conversation_context = hybrid_context["recent_messages"] if hybrid_context["older_summary"] is None else {
+                "older_summary": hybrid_context["older_summary"],
+                "recent_messages": hybrid_context["recent_messages"]
+            }
 
-            # Summarize conversation if over threshold
-            if token_count > CONVERSATION_TOKEN_THRESHOLD:
-                logger.info(f"Token count ({token_count}) exceeds threshold ({CONVERSATION_TOKEN_THRESHOLD}), summarizing conversation")
-                try:
-                    conversation_context = await conversation_summary_llm(conversation=messages_for_processing)
-                    logger.info("Conversation summary generated successfully")
-                except Exception as e:
-                    logger.error(f"Error generating conversation summary: {str(e)}")
-                    raise HTTPException(status_code=500, detail=f"Error generating conversation summary: {str(e)}")
-            else:
-                conversation_context = messages_for_processing
-        else:
-            conversation_context = []
+            logger.info(f"conversation for LLM: {conversation_context}")
+        except Exception as e:
+            logger.error(f"Error building hybrid context: {str(e)}")
+            # Fall back to original behavior
+            hybrid_context = {"older_summary": None, "recent_messages": messages_for_processing, "context_type": "recent_only"}
+            conversation_context = messages_for_processing
 
         # 4. Retrieve report summary from DB
         try:
             report_summary = await get_summary_report(chat_history_id=chat_context["chat_history_id"], db=db)
-            logger.info(f"Retrieved report summary for chat_history_id: {chat_context['chat_history_id']}")
+            logger.info(f"Retrieved report summary for chat_history_id: {chat_context['chat_history_id']} and report_summary details: {report_summary}")
         except Exception as e:
             logger.error(f"Error retrieving report summary: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error retrieving report summary: {str(e)}")
@@ -2188,12 +2599,392 @@ async def conversation_with_doc_v2(
         # Get the latest user message
         user_message = chat_context["message"][-1]["content"]
 
+        # ============================================================
+        # STEP 1: EXTRACT ALL PENDING ACTIONS FIRST
+        # ============================================================
+        # This MUST happen before classification so we can detect confirmations
+        pending_actions = extract_pending_actions(chat_context["message"][-10:])
+        logger.info(f"Extracted {len(pending_actions)} pending actions before classification")
+
+        # ============================================================
+        # STEP 2: UNIFIED INTENT CLASSIFICATION
+        # ============================================================
+        # Single LLM call that detects ALL intents:
+        # - Confirmations/declines (for pending actions)
+        # - Questions
+        # - Explicit suggestions (auto-track)
+        # - Implicit suggestions (offer to track)
+        # - Commands
+        # - Clarification responses
+        #
+        # Key fix: ALWAYS passes pending_actions (old hybrid_intent didn't)
+
+        try:
+            classification_result = await classify_unified_intent(
+                user_message=user_message,
+                hybrid_context=hybrid_context,
+                report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+                pending_actions=pending_actions,  # ALWAYS pass this!
+                last_assistant_message=get_last_assistant_message(chat_context)
+            )
+            logger.info(f"Unified classification: primary_intent={classification_result.get('primary_intent')}, "
+                       f"is_hybrid={classification_result.get('is_hybrid')}, "
+                       f"has_confirmation={classification_result.get('has_confirmation')}, "
+                       f"intents={len(classification_result.get('intents', []))}")
+
+            # For backward compatibility, also set hybrid_intent
+            hybrid_intent = classification_result
+        except Exception as e:
+            logger.warning(f"Unified classification failed, falling back to standard flow: {str(e)}")
+            classification_result = {
+                "intents": [],
+                "primary_intent": "question",
+                "is_hybrid": False,
+                "has_question": False,
+                "has_suggestion": False,
+                "has_confirmation": False,
+                "pending_actions_to_confirm": []
+            }
+            hybrid_intent = classification_result
+
+        # ============================================================
+        # STEP 3: PROCESS CONFIRMATIONS FIRST (Highest Priority)
+        # ============================================================
+        # If user is confirming/declining pending actions, handle that BEFORE
+        # processing other intents like questions or suggestions
+
+        primary_intent = classification_result.get("primary_intent", "")
+
+        if classification_result.get("has_confirmation", False) and pending_actions:
+            pending_to_confirm = classification_result.get("pending_actions_to_confirm", pending_actions[:1])
+            logger.info(f"Processing confirmation for {len(pending_to_confirm)} pending actions")
+
+            if primary_intent == "confirmation":
+                # Track all confirmed pending actions
+                tracked_changes = []
+                for pa in pending_to_confirm:
+                    suggestion_content = pa.get("content", "")
+                    suggestion_category = pa.get("type", "modify_architecture")
+
+                    if suggestion_content:
+                        affected_sections = get_affected_sections(suggestion_category)
+                        change_record = {
+                            "type": suggestion_category,
+                            "user_request": suggestion_content,
+                            "affected_sections": affected_sections,
+                            "timestamp": datetime.now().isoformat(),
+                            "status": "pending",
+                            "source": "hybrid_suggestion_confirmed"
+                        }
+
+                        try:
+                            add_result = await add_pending_change(
+                                chat_history_id=chat_context["chat_history_id"],
+                                change=change_record,
+                                db=db
+                            )
+                            tracked_changes.append({
+                                "change_id": add_result.get("change_id", "CHG-XXX"),
+                                "content": suggestion_content,
+                                "category": suggestion_category
+                            })
+                        except Exception as e:
+                            logger.error(f"Failed to track confirmed suggestion: {str(e)}")
+
+                # Check if there are ALSO new suggestions in the same message (e.g., "yes, and also add caching")
+                new_suggestions = [
+                    i for i in classification_result.get("intents", [])
+                    if i.get("type") in ["explicit_suggestion", "implicit_suggestion"]
+                ]
+
+                # Track any new explicit suggestions
+                for suggestion in new_suggestions:
+                    if suggestion.get("type") == "explicit_suggestion":
+                        suggestion_content = suggestion.get("content", "")
+                        suggestion_action = suggestion.get("action", "modify_architecture")
+
+                        if suggestion_content:
+                            affected_sections = get_affected_sections(suggestion_action)
+                            change_record = {
+                                "type": suggestion_action,
+                                "user_request": suggestion_content,
+                                "affected_sections": affected_sections,
+                                "timestamp": datetime.now().isoformat(),
+                                "status": "pending",
+                                "source": "confirmation_with_new_suggestion"
+                            }
+
+                            try:
+                                add_result = await add_pending_change(
+                                    chat_history_id=chat_context["chat_history_id"],
+                                    change=change_record,
+                                    db=db
+                                )
+                                tracked_changes.append({
+                                    "change_id": add_result.get("change_id", "CHG-XXX"),
+                                    "content": suggestion_content,
+                                    "category": suggestion_action
+                                })
+                            except Exception as e:
+                                logger.error(f"Failed to track new suggestion: {str(e)}")
+
+                if tracked_changes:
+                    pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
+
+                    if len(tracked_changes) == 1:
+                        change = tracked_changes[0]
+                        llm_response = f"""Got it. I've captured that as **{change['change_id']}** - {change['content']}.
+
+You now have {pending_count} pending modification{'s' if pending_count > 1 else ''}. When you're ready to incorporate these into the report, just say "regenerate report" and I'll update it accordingly."""
+                    else:
+                        changes_list = "\n".join([
+                            f"• **{c['change_id']}** - {c['content']}"
+                            for c in tracked_changes
+                        ])
+                        llm_response = f"""Noted. I've captured {len(tracked_changes)} modifications:
+
+{changes_list}
+
+That brings us to {pending_count} pending change{'s' if pending_count > 1 else ''} total. Let me know when you'd like to regenerate the report with these updates."""
+
+                    new_assistant_message = {
+                        "role": "assistant",
+                        "content": llm_response,
+                        "timestamp": datetime.now().isoformat(),
+                        "selected": True,
+                        "type": "suggestion_confirmed"
+                    }
+                    chat_context["message"].append(new_assistant_message)
+                    await save_chat_history(chat=chat_context, db=db)
+
+                    logger.info(f"Confirmed and tracked {len(tracked_changes)} changes")
+                    return {
+                        "message": llm_response,
+                        "action": "confirm_suggestion",
+                        "action_reason": f"User confirmed {len(tracked_changes)} suggestion(s)",
+                        "tracked_changes": tracked_changes
+                    }
+
+            elif primary_intent == "decline":
+                logger.info("User declined pending suggestion(s)")
+                llm_response = "Understood, we'll leave that as is. What else would you like to discuss about the architecture?"
+
+                new_assistant_message = {
+                    "role": "assistant",
+                    "content": llm_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "selected": True,
+                    "type": "suggestion_declined"
+                }
+                chat_context["message"].append(new_assistant_message)
+                await save_chat_history(chat=chat_context, db=db)
+
+                return {
+                    "message": llm_response,
+                    "action": "decline_suggestion",
+                    "action_reason": "User declined hybrid suggestion"
+                }
+
+        # ============================================================
+        # STEP 4: HANDLE HYBRID/MULTI-INTENT QUERIES
+        # ============================================================
+        # This section handles:
+        # - Hybrid queries (question + suggestion)
+        # - Multiple suggestions in one message
+        # - Questions that need answers from vector DB
+        #
+        # Key improvements:
+        # - Explicit suggestions are auto-tracked (not just offered)
+        # - Implicit suggestions are offered for confirmation
+        # - Questions are answered using vector retrieval
+        # - Multiple suggestions in one message are all tracked
+
+        intents = classification_result.get("intents", [])
+        has_question = classification_result.get("has_question", False)
+        has_suggestion = classification_result.get("has_suggestion", False)
+        is_hybrid = classification_result.get("is_hybrid", False)
+
+        # Get all suggestions (both explicit and implicit)
+        explicit_suggestions = [i for i in intents if i.get("type") == "explicit_suggestion"]
+        implicit_suggestions = [i for i in intents if i.get("type") == "implicit_suggestion"]
+        question_intents = [i for i in intents if i.get("type") == "question"]
+
+        logger.info(f"Intent breakdown: {len(question_intents)} questions, "
+                   f"{len(explicit_suggestions)} explicit suggestions, "
+                   f"{len(implicit_suggestions)} implicit suggestions")
+
+        # If we have any intents to process (question, suggestions, or hybrid)
+        if has_question or has_suggestion or len(intents) > 0:
+            # Track all explicit suggestions immediately
+            tracked_changes = []
+            for suggestion in explicit_suggestions:
+                suggestion_content = suggestion.get("content", "")
+                suggestion_action = suggestion.get("action", "modify_architecture")
+
+                if suggestion_content:
+                    affected_sections = get_affected_sections(suggestion_action)
+                    change_record = {
+                        "type": suggestion_action,
+                        "user_request": suggestion_content,
+                        "affected_sections": affected_sections,
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "pending",
+                        "source": "explicit_suggestion"
+                    }
+
+                    try:
+                        add_result = await add_pending_change(
+                            chat_history_id=chat_context["chat_history_id"],
+                            change=change_record,
+                            db=db
+                        )
+                        tracked_changes.append({
+                            "change_id": add_result.get("change_id", "CHG-XXX"),
+                            "content": suggestion_content,
+                            "category": suggestion_action
+                        })
+                        logger.info(f"Auto-tracked explicit suggestion: {add_result.get('change_id')}")
+                    except Exception as e:
+                        logger.error(f"Failed to track explicit suggestion: {str(e)}")
+
+            # Retrieve context for answering questions
+            retrieved_context = "N/A"
+            if has_question and question_intents:
+                try:
+                    question_for_retrieval = question_intents[0].get("content", user_message)
+                    vector_results = await retrieve_similar_embeddings(
+                        query_text=question_for_retrieval,
+                        model=settings.EMBEDDING_MODEL,
+                        chat_history_id=chat_context["chat_history_id"],
+                        top_k=3
+                    )
+                    if vector_results and "documents" in vector_results and vector_results["documents"]:
+                        retrieved_context = "\n\n".join(vector_results["documents"][0])
+                        logger.info(f"Retrieved {len(vector_results['documents'][0])} chunks for question")
+                except Exception as e:
+                    logger.warning(f"Vector retrieval for question failed: {str(e)}")
+
+            # Generate response based on intent combination
+            try:
+                # Determine the pending suggestion to offer (only implicit ones need confirmation)
+                pending_suggestion = None
+                if implicit_suggestions:
+                    first_implicit = implicit_suggestions[0]
+                    pending_suggestion = {
+                        "content": first_implicit.get("content", ""),
+                        "category": first_implicit.get("action", "modify_architecture"),
+                        "awaiting_confirmation": True
+                    }
+
+                # Generate response using hybrid response generator
+                llm_response = await generate_hybrid_response(
+                    report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+                    hybrid_context=hybrid_context,
+                    user_message=user_message,
+                    intent=classification_result,
+                    retrieved_context=retrieved_context
+                )
+
+                # If we tracked explicit changes, add that to the response
+                if tracked_changes:
+                    pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
+                    if len(tracked_changes) == 1:
+                        change = tracked_changes[0]
+                        llm_response += f"\n\nI've captured that as **{change['change_id']}** ({pending_count} pending total)."
+                    else:
+                        changes_list = ", ".join([f"**{c['change_id']}**" for c in tracked_changes])
+                        llm_response += f"\n\nI've captured those as {changes_list} ({pending_count} pending total)."
+
+                action = "hybrid_question_suggestion" if is_hybrid else ("question_answered" if has_question else "suggestions_processed")
+                action_reason = f"Processed: {len(question_intents)} questions, {len(tracked_changes)} tracked, {len(implicit_suggestions)} pending confirmation"
+
+                # Create and save response
+                new_assistant_message = {
+                    "role": "assistant",
+                    "content": llm_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "selected": True,
+                    "type": "hybrid_response" if is_hybrid else "unified_response"
+                }
+
+                # Only add pending_suggestion if there are implicit suggestions awaiting confirmation
+                if pending_suggestion:
+                    new_assistant_message["pending_suggestion"] = pending_suggestion
+
+                chat_context["message"].append(new_assistant_message)
+                await save_chat_history(chat=chat_context, db=db)
+
+                return {
+                    "message": llm_response,
+                    "action": action,
+                    "action_reason": action_reason,
+                    "tracked_changes": tracked_changes,
+                    "awaiting_confirmation": pending_suggestion is not None,
+                    "hybrid_intent": {
+                        "question_content": question_intents[0].get("content") if question_intents else None,
+                        "suggestion_content": pending_suggestion.get("content") if pending_suggestion else None,
+                        "suggestion_type": "implicit_suggestion" if pending_suggestion else None,
+                        "awaiting_confirmation": pending_suggestion is not None
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Error generating unified response: {str(e)}")
+                # Fall through to standard flow if unified response fails
+
+        # ============================================================
+        # STEP 5: CLARIFICATION CHECK (Max 2 attempts)
+        # ============================================================
+        # NOTE: Multi-part detection is now handled by the unified classification above
+        if needs_clarification(user_message):
+            # Count previous clarification attempts
+            clarification_count = 0
+            for msg in chat_context["message"]:
+                if msg.get("role") == "assistant" and "**Clarification Needed**" in msg.get("content", ""):
+                    clarification_count += 1
+
+            if clarification_count < 2:
+                logger.info(f"Message needs clarification (attempt {clarification_count + 1}/2)")
+
+                clarification_question = get_clarification_question(user_message)
+                llm_response = f"""**Clarification Needed**
+
+I want to make sure I understand your request correctly.
+
+{clarification_question}
+
+Your message: "{user_message}"
+"""
+                # Create and save response
+                new_assistant_message = {
+                    "role": "assistant",
+                    "content": llm_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "selected": True
+                }
+                chat_context["message"].append(new_assistant_message)
+                await save_chat_history(chat=chat_context, db=db)
+
+                return {
+                    "message": llm_response,
+                    "action": "clarification_requested",
+                    "action_reason": "Message was too vague, requesting clarification"
+                }
+            else:
+                logger.info("Max clarifications reached, proceeding with best interpretation")
+
+        # ============================================================
+        # STEP 6: ROUTER FALLBACK (for commands and other actions)
+        # ============================================================
+        # If the unified classification didn't handle the request (e.g., commands
+        # like "show version history", "regenerate report", etc.), use the router LLM
+
         # 5. Route query to determine action type
+        # Use summary_report (compressed) not the full report_content
         try:
             router_response = await router_query_llm(
                 user_message=user_message,
                 conversation_summary=conversation_context,
-                report_summary=report_summary
+                report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary
             )
             action = router_response.get("action", "general_discussion")
             action_reason = router_response.get("reason", "")
@@ -2201,6 +2992,47 @@ async def conversation_with_doc_v2(
         except Exception as e:
             logger.error(f"Error in router LLM: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error in router LLM: {str(e)}")
+
+        # ============================================================
+        # SAFETY NET: Critical Operation Confirmations
+        # ============================================================
+        # Only for rollback/clear operations (hybrid suggestions are now
+        # handled by the unified classification above)
+
+        if action == "general_discussion" and len(user_message.split()) <= 5:
+            user_lower = user_message.lower().strip()
+
+            affirmative_words = ["yes", "yeah", "yep", "yup", "ok", "okay", "sure", "go ahead",
+                               "do it", "proceed", "confirm", "confirmed", "absolutely", "definitely"]
+            negative_words = ["no", "nope", "nah", "cancel", "nevermind", "never mind", "stop", "don't", "abort"]
+
+            is_affirmative = any(word in user_lower for word in affirmative_words)
+            is_negative = any(word in user_lower for word in negative_words)
+
+            if is_affirmative or is_negative:
+                for msg in reversed(chat_context["message"][-10:]):
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+
+                        # Check for rollback confirmation
+                        if "CONFIRM ROLLBACK" in content or "rollback to" in content.lower():
+                            if is_affirmative:
+                                action = "rollback_to_version"
+                                action_reason = "User confirmed pending rollback"
+                                logger.info(f"Safety net: overriding to rollback_to_version")
+                            else:
+                                action = "undo_last_change"
+                                action_reason = "User cancelled pending rollback"
+                                logger.info(f"Safety net: overriding to undo_last_change")
+                            break
+
+                        # Check for clear all changes confirmation
+                        if "clear all" in content.lower() or "discard all" in content.lower():
+                            if is_affirmative:
+                                action = "clear_all_changes"
+                                action_reason = "User confirmed clearing all changes"
+                                logger.info(f"Safety net: overriding to clear_all_changes")
+                            break
 
         # 6. Handle action-specific processing
         retrieved_context = "N/A"
@@ -2451,6 +3283,997 @@ To make changes, you can:
                 logger.error(f"Error getting pending changes: {str(e)}")
                 llm_response = f"I encountered an error while retrieving pending changes: {str(e)}"
 
+        # ============================================================
+        # VERSION MANAGEMENT ACTIONS
+        # ============================================================
+
+        # Handle show_version_history action
+        elif action == "show_version_history":
+            logger.info("Processing show_version_history action")
+            try:
+                versions = await get_all_report_versions_enhanced(
+                    chat_context["chat_history_id"],
+                    current_user["regular_login_token"]["id"],
+                    db
+                )
+
+                if not versions:
+                    llm_response = """**No Report Versions Found**
+
+No reports have been generated for this conversation yet.
+
+Complete your analysis to generate a report.
+"""
+                elif len(versions) == 1:
+                    v = versions[0]
+                    llm_response = f"""**Version History** (1 version)
+
+**Version {v['version_number']}** {'(Default)' if v.get('is_default') else ''} {'(Latest)' if v.get('is_latest') else ''}
+- Created: {v['created_at'][:16] if v.get('created_at') else 'Unknown'}
+- Status: {v.get('change_description', 'Initial report')}
+- Summary: {v.get('executive_summary') or 'No summary available'}
+
+This is your only version. Future versions are created when you:
+- Make changes and regenerate the report
+- Rollback to a previous version
+"""
+                else:
+                    version_list = []
+                    for v in versions:
+                        status_markers = []
+                        if v.get("is_default"):
+                            status_markers.append("**DEFAULT**")
+                        if v.get("is_latest"):
+                            status_markers.append("Latest")
+                        status = f" {' | '.join(status_markers)}" if status_markers else ""
+
+                        exec_summary = v.get('executive_summary', 'N/A')
+                        if exec_summary and len(exec_summary) > 100:
+                            exec_summary = exec_summary[:100] + '...'
+
+                        version_list.append(
+                            f"**Version {v['version_number']}**{status}\n"
+                            f"   Created: {v['created_at'][:16] if v.get('created_at') else 'Unknown'}\n"
+                            f"   Changes: {v.get('change_description', 'N/A')}\n"
+                            f"   Summary: {exec_summary or 'N/A'}"
+                        )
+
+                    llm_response = f"""**Report Version History** ({len(versions)} versions)
+
+{chr(10).join(version_list)}
+
+---
+**Available Actions:**
+- "Show me version X" - View full content of a specific version
+- "Set version X as default" - Mark a version as your preferred version
+- "Compare version X and Y" - See differences between versions
+- "Rollback to version X" - Restore an older version
+- "Show full report" - View the default version
+"""
+            except Exception as e:
+                logger.error(f"Error retrieving version history: {str(e)}")
+                llm_response = f"Error retrieving version history: {str(e)}"
+
+        # Handle view_specific_version action
+        elif action == "view_specific_version":
+            logger.info("Processing view_specific_version action")
+            import re
+            version_match = re.search(r'version\s*(\d+)|v(\d+)', user_message, re.IGNORECASE)
+
+            if version_match:
+                target_version = int(version_match.group(1) or version_match.group(2))
+                try:
+                    version_data = await get_report_version_by_number(
+                        chat_context["chat_history_id"],
+                        target_version,
+                        db
+                    )
+
+                    current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+                    is_current = target_version == current_version
+
+                    llm_response = f"""**Report Version {target_version}** {"(Current)" if is_current else "(Historical)"}
+
+Created: {version_data.get('created_at', 'Unknown')}
+
+---
+
+{version_data.get('report_content', 'Content not available')}
+
+---
+
+{"This is your current version." if is_current else f"*This is a historical version. Current version is {current_version}.*"}
+
+**Actions:**
+- "Rollback to this version" - Restore this version as current
+- "Compare with current version" - See what changed
+"""
+                except HTTPException as he:
+                    if he.status_code == 404:
+                        llm_response = f"Version {target_version} not found. Use 'show version history' to see available versions."
+                    else:
+                        raise
+                except Exception as e:
+                    logger.error(f"Error retrieving version {target_version}: {str(e)}")
+                    llm_response = f"Error retrieving version {target_version}: {str(e)}"
+            else:
+                try:
+                    versions = await get_all_report_versions(chat_context["chat_history_id"], db)
+                    version_nums = [str(v["version_number"]) for v in versions]
+                    llm_response = f"""**Which version would you like to see?**
+
+Available versions: {', '.join(version_nums) if version_nums else 'Only current version exists'}
+
+Please specify, e.g., "Show me version 2"
+"""
+                except Exception as e:
+                    llm_response = "Please specify a version number, e.g., 'Show me version 2'"
+
+        # Handle rollback_to_version action (Two-Step Confirmation)
+        elif action == "rollback_to_version":
+            logger.info("Processing rollback_to_version action")
+            import re
+
+            version_match = re.search(r'version\s*(\d+)|v(\d+)', user_message, re.IGNORECASE)
+
+            # Check if this is a confirmation
+            is_confirmation = any(word in user_message.lower() for word in
+                                 ["yes", "confirm", "proceed", "do it", "go ahead", "ok", "okay"])
+
+            # Check for pending rollback in conversation context
+            pending_rollback = None
+            for msg in reversed(chat_context["message"]):
+                if msg.get("role") == "assistant" and "CONFIRM ROLLBACK" in msg.get("content", ""):
+                    pending_match = re.search(r'rollback to \*\*Version (\d+)\*\*', msg["content"], re.IGNORECASE)
+                    if pending_match:
+                        pending_rollback = int(pending_match.group(1))
+                        break
+
+            if is_confirmation and pending_rollback:
+                # Execute the rollback
+                try:
+                    result = await rollback_to_version(
+                        chat_history_id=chat_context["chat_history_id"],
+                        user_id=current_user["regular_login_token"]["id"],
+                        target_version_number=pending_rollback,
+                        db=db
+                    )
+
+                    # Update vector DB
+                    try:
+                        rolled_back_version = await get_report_version_by_number(
+                            chat_context["chat_history_id"],
+                            result["new_version_number"],
+                            db
+                        )
+                        new_chunks = await chunking.chunk_text(text=rolled_back_version["report_content"])
+                        await vector_db.create_embeddings(
+                            texts=new_chunks,
+                            model=settings.EMBEDDING_MODEL,
+                            chat_history_id=chat_context["chat_history_id"]
+                        )
+                    except Exception as vec_error:
+                        logger.warning(f"Failed to update vector DB: {str(vec_error)}")
+
+                    llm_response = f"""**Rollback Complete**
+
+Successfully rolled back to Version {pending_rollback}.
+
+A new version (Version {result['new_version_number']}) has been created with the content from Version {pending_rollback}.
+
+Your full version history is preserved - nothing was deleted.
+
+You can now continue working with this version or make additional changes.
+"""
+                except Exception as e:
+                    logger.error(f"Error during rollback: {str(e)}")
+                    llm_response = f"Error during rollback: {str(e)}"
+
+            elif version_match:
+                target_version = int(version_match.group(1) or version_match.group(2))
+                current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+
+                if target_version == current_version:
+                    llm_response = f"You're already on Version {target_version}. No rollback needed."
+                elif target_version > current_version:
+                    llm_response = f"Version {target_version} doesn't exist. Current version is {current_version}. Use 'show version history' to see available versions."
+                else:
+                    try:
+                        target_data = await get_report_version_by_number(
+                            chat_context["chat_history_id"],
+                            target_version,
+                            db
+                        )
+                        target_summary = "No summary available"
+                        if target_data.get("summary_report"):
+                            summary_report = target_data["summary_report"]
+                            if isinstance(summary_report, dict):
+                                target_summary = summary_report.get("executive_summary", "No summary")[:200]
+                            else:
+                                target_summary = str(summary_report)[:200]
+
+                        llm_response = f"""**CONFIRM ROLLBACK**
+
+You are about to rollback to **Version {target_version}**.
+
+**Version {target_version} Summary:**
+{target_summary}...
+
+**Current Version:** {current_version}
+
+This will create a new version with the content from Version {target_version}.
+Your current version will be preserved in history.
+
+**Type "yes" or "confirm" to proceed, or "cancel" to abort.**
+"""
+                    except Exception as e:
+                        logger.error(f"Error retrieving version {target_version}: {str(e)}")
+                        llm_response = f"Error retrieving version {target_version}: {str(e)}"
+            else:
+                llm_response = """**Which version would you like to rollback to?**
+
+Please specify a version number, e.g., "Rollback to version 2"
+
+Use "show version history" to see available versions.
+"""
+
+        # Handle compare_versions action
+        elif action == "compare_versions":
+            logger.info("Processing compare_versions action")
+            import re
+
+            version_matches = re.findall(r'(\d+)', user_message)
+
+            if len(version_matches) >= 2:
+                version_a = int(version_matches[0])
+                version_b = int(version_matches[1])
+
+                try:
+                    diff = await get_report_diff(
+                        chat_context["chat_history_id"],
+                        version_a,
+                        version_b,
+                        db
+                    )
+
+                    llm_response = f"""**Version Comparison: v{version_a} vs v{version_b}**
+
+**Statistics:**
+- Lines added: {diff.get('lines_added', 'N/A')}
+- Lines removed: {diff.get('lines_removed', 'N/A')}
+- Total changes: {diff.get('total_changes', 'N/A')}
+
+**Version {version_a} Summary:**
+{str(diff.get('summary_a', 'N/A'))[:200]}...
+
+**Version {version_b} Summary:**
+{str(diff.get('summary_b', 'N/A'))[:200]}...
+
+**Key Differences:**
+{diff.get('key_differences', 'Unable to compute detailed differences')}
+
+---
+Use "show me version X" to view full content of either version.
+"""
+                except Exception as e:
+                    logger.error(f"Error comparing versions: {str(e)}")
+                    llm_response = f"Error comparing versions: {str(e)}"
+            else:
+                current = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+                llm_response = f"""**Which versions would you like to compare?**
+
+Current version: {current}
+
+Please specify two version numbers, e.g.:
+- "Compare version 1 and 3"
+- "Diff between v1 and v2"
+- "What changed between version 1 and 2?"
+"""
+
+        # ============================================================
+        # NAVIGATION & CONTEXT ACTIONS
+        # ============================================================
+
+        # Handle show_section action
+        elif action == "show_section":
+            logger.info("Processing show_section action")
+
+            # Map common section names to report sections and markdown headers
+            SECTION_MAPPING = {
+                "architecture": {
+                    "keywords": ["architecture", "system design", "technical architecture", "design", "technical"],
+                    "headers": ["architecture", "system architecture", "technical architecture", "system design", "architectural"]
+                },
+                "risks": {
+                    "keywords": ["risks", "risk assessment", "potential risks", "risk analysis", "risk"],
+                    "headers": ["risk", "risks", "risk assessment", "risk analysis", "potential risks"]
+                },
+                "costs": {
+                    "keywords": ["costs", "estimates", "cost breakdown", "pricing", "budget", "cost", "estimate"],
+                    "headers": ["cost", "costs", "pricing", "budget", "estimate", "cost breakdown", "cost estimation"]
+                },
+                "executive_summary": {
+                    "keywords": ["executive summary", "summary", "overview", "tldr", "executive"],
+                    "headers": ["executive summary", "summary", "overview", "introduction"]
+                },
+                "implementation": {
+                    "keywords": ["implementation", "implementation plan", "timeline", "phases", "plan", "roadmap"],
+                    "headers": ["implementation", "implementation plan", "timeline", "phases", "roadmap", "milestones"]
+                },
+                "requirements": {
+                    "keywords": ["requirements", "functional requirements", "non-functional", "requirement", "features"],
+                    "headers": ["requirement", "requirements", "functional requirements", "non-functional", "features"]
+                },
+                "assumptions": {
+                    "keywords": ["assumptions", "assumed", "presumed", "assumption"],
+                    "headers": ["assumption", "assumptions", "presumptions"]
+                },
+                "technologies": {
+                    "keywords": ["technologies", "tech stack", "stack", "tools", "technology", "technical"],
+                    "headers": ["technology", "technologies", "tech stack", "technology stack", "tools", "technical stack"]
+                },
+                "security": {
+                    "keywords": ["security", "authentication", "authorization", "auth"],
+                    "headers": ["security", "authentication", "authorization", "security considerations"]
+                },
+                "infrastructure": {
+                    "keywords": ["infrastructure", "deployment", "hosting", "cloud", "deploy"],
+                    "headers": ["infrastructure", "deployment", "hosting", "cloud", "devops"]
+                },
+            }
+
+            # Detect which section user wants
+            user_lower = user_message.lower()
+            target_section = None
+
+            for section_key, section_data in SECTION_MAPPING.items():
+                if any(kw in user_lower for kw in section_data["keywords"]):
+                    target_section = section_key
+                    break
+
+            if target_section:
+                section_content = None
+                source = None
+
+                # Strategy 1: Try to extract section directly from report_content using markdown headers
+                report_content = report_summary.report_content if hasattr(report_summary, 'report_content') else None
+
+                if report_content:
+                    import re
+                    section_headers = SECTION_MAPPING[target_section]["headers"]
+
+                    # Build regex pattern to find section by headers (## Header or # Header)
+                    for header in section_headers:
+                        # Match ## Header or # Header (case insensitive)
+                        pattern = rf'^(#{1,3})\s*[^#]*{re.escape(header)}[^#\n]*$'
+                        matches = list(re.finditer(pattern, report_content, re.IGNORECASE | re.MULTILINE))
+
+                        if matches:
+                            start_pos = matches[0].start()
+                            header_level = len(matches[0].group(1))  # Number of # symbols
+
+                            # Find next section of same or higher level
+                            next_section_pattern = rf'^#{{{1},{header_level}}}\s+[^#]'
+                            remaining_content = report_content[matches[0].end():]
+                            next_match = re.search(next_section_pattern, remaining_content, re.MULTILINE)
+
+                            if next_match:
+                                section_content = report_content[start_pos:matches[0].end() + next_match.start()].strip()
+                            else:
+                                # Take until end of document or reasonable limit
+                                section_content = report_content[start_pos:start_pos + 5000].strip()
+
+                            source = "report_content"
+                            logger.info(f"Extracted section '{target_section}' from report_content using header matching")
+                            break
+
+                # Strategy 2: Try summary if no content from report
+                if not section_content:
+                    summary_report = report_summary.summary_report if hasattr(report_summary, 'summary_report') else {}
+                    if isinstance(summary_report, dict):
+                        section_content = summary_report.get(target_section)
+                        if section_content:
+                            if not isinstance(section_content, str):
+                                section_content = json.dumps(section_content, indent=2)
+                            source = "summary"
+
+                # Strategy 3: Fall back to vector retrieval with higher top_k
+                if not section_content:
+                    try:
+                        vector_results = await retrieve_similar_embeddings(
+                            query_text=f"{target_section.replace('_', ' ')} section details requirements specifications",
+                            chat_history_id=chat_context["chat_history_id"],
+                            model=settings.EMBEDDING_MODEL,
+                            top_k=5  # Increased from 3 to 5
+                        )
+
+                        if vector_results and vector_results.get("documents") and vector_results["documents"][0]:
+                            section_content = "\n\n".join(vector_results["documents"][0])
+                            source = "vector_retrieval"
+                            logger.info(f"Retrieved section '{target_section}' via vector search")
+                    except Exception as e:
+                        logger.error(f"Vector retrieval failed: {str(e)}")
+
+                # Format response based on what we found
+                if section_content:
+                    source_note = {
+                        "report_content": "*Extracted directly from the full report.*",
+                        "summary": "*Extracted from report summary. Say \"show more detail\" for the full section.*",
+                        "vector_retrieval": "*Retrieved from report content.*"
+                    }.get(source, "")
+
+                    llm_response = f"""**{target_section.replace('_', ' ').title()}**
+
+{section_content}
+
+---
+{source_note}
+"""
+                else:
+                    llm_response = f"""I couldn't find a specific **{target_section.replace('_', ' ')}** section in the report.
+
+The report may structure this information differently. You can try:
+- Asking a specific question about {target_section.replace('_', ' ')}
+- Saying "show the full report" to see all content
+"""
+            else:
+                # Show available sections
+                llm_response = """**Which section would you like to see?**
+
+Available sections:
+- **Architecture** - System design and technical architecture
+- **Risks** - Risk assessment and mitigation strategies
+- **Costs** - Cost estimates and budget breakdown
+- **Executive Summary** - High-level overview
+- **Implementation** - Implementation plan and timeline
+- **Requirements** - Functional and non-functional requirements
+- **Technologies** - Tech stack and tools
+- **Security** - Security considerations
+- **Infrastructure** - Deployment and hosting
+- **Assumptions** - Assumptions made in the analysis
+
+Just say something like "Show me the architecture" or "What are the risks?"
+"""
+
+        # Handle show_presales_context action
+        elif action == "show_presales_context":
+            logger.info("Processing show_presales_context action")
+
+            try:
+                # Get analysis link to find presales_id
+                analysis_link = await get_analysis_link(
+                    document_id=chat_context.get("document_id"),
+                    user_id=current_user["regular_login_token"]["id"],
+                    db=db
+                )
+
+                if not analysis_link or not analysis_link.get("presales_id"):
+                    llm_response = """**No Pre-Sales Context Available**
+
+This report was not generated from a pre-sales analysis, so there's no pre-sales context to show.
+
+The report was likely generated directly from a document upload.
+"""
+                else:
+                    presales_id = analysis_link["presales_id"]
+
+                    # Get presales data
+                    presales = await get_presales_by_id(
+                        presales_id=presales_id,
+                        user_id=current_user["regular_login_token"]["id"],
+                        db=db
+                    )
+
+                    # Get questions and answers
+                    questions = await get_presales_questions(
+                        presales_id=presales_id,
+                        user_id=current_user["regular_login_token"]["id"],
+                        db=db
+                    )
+
+                    # Format presales brief
+                    brief = presales.get("presales_brief", "No brief available") if presales else "No brief available"
+                    if len(brief) > 500:
+                        brief = brief[:500] + "..."
+
+                    # Format questions with answers
+                    questions_text = ""
+                    answered_count = 0
+                    if questions:
+                        for i, q in enumerate(questions, 1):
+                            answer = q.get("answer", "Not answered")
+                            if answer and answer != "Not answered":
+                                answered_count += 1
+                            q_type = "P1" if q.get("is_p1_blocker") else "Q"
+                            questions_text += f"**{q_type}-{i}:** {q.get('question', 'Unknown')}\n"
+                            questions_text += f"   Answer: {answer}\n\n"
+
+                    # Get additional context if saved
+                    additional_context = presales.get("additional_context", "None provided") if presales else "None"
+
+                    llm_response = f"""**Pre-Sales Context**
+
+## Original Brief
+{brief}
+
+## Questions & Answers ({answered_count}/{len(questions) if questions else 0} answered)
+
+{questions_text if questions_text else "No questions recorded."}
+
+## Additional Context
+{additional_context if additional_context else "None provided"}
+
+---
+**Actions:**
+- Switch to **Pre-Sales tab** to modify answers
+- Say "regenerate with updated presales" after making changes
+- Changes will create a new report version
+"""
+            except Exception as e:
+                logger.error(f"Error retrieving presales context: {str(e)}")
+                llm_response = f"Error retrieving pre-sales context: {str(e)}"
+
+        # ============================================================
+        # UTILITY ACTIONS
+        # ============================================================
+
+        # Handle help_capabilities action
+        elif action == "help_capabilities":
+            logger.info("Processing help_capabilities action")
+
+            try:
+                pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
+                current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+
+                llm_response = f"""**AlignIQ Report Assistant**
+
+I can help you with your technical report. Here's what I can do:
+
+## Ask Questions
+- "What does the architecture look like?"
+- "Explain the risk assessment"
+- "Show me the cost estimates"
+- "What technologies are recommended?"
+
+## Make Changes
+- "Use PostgreSQL instead of MongoDB"
+- "Add real-time messaging capability"
+- "The user count should be 50,000 not 10,000"
+- "We're using AWS, not Azure"
+
+## Manage Changes
+- "Show pending changes" - See what changes are queued
+- "Undo last change" - Remove the most recent change
+- "Remove CHG-001" - Remove a specific change
+- "Clear all changes" - Discard all pending changes
+- "Regenerate report" - Apply all pending changes
+
+## Version History
+- "Show version history" - List all versions
+- "Show me version 2" - View a specific version
+- "Compare version 1 and 2" - See differences
+- "Rollback to version 1" - Restore a previous version
+
+## Navigation
+- "Show me the architecture section"
+- "What are the risks?"
+- "Show presales context" - View original inputs
+- "Show executive summary"
+
+## Export
+- "Export to PDF" - Generate downloadable report
+
+---
+**Current Status:**
+- Report Version: {current_version}
+- Pending Changes: {pending_count}
+
+What would you like to do?
+"""
+            except Exception as e:
+                logger.error(f"Error in help_capabilities: {str(e)}")
+                llm_response = """**AlignIQ Report Assistant**
+
+I can help you with:
+- Answering questions about your report
+- Making changes to architecture, requirements, or assumptions
+- Managing pending changes
+- Viewing version history
+- Exporting the report
+
+Just ask me anything about your report!
+"""
+
+        # Handle export_report action
+        elif action == "export_report":
+            logger.info("Processing export_report action")
+
+            try:
+                # Get the default/current report
+                default_report = await get_default_report(
+                    chat_history_id=chat_context["chat_history_id"],
+                    user_id=current_user["regular_login_token"]["id"],
+                    db=db
+                )
+
+                report_content = default_report.get("report_content", "")
+                version_number = default_report.get("version_number", 1)
+
+                if not report_content:
+                    llm_response = "Unable to export: No report content found."
+                else:
+                    # Check if user specifically asked for PDF
+                    user_lower = user_message.lower()
+                    wants_pdf = any(keyword in user_lower for keyword in ['pdf', 'download', 'generate pdf'])
+
+                    if wants_pdf:
+                        try:
+                            # Generate PDF on-the-fly
+                            pdf_data = await generate_pdf_from_markdown(
+                                markdown_content=report_content,
+                                title="Technical Report",
+                                version=version_number
+                            )
+
+                            # Return base64 encoded PDF for frontend download
+                            import base64
+                            pdf_base64 = base64.b64encode(pdf_data).decode('utf-8')
+
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            filename = f"report_v{version_number}_{timestamp}.pdf"
+
+                            llm_response = f"""**PDF Generated Successfully**
+
+Your report has been converted to PDF format.
+
+**Version:** {version_number}
+**Filename:** {filename}
+
+The PDF download should start automatically. If not, click the download button below.
+"""
+                            # Create assistant message with PDF data
+                            new_assistant_message = {
+                                "role": "assistant",
+                                "content": llm_response,
+                                "timestamp": datetime.now().isoformat(),
+                                "selected": True,
+                                "pdf_download": {
+                                    "available": True,
+                                    "filename": filename,
+                                    "data": pdf_base64,
+                                    "mime_type": "application/pdf"
+                                }
+                            }
+                            chat_context["message"].append(new_assistant_message)
+                            await save_chat_history(chat=chat_context, db=db)
+
+                            return {
+                                "message": llm_response,
+                                "action": action,
+                                "action_reason": action_reason,
+                                "pdf_download": {
+                                    "available": True,
+                                    "filename": filename,
+                                    "data": pdf_base64,
+                                    "mime_type": "application/pdf"
+                                }
+                            }
+
+                        except Exception as pdf_error:
+                            logger.error(f"PDF generation error: {str(pdf_error)}")
+                            # Fallback to markdown export
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                            llm_response = f"""**PDF Generation Failed**
+
+Unable to generate PDF: {str(pdf_error)}
+
+Here's your report in Markdown format instead (you can use browser print to PDF):
+
+---
+
+**Version:** {version_number}
+**Generated:** {timestamp}
+
+---
+
+{report_content}
+
+---
+
+*End of Report*
+"""
+                    else:
+                        # Plain export without PDF
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+                        llm_response = f"""**Report Export**
+
+**Version:** {version_number}
+**Generated:** {timestamp}
+**Format:** Markdown
+
+---
+
+The report content is displayed below. You can:
+1. **Copy the content** - Select all and copy to your preferred editor
+2. **Say "Export to PDF"** - Generate a downloadable PDF file
+3. **Print to PDF** - Use your browser's print function (Ctrl+P) and select "Save as PDF"
+
+---
+
+## Full Report Content
+
+{report_content}
+
+---
+
+*End of Report*
+"""
+            except HTTPException as he:
+                if he.status_code == 404:
+                    llm_response = "No report found to export. Generate a report first."
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Export error: {str(e)}")
+                llm_response = f"Error exporting report: {str(e)}"
+
+        # ============================================================
+        # SHOW FULL REPORT ACTION
+        # ============================================================
+
+        elif action == "show_full_report":
+            logger.info("Processing show_full_report action")
+            try:
+                # Get the default/current report
+                default_report = await get_default_report(
+                    chat_history_id=chat_context["chat_history_id"],
+                    user_id=current_user["regular_login_token"]["id"],
+                    db=db
+                )
+
+                report_content = default_report.get("report_content", "")
+                version_number = default_report.get("version_number", 1)
+                is_default = default_report.get("is_default", False)
+
+                # Handle potentially large reports
+                content_length = len(report_content)
+                MAX_RESPONSE_LENGTH = 50000  # ~12k tokens
+
+                if content_length > MAX_RESPONSE_LENGTH:
+                    # Truncate with notice
+                    truncated_content = report_content[:MAX_RESPONSE_LENGTH]
+                    # Find last complete section to avoid mid-word cuts
+                    last_header = truncated_content.rfind('\n## ')
+                    if last_header > MAX_RESPONSE_LENGTH * 0.8:
+                        truncated_content = truncated_content[:last_header]
+
+                    llm_response = f"""**Full Report (Version {version_number})** {'(Default)' if is_default else ''}
+
+{truncated_content}
+
+---
+
+*Report truncated due to size ({content_length:,} characters). To see specific sections, try:*
+- "Show me the architecture section"
+- "Show me the risks section"
+- "Export to PDF" for the complete document
+"""
+                else:
+                    llm_response = f"""**Full Report (Version {version_number})** {'(Default)' if is_default else ''}
+
+{report_content}
+
+---
+
+*End of Report*
+
+**Actions:**
+- "Set this as default version" - Mark this as your preferred version
+- "Export to PDF" - Download the complete report
+- "Show version history" - See other versions
+"""
+            except HTTPException as he:
+                if he.status_code == 404:
+                    llm_response = """**No Report Found**
+
+There is no report generated for this conversation yet.
+
+To generate a report, you'll need to:
+1. Upload a requirements document
+2. Run the full analysis workflow
+
+Or if you're in a presales workflow, complete the analysis first.
+"""
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Error retrieving full report: {str(e)}")
+                llm_response = f"Error retrieving report: {str(e)}"
+
+        # ============================================================
+        # SET DEFAULT VERSION ACTION
+        # ============================================================
+
+        elif action == "set_default_version":
+            logger.info("Processing set_default_version action")
+            import re as regex_module
+
+            version_match = regex_module.search(r'version\s*(\d+)|v(\d+)', user_message, regex_module.IGNORECASE)
+
+            if version_match:
+                target_version = int(version_match.group(1) or version_match.group(2))
+                try:
+                    result = await set_default_version(
+                        chat_history_id=chat_context["chat_history_id"],
+                        user_id=current_user["regular_login_token"]["id"],
+                        version_number=target_version,
+                        db=db
+                    )
+
+                    # Update vector DB embeddings to match the new default version
+                    try:
+                        default_report = await get_default_report(
+                            chat_history_id=chat_context["chat_history_id"],
+                            user_id=current_user["regular_login_token"]["id"],
+                            db=db
+                        )
+                        report_content = default_report.get("report_content", "")
+                        if report_content:
+                            new_chunks = await chunking.chunk_text(text=report_content)
+                            await vector_db.create_embeddings(
+                                texts=new_chunks,
+                                model=settings.EMBEDDING_MODEL,
+                                chat_history_id=chat_context["chat_history_id"]
+                            )
+                            logger.info(f"Updated vector DB embeddings for default version {target_version}")
+                    except Exception as vec_error:
+                        logger.warning(f"Failed to update vector DB embeddings: {str(vec_error)}")
+
+                    llm_response = f"""**Default Version Updated**
+
+Version {target_version} is now set as your default report version.
+
+When you ask for "the report" or "current report", this version will be returned.
+
+**What this means:**
+- "Show full report" will display Version {target_version}
+- "Export to PDF" will use Version {target_version}
+- Other versions remain accessible via "show me version X"
+
+You can change the default at any time by saying "set version X as default".
+"""
+                except HTTPException as he:
+                    if he.status_code == 404:
+                        llm_response = f"""**Version Not Found**
+
+Version {target_version} doesn't exist for this report.
+
+Use "show version history" to see available versions.
+"""
+                    else:
+                        raise
+                except Exception as e:
+                    logger.error(f"Error setting default version: {str(e)}")
+                    llm_response = f"Error setting default version: {str(e)}"
+            else:
+                # Ask which version to set as default
+                try:
+                    versions = await get_all_report_versions_enhanced(
+                        chat_context["chat_history_id"],
+                        current_user["regular_login_token"]["id"],
+                        db
+                    )
+
+                    if versions:
+                        version_list = []
+                        for v in versions:
+                            status_markers = []
+                            if v["is_default"]:
+                                status_markers.append("Current Default")
+                            if v["is_latest"]:
+                                status_markers.append("Latest")
+                            status = f" ({', '.join(status_markers)})" if status_markers else ""
+                            version_list.append(f"- Version {v['version_number']}{status}")
+
+                        llm_response = f"""**Which version would you like to set as default?**
+
+Available versions:
+{chr(10).join(version_list)}
+
+Please specify, e.g., "Set version 2 as default"
+"""
+                    else:
+                        llm_response = "No report versions found. Generate a report first."
+                except Exception as e:
+                    llm_response = "Please specify a version number, e.g., 'Set version 2 as default'"
+
+        # ============================================================
+        # IMPROVE EXISTING REPORT ACTION
+        # ============================================================
+
+        # Handle improve_existing_report action - track as pending change
+        elif action == "improve_existing_report":
+            logger.info("Processing improve_existing_report action")
+
+            # Detect which section to improve
+            section_keywords = {
+                "architecture": ["architecture", "design", "system", "technical"],
+                "costs": ["cost", "estimate", "pricing", "budget", "price"],
+                "risks": ["risk", "risks", "risk assessment"],
+                "implementation": ["implementation", "timeline", "phases", "plan"],
+                "security": ["security", "auth", "authentication"],
+                "executive_summary": ["summary", "executive", "overview"],
+                "requirements": ["requirement", "requirements", "features"],
+                "infrastructure": ["infrastructure", "deploy", "hosting", "cloud"],
+            }
+
+            target_section = None
+            user_lower = user_message.lower()
+
+            for section, keywords in section_keywords.items():
+                if any(kw in user_lower for kw in keywords):
+                    target_section = section
+                    break
+
+            if target_section:
+                # Track as a pending change for section expansion
+                change_record = {
+                    "type": "improve_section",
+                    "user_request": user_message,
+                    "affected_sections": [target_section],
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "pending",
+                    "improvement_type": "expand"
+                }
+
+                try:
+                    add_result = await add_pending_change(
+                        chat_history_id=chat_context["chat_history_id"],
+                        change=change_record,
+                        db=db
+                    )
+
+                    pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
+
+                    llm_response = f"""**Improvement Tracked**
+
+I've noted your request to expand the **{target_section.replace('_', ' ').title()}** section.
+
+**Change ID:** {add_result['change_id']}
+**Request:** {user_message}
+
+**Total pending changes:** {pending_count}
+
+When you say **"regenerate report"**, I'll expand this section with more detail based on your request.
+
+You can also:
+- Add more improvement requests before regenerating
+- Say "show pending changes" to see all queued changes
+- Say "undo" to remove this change
+"""
+                except Exception as e:
+                    logger.error(f"Error tracking improvement: {str(e)}")
+                    # Fall back to generating a response
+                    llm_response = await generate_action_response(
+                        report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+                        conversation_context=conversation_context,
+                        user_message=user_message,
+                        action=action,
+                        action_reason=action_reason,
+                        retrieved_context="N/A"
+                    )
+            else:
+                # No specific section detected - ask for clarification or provide general response
+                llm_response = await generate_action_response(
+                    report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+                    conversation_context=conversation_context,
+                    user_message=user_message,
+                    action=action,
+                    action_reason=action_reason,
+                    retrieved_context="N/A"
+                )
+
         # Handle regenerate_full_report action
         elif action == "regenerate_full_report":
             logger.info("Processing regenerate_full_report action")
@@ -2523,9 +4346,13 @@ If you'd like to make modifications, just let me know what you'd like to change 
 
                             logger.info(f"Section regeneration completed, new report length: {len(regenerated_report)} chars")
 
-                            # Create summary for the new report
-                            new_summary = await main_report_summary(main_report=regenerated_report)
-                            logger.info(f"Generated summary for regenerated report")
+                            # Calculate new version number before creating summary
+                            current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+                            new_version_number = current_version + 1
+
+                            # Create summary for the new report with correct version number
+                            new_summary = await main_report_summary(main_report=regenerated_report, version_number=new_version_number)
+                            logger.info(f"Generated summary for regenerated report (version {new_version_number})")
 
                             # Create new version
                             new_version_result = await create_new_report_version(
@@ -2581,6 +4408,15 @@ Your report has been updated with all the requested changes. You can:
 - View previous versions by asking "show version history"
 - Rollback to a previous version if needed"""
 
+                            # Update pending_changes_info to reflect cleared state
+                            pending_changes_info = {
+                                "total_pending": 0,
+                                "has_conflicts": False,
+                                "changes_applied": len(pending_changes),
+                                "new_version": new_version_result['version_number'],
+                                "status": "applied"
+                            }
+
                         except Exception as regen_error:
                             logger.error(f"Error during regeneration: {str(regen_error)}")
                             # Fall back to showing the plan if regeneration fails
@@ -2609,7 +4445,7 @@ Your changes have been saved. Please try again or contact support if the issue p
         # Handle vector store retrieval
         elif action == "retrieve_from_vectorstore":
             try:
-                vector_results = await vector_db.retrieve_similar_embeddings(
+                vector_results = await retrieve_similar_embeddings(
                     query_text=user_message,
                     chat_history_id=chat_context["chat_history_id"],
                     model=settings.EMBEDDING_MODEL,
@@ -2938,4 +4774,200 @@ async def compare_versions(
     except Exception as e:
         logger.error(f"Error computing diff: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error computing diff: {str(e)}")
+
+
+# ============================================================================
+# NEW: UNIFIED CHAT ENDPOINT (V3) - Uses Semantic Classification
+# ============================================================================
+# This endpoint replaces keyword-based intent detection with LLM-based
+# semantic understanding. It uses explicit state management for pending
+# actions and routes to specialized handlers.
+
+@router.post('/chat-with-doc')
+async def conversation_with_doc_v3(
+    request: ChatHistoryDetails,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Unified chat endpoint with semantic intent classification.
+
+    Key improvements over v2:
+    1. Semantic classification - no hardcoded keyword matching
+    2. Explicit state management - pending actions stored in DB
+    3. Architecture defense - can explain WHY choices were made
+    4. Clean handler-based architecture - single responsibility
+
+    Flow:
+    1. Load conversation state from DB
+    2. Build report context
+    3. Classify intent semantically (single LLM call)
+    4. Route to appropriate handler
+    5. Save state and return response
+
+    Args:
+        request: ChatHistoryDetails with message array
+        current_user: Authenticated user from token
+        db: Database session
+
+    Returns:
+        Dict with AI response message and metadata
+    """
+    try:
+        # 1. VALIDATE USER
+        if current_user["regular_login_token"]["id"] != request.user_id:
+            raise HTTPException(status_code=400, detail="User ID mismatch")
+
+        chat_context = request.model_dump()
+        chat_history_id = chat_context["chat_history_id"]
+        logger.info(f"Processing chat-with-doc-v3 for chat_history_id: {chat_history_id}")
+
+        # Get latest user message
+        if not chat_context["message"]:
+            raise HTTPException(status_code=400, detail="No messages to process")
+
+        user_message = chat_context["message"][-1]["content"]
+        logger.info(f"User message: {user_message[:100]}...")
+
+        # 2. LOAD CONVERSATION STATE
+        # This replaces fragile string-based pending action extraction
+        conversation_state = await load_conversation_state(chat_history_id, db)
+        pending_actions = conversation_state.get_pending_actions_for_classifier()
+        logger.info(f"Loaded {len(pending_actions)} pending actions from state")
+
+        # 3. BUILD REPORT CONTEXT
+        try:
+            report_summary = await get_summary_report(chat_history_id=chat_history_id, db=db)
+            if not report_summary:
+                raise HTTPException(status_code=404, detail="No report found for this chat")
+        except Exception as e:
+            logger.error(f"Error retrieving report summary: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error retrieving report: {str(e)}")
+
+        # Build recent messages context (last 10 turns, excluding report content)
+        from utils.chat_history import build_conversation_context
+        context_result = await build_conversation_context(
+            messages=chat_context["message"],
+            max_turns=10
+        )
+        recent_messages = context_result["recent_messages"]
+        conversation_summary = context_result.get("conversation_summary")
+        logger.info(f"Context built: type={context_result['context_type']}, "
+                   f"included={context_result['total_included']}, filtered={context_result['filtered_count']}")
+
+        # 4. SEMANTIC INTENT CLASSIFICATION
+        # Single LLM call that understands meaning, not keywords
+        try:
+            classification = await classify_semantic_intent(
+                user_message=user_message,
+                pending_actions=pending_actions,
+                report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+                recent_messages=recent_messages
+            )
+            # Ensure user_message is always in classification for handler use
+            classification["user_message"] = user_message
+            logger.info(f"Semantic classification: strategy={classification.get('primary_response_strategy')}, "
+                       f"defense={classification.get('requires_architecture_defense')}")
+        except Exception as e:
+            logger.error(f"Semantic classification failed: {str(e)}")
+            # Fallback to simple question handling
+            classification = {
+                "primary_response_strategy": "answer_question",
+                "intents": [{"type": "question", "content": user_message}],
+                "confirmation_map": {},
+                "requires_architecture_defense": False,
+                "user_message": user_message
+            }
+
+        # 5. ROUTE TO HANDLER
+        # Each handler has single responsibility
+        primary_strategy = classification.get("primary_response_strategy", "answer_question")
+        handler = get_intent_handler(primary_strategy)
+
+        # Build context for handler
+        handler_context = {
+            "report_summary": report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
+            "recent_messages": recent_messages,
+            "chat_history_id": chat_history_id,
+            "user_id": request.user_id,
+            "conversation_summary": conversation_summary
+        }
+
+        try:
+            response = await handler.handle(
+                classification=classification,
+                state=conversation_state,
+                context=handler_context,
+                db=db
+            )
+        except Exception as e:
+            logger.error(f"Handler error: {str(e)}")
+            response = {
+                "message": "I encountered an issue processing your request. Could you rephrase that?",
+                "action": "handler_error",
+                "action_reason": str(e)
+            }
+
+        # 6. SAVE CHAT HISTORY
+        llm_response = response.get("message", "")
+
+        # Handle report regeneration response - include full report content
+        report_content = response.get("report_content")
+        if response.get("type") == "report_regeneration" and report_content:
+            # For report regeneration, store full report separately but show summary in chat
+            full_content_for_chat = f"{llm_response}\n\n---\n\n{report_content}"
+        else:
+            full_content_for_chat = llm_response
+
+        new_assistant_message = {
+            "role": "assistant",
+            "content": full_content_for_chat,
+            "timestamp": datetime.now().isoformat(),
+            "selected": True,
+            "type": response.get("type", "unified_response")
+        }
+
+        # Include pending suggestion if handler returned one
+        if response.get("pending_suggestion"):
+            new_assistant_message["pending_suggestion"] = response["pending_suggestion"]
+
+        # Include version info for report regeneration
+        if response.get("version_number"):
+            new_assistant_message["version_number"] = response["version_number"]
+
+        chat_context["message"].append(new_assistant_message)
+        await save_chat_history(chat=chat_context, db=db)
+
+        # 7. RETURN RESPONSE
+        api_response = {
+            "message": llm_response,
+            "action": response.get("action", "processed"),
+            "action_reason": response.get("action_reason", ""),
+            "tracked_changes": response.get("tracked_changes", []),
+            "awaiting_confirmation": response.get("pending_suggestion") is not None,
+            "classification": {
+                "primary_strategy": primary_strategy,
+                "requires_defense": classification.get("requires_architecture_defense", False)
+            }
+        }
+
+        # Include report-specific fields if present
+        if report_content:
+            api_response["report_content"] = report_content
+        if response.get("version_number"):
+            api_response["version_number"] = response["version_number"]
+        if response.get("changes_applied"):
+            api_response["changes_applied"] = response["changes_applied"]
+        if response.get("processing_time"):
+            api_response["processing_time"] = response["processing_time"]
+        if response.get("conflicts"):
+            api_response["conflicts"] = response["conflicts"]
+
+        return api_response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in chat-with-doc-v3: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
