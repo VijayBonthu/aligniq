@@ -654,9 +654,14 @@ async def get_all_report_versions(chat_history_id: str, db: Session) -> list:
             versions.append({
                 "report_version_id": record.report_version_id,
                 "version_number": record.version_number,
+                "version": record.version_number,  # Alias for compatibility
                 "created_at": record.created_at.isoformat() if record.created_at else None,
                 "summary": record.summary_report.get("executive_summary", "No summary available") if record.summary_report else "No summary",
-                "is_latest": record.version_number == records[0].version_number if records else False
+                "is_latest": record.version_number == records[0].version_number if records else False,
+                # Changelog tracking fields
+                "changes_applied": record.changes_applied,
+                "changelog_summary": record.changelog_summary,
+                "parent_version_id": record.parent_version_id
             })
 
         return versions
@@ -702,7 +707,11 @@ async def get_report_version_by_number(chat_history_id: str, version_number: int
             "version_number": record.version_number,
             "report_content": record.report_content,
             "summary_report": record.summary_report,
-            "created_at": record.created_at.isoformat() if record.created_at else None
+            "created_at": record.created_at.isoformat() if record.created_at else None,
+            # Changelog tracking fields
+            "changes_applied": record.changes_applied,
+            "changelog_summary": record.changelog_summary,
+            "parent_version_id": record.parent_version_id
         }
 
     except HTTPException:
@@ -720,7 +729,9 @@ async def create_new_report_version(
     report_content: str,
     summary_report: dict,
     changes_applied: list,
-    db: Session
+    db: Session,
+    changelog_summary: str = None,
+    parent_version_id: str = None
 ) -> dict:
     """
     Create a new report version after regeneration.
@@ -732,6 +743,8 @@ async def create_new_report_version(
         summary_report: The structured summary of the report
         changes_applied: List of changes that were applied in this version
         db: Database session
+        changelog_summary: LLM-generated summary of what changed and implications (optional)
+        parent_version_id: ID of the version this was based on (optional)
 
     Returns:
         Dict with new version details
@@ -744,7 +757,17 @@ async def create_new_report_version(
 
         new_version_number = (latest.version_number + 1) if latest else 1
 
-        # Create new version record
+        # If no parent_version_id provided, use the latest version's ID
+        if parent_version_id is None and latest:
+            parent_version_id = latest.report_version_id
+
+        # Set all existing versions to is_default=False before creating new version
+        # This ensures only the new version will have is_default=True
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).update({"is_default": False})
+
+        # Create new version record with changelog tracking
         new_version = models.ReportVersions(
             report_version_id=str(uuid.uuid4()),
             chat_history_id=chat_history_id,
@@ -752,20 +775,25 @@ async def create_new_report_version(
             version_number=new_version_number,
             report_content=report_content,
             summary_report=summary_report,
-            pending_changes=[]  # Clear pending changes for new version
+            pending_changes=[],  # Clear pending changes for new version
+            changes_applied=changes_applied,  # Store the changes that created this version
+            changelog_summary=changelog_summary,  # Store the changelog summary
+            parent_version_id=parent_version_id  # Track version lineage
         )
 
         db.add(new_version)
         db.commit()
         db.refresh(new_version)
 
-        logger.info(f"Created new report version {new_version_number} for chat_history_id: {chat_history_id}")
+        logger.info(f"Created new report version {new_version_number} for chat_history_id: {chat_history_id} with changelog")
 
         return {
             "status": "success",
             "report_version_id": new_version.report_version_id,
             "version_number": new_version_number,
             "changes_applied": len(changes_applied),
+            "changelog_summary": changelog_summary,
+            "parent_version_id": parent_version_id,
             "created_at": new_version.created_at.isoformat() if new_version.created_at else None
         }
 
@@ -824,6 +852,12 @@ async def rollback_to_version(
 
         new_version_number = latest.version_number + 1
 
+        # Set all existing versions to is_default=False before creating rollback version
+        # This ensures only the new rollback version will have is_default=True
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).update({"is_default": False})
+
         # Create new version with target's content
         rollback_version = models.ReportVersions(
             report_version_id=str(uuid.uuid4()),
@@ -846,7 +880,8 @@ async def rollback_to_version(
             "message": f"Rolled back to version {target_version_number}",
             "new_version_number": new_version_number,
             "report_version_id": rollback_version.report_version_id,
-            "original_version": target_version_number
+            "original_version": target_version_number,
+            "report_content": target_version.report_content  # For vector DB update
         }
 
     except HTTPException:
@@ -1045,6 +1080,33 @@ async def set_default_version(chat_history_id: str, user_id: str, version_number
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error setting default version: {str(e)}"
         )
+
+
+async def get_report_version_content(chat_history_id: str, version_number: int, db: Session) -> str:
+    """
+    Get the report content for a specific version number.
+    Used for updating vector DB when changing default version.
+
+    Args:
+        chat_history_id: The chat history ID
+        version_number: The version number to get content for
+        db: Database session
+
+    Returns:
+        The report content string, or None if not found
+    """
+    try:
+        version = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.version_number == version_number
+        ).first()
+
+        if version:
+            return version.report_content
+        return None
+    except Exception as e:
+        logger.error(f"Error getting report version content: {str(e)}")
+        return None
 
 
 async def get_all_report_versions_enhanced(chat_history_id: str, user_id: str, db: Session) -> list:
@@ -1279,6 +1341,59 @@ async def get_presales_analysis(document_id: str, user_id: str, db: Session) -> 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving presales analysis: {str(e)}"
         )
+
+
+async def get_presales_by_chat_history(chat_history_id: str, db: Session) -> dict:
+    """
+    Get pre-sales analysis for a chat history session.
+    Resolves chat_history_id to document_id and retrieves presales analysis.
+
+    Args:
+        chat_history_id: The chat history ID
+        db: Database session
+
+    Returns:
+        Dict with presales analysis data, or None if not found
+    """
+    try:
+        # First get the chat history to get document_id and user_id
+        chat_history = db.query(models.ChatHistory).filter(
+            models.ChatHistory.chat_history_id == chat_history_id
+        ).first()
+
+        if not chat_history:
+            return None
+
+        # Now get presales analysis using document_id and user_id
+        presales = db.query(models.PresalesAnalysis).filter(
+            models.PresalesAnalysis.document_id == chat_history.document_id,
+            models.PresalesAnalysis.user_id == chat_history.user_id
+        ).order_by(models.PresalesAnalysis.created_at.desc()).first()
+
+        if not presales:
+            return None
+
+        return {
+            "presales_id": presales.presales_id,
+            "document_id": presales.document_id,
+            "user_id": presales.user_id,
+            "extracted_requirements": presales.extracted_requirements,
+            "blind_spots": presales.blind_spots,
+            "p1_blockers": presales.p1_blockers,
+            "technology_risks": presales.technology_risks,
+            "kickstart_questions": presales.kickstart_questions,
+            "red_flags": getattr(presales, 'red_flags', None),
+            "critical_unknowns": getattr(presales, 'critical_unknowns', None),
+            "presales_brief": presales.presales_brief,
+            "status": presales.status,
+            "model_used": presales.model_used,
+            "processing_time_seconds": presales.processing_time_seconds,
+            "created_at": presales.created_at.isoformat() if presales.created_at else None
+        }
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error getting presales analysis by chat history: {str(e)}")
+        return None
 
 
 async def get_presales_by_id(presales_id: str, user_id: str, db: Session) -> dict:
@@ -2788,7 +2903,7 @@ async def remove_pending_change(
     try:
         record = db.query(models.ReportVersions).filter(
             models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.version.desc()).first()
+        ).order_by(models.ReportVersions.version_number.desc()).first()
 
         if not record:
             return {
@@ -3270,11 +3385,13 @@ async def get_regeneration_context(
         pending_changes = []
         current_report_summary = {}
         current_version = 0
+        previous_version_id = None
 
         if report_version:
             pending_changes = copy.deepcopy(report_version.pending_changes) if report_version.pending_changes else []
             current_report_summary = report_version.summary_report or {}
             current_version = report_version.version_number or 1
+            previous_version_id = report_version.report_version_id  # Track the parent version
 
         # Build document_text from extracted_requirements (as done in services.py)
         document_text = json.dumps(presales_data.get("extracted_requirements", {}))
@@ -3304,7 +3421,10 @@ async def get_regeneration_context(
             "user_answers": user_answers,
             "pending_changes": pending_changes,
             "current_report_summary": current_report_summary,
-            "current_version": current_version
+            "current_version": current_version,
+            # Changelog tracking fields
+            "previous_version_id": previous_version_id,
+            "previous_summary": current_report_summary  # Same as current_report_summary for comparison
         }
 
     except HTTPException:

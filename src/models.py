@@ -114,7 +114,11 @@ class ReportVersions(Base):
     summary_report = Column(JSON, nullable=False)
     pending_changes = Column(JSON, nullable=True, default=[])  # Track modifications before regeneration
     schema_version = Column(String, nullable=False, default="1.0")  # For future migrations
-    is_default = Column(Boolean, nullable=False, default=False, index=True)  # Mark as default/recommended version
+    is_default = Column(Boolean, nullable=False, default=True, index=True)  # Mark as default/recommended version
+    # Changelog tracking fields
+    changes_applied = Column(JSON, nullable=True, default=None)  # Pending changes that created this version
+    changelog_summary = Column(Text, nullable=True)  # LLM-generated summary of what changed and why
+    parent_version_id = Column(String, nullable=True)  # Reference to the version this was based on
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=True, onupdate=text("now()"))
 

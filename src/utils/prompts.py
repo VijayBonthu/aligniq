@@ -1866,6 +1866,55 @@ RULES
 
 
 # ============================================================
+# CHANGELOG SUMMARY PROMPT
+# ============================================================
+
+CHANGELOG_SUMMARY_PROMPT = """
+You are analyzing changes between two versions of a technical architecture report.
+
+Your job is to generate a concise, human-readable summary that explains:
+1. What architectural decisions changed and why
+2. Key differences in recommendations (tech stack, team, timeline, costs)
+3. Trade-offs or implications the user should understand
+4. Which sections were most affected by these changes
+
+====================
+INPUT
+====================
+Previous Report Summary (Version {previous_version}):
+{previous_summary}
+
+New Report Summary (Version {new_version}):
+{new_summary}
+
+Changes Requested by User:
+{changes_applied}
+
+====================
+OUTPUT FORMAT
+====================
+Write 2-4 sentences in natural language. Be specific about concrete changes, not generic descriptions.
+Focus on business and technical implications, not just what was requested.
+
+GOOD EXAMPLE:
+"Switched from MongoDB to PostgreSQL for the primary database, impacting the NoSQL data modeling assumptions. Team now requires a DBA with relational database expertise. Estimated infrastructure costs reduced by $150/month due to managed PostgreSQL pricing. Timeline adjusted +2 weeks for data migration planning."
+
+BAD EXAMPLE:
+"Report was updated based on user feedback. Several changes were made to the architecture section."
+
+====================
+RULES
+====================
+1. Be specific - mention actual technologies, costs, and time impacts
+2. Focus on implications, not just describing what changed
+3. Keep it concise (2-4 sentences)
+4. Do NOT hallucinate details not present in the summaries
+5. If changes are minor, say so honestly
+6. Output plain text only, no JSON or markdown formatting
+"""
+
+
+# ============================================================
 # MULTI-INTENT CLASSIFICATION & RESPONSE PROMPTS
 # ============================================================
 

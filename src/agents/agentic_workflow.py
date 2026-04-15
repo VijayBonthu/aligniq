@@ -3,7 +3,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain.output_parsers import OutputFixingParser
 from config import settings
-from utils.prompts import Requirements_analyzer_prompt, Ambiguity_Resolver_Prompt, Validator_agent_prompt, midway_ba_report_prompt, Solution_Architect_Agent_Prompt, Critic_Agent_Prompt,Evidence_Gatherer_Agent_prompt, feasibility_estimator_prompt, Report_Generator_Prompt, SUMMARIZE_CHATCONVERSATION_PROMPT, SUMMARIAZE_MAIN_REPORT_PROMPT, SECTION_REGENERATION_PROMPT
+from utils.prompts import Requirements_analyzer_prompt, Ambiguity_Resolver_Prompt, Validator_agent_prompt, midway_ba_report_prompt, Solution_Architect_Agent_Prompt, Critic_Agent_Prompt,Evidence_Gatherer_Agent_prompt, feasibility_estimator_prompt, Report_Generator_Prompt, SUMMARIZE_CHATCONVERSATION_PROMPT, SUMMARIAZE_MAIN_REPORT_PROMPT, SECTION_REGENERATION_PROMPT, CHANGELOG_SUMMARY_PROMPT
 from utils.logger import logger
 import json
 import asyncio
@@ -429,6 +429,62 @@ async def main_report_summary(main_report: str, version_number: int = 1) -> dict
     response = await invoke_with_timeout(chain, input_dict, agent_name="main_report_summary")
     logger.info(f"Completed main_report_summary for version {version_number}")
     return validate_response(response, "main_report_summary")
+
+
+async def generate_changelog_summary(
+    previous_summary: str,
+    new_summary: str,
+    changes_applied: list,
+    previous_version: int,
+    new_version: int
+) -> str:
+    """
+    Generate a human-readable summary of what changed between report versions.
+
+    This function takes the old and new summaries along with the changes that
+    were applied and produces a concise explanation of what changed and why.
+
+    Args:
+        previous_summary: Executive summary from the previous report version
+        new_summary: Executive summary from the new report version
+        changes_applied: List of pending change objects that were applied
+        previous_version: Version number of the previous report
+        new_version: Version number of the new report
+
+    Returns:
+        str: Human-readable changelog summary (2-4 sentences)
+    """
+    logger.info(f"Starting generate_changelog_summary for v{previous_version} -> v{new_version}")
+
+    # Format changes_applied for the prompt
+    if changes_applied:
+        changes_text = "\n".join([
+            f"- {change.get('user_request', 'Unknown change')} (Type: {change.get('type', 'unknown')})"
+            for change in changes_applied
+        ])
+    else:
+        changes_text = "No specific changes recorded"
+
+    changelog_prompt = ChatPromptTemplate.from_template(CHANGELOG_SUMMARY_PROMPT)
+    str_parser = StrOutputParser()
+    chain = changelog_prompt | llm_parser | str_parser
+
+    input_dict = {
+        "previous_summary": previous_summary,
+        "new_summary": new_summary,
+        "changes_applied": changes_text,
+        "previous_version": previous_version,
+        "new_version": new_version
+    }
+
+    try:
+        response = await invoke_with_timeout(chain, input_dict, agent_name="generate_changelog_summary")
+        logger.info(f"Completed generate_changelog_summary for v{previous_version} -> v{new_version}")
+        return response.strip() if response else "Changes applied to generate this version."
+    except Exception as e:
+        logger.warning(f"Failed to generate changelog summary: {e}")
+        # Return a fallback summary if generation fails
+        return f"Version {new_version} created from version {previous_version} with {len(changes_applied)} change(s) applied."
 
 
 async def regenerate_report_sections(

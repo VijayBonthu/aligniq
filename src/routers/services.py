@@ -72,6 +72,8 @@ from utils.router_llm import (
 from utils.conversation_state import load_conversation_state, warn_if_similar_change
 # NEW: Intent handlers
 from handlers.intent_handlers import get_intent_handler
+# NEW: Tool-based chat agent (LangChain)
+from utils.tool_chat_agent import chat_with_doc_v2, get_report_context_summary
 from database_scripts import (
     user_documents,
     get_summary_report,
@@ -4821,6 +4823,7 @@ async def conversation_with_doc_v3(
         chat_context = request.model_dump()
         chat_history_id = chat_context["chat_history_id"]
         logger.info(f"Processing chat-with-doc-v3 for chat_history_id: {chat_history_id}")
+        logger.info("using this api for the frontend /chaat with doc endpoint")
 
         # Get latest user message
         if not chat_context["message"]:
@@ -4829,6 +4832,62 @@ async def conversation_with_doc_v3(
         user_message = chat_context["message"][-1]["content"]
         logger.info(f"User message: {user_message[:100]}...")
 
+        # FEATURE FLAG: Use new tool-based chat if enabled
+        # Debug: Log the actual value to diagnose issues
+        logger.info(f"DEBUG: USE_TOOL_BASED_CHAT = {settings.USE_TOOL_BASED_CHAT} (type: {type(settings.USE_TOOL_BASED_CHAT).__name__})")
+        if settings.USE_TOOL_BASED_CHAT:
+            logger.info("Using tool-based chat (v2) via feature flag")
+
+            # Get conversation history for context
+            conversation_history = [
+                {"role": msg.get("role"), "content": msg.get("content")}
+                for msg in chat_context["message"][:-1][-5:]  # Last 5 messages excluding current
+            ]
+
+            # Get report context summary
+            report_context = await get_report_context_summary(chat_history_id, db)
+
+            # Get user_id for operations that require it (e.g., regenerate_report)
+            user_id = request.user_id
+
+            # Call tool-based chat agent
+            v2_result = await chat_with_doc_v2(
+                chat_history_id=chat_history_id,
+                user_message=user_message,
+                db=db,
+                conversation_history=conversation_history,
+                report_context=report_context,
+                user_id=user_id
+            )
+
+            llm_response = v2_result.get("response", "")
+
+            # Save chat history
+            new_assistant_message = {
+                "role": "assistant",
+                "content": llm_response,
+                "timestamp": datetime.now().isoformat(),
+                "selected": True,
+                "type": "tool_based_response",
+                "tools_called": v2_result.get("tools_called", [])
+            }
+            chat_context["message"].append(new_assistant_message)
+            await save_chat_history(chat=chat_context, db=db)
+
+            # Return response
+            return {
+                "message": llm_response,
+                "action": v2_result.get("action", "processed"),
+                "action_reason": "tool_based_chat",
+                "tools_called": v2_result.get("tools_called", []),
+                "iterations": v2_result.get("iterations", 1),
+                "classification": {
+                    "primary_strategy": "tool_based",
+                    "requires_defense": False
+                }
+            }
+
+        # EXISTING FLOW: Classification-based approach
         # 2. LOAD CONVERSATION STATE
         # This replaces fragile string-based pending action extraction
         conversation_state = await load_conversation_state(chat_history_id, db)
