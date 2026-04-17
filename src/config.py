@@ -15,6 +15,8 @@ class Settings:
     ALGORITHM=os.getenv("ALGORITHM")
     SECRET_KEY_J=os.getenv("SECRET_KEY_J")
     TOKEN_EXPIRED_TIME_IN_DAYS=os.getenv("TOKEN_EXPIRED_TIME_IN_DAYS")
+    ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+    REFRESH_TOKEN_EXPIRE_DAYS=int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
     FILE_SIZE = os.getenv("FILE_SIZE")
     OPENAI_CHATGPT = os.getenv("OPENAI_CHATGPT")
     IMAGE_TEXT_LANGUAGE=['en']
@@ -51,6 +53,8 @@ class Settings:
 
     # Feature flags
     USE_TOOL_BASED_CHAT = os.getenv("USE_TOOL_BASED_CHAT", "false").lower() == "true"
+    USE_STREAMING_CHAT = os.getenv("USE_STREAMING_CHAT", "false").lower() == "true"
+    STREAMING_TIMEOUT = int(os.getenv("STREAMING_TIMEOUT", "300"))  # 5 minutes default for streaming
 
 
 settings = Settings()

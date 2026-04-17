@@ -5030,3 +5030,126 @@ async def conversation_with_doc_v3(
         logger.error(f"Error in chat-with-doc-v3: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
+
+# =============================================================================
+# STREAMING CHAT ENDPOINT (SSE)
+# =============================================================================
+# This endpoint provides real-time streaming for the chat response using
+# Server-Sent Events (SSE). It streams tokens as they are generated and
+# shows tool execution status.
+
+from fastapi.responses import StreamingResponse
+from utils.streaming_chat_agent import StreamingToolChatAgent, stream_chat_with_doc
+from utils.streaming import StreamEventType
+
+@router.post('/chat-with-doc-stream')
+async def conversation_with_doc_stream(
+    request: ChatHistoryDetails,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Streaming chat endpoint using Server-Sent Events (SSE).
+
+    Returns real-time token streaming, tool execution status, and results.
+    This is an alternative to /chat-with-doc for clients that want real-time updates.
+
+    Event types:
+    - stream_start: Connection established
+    - thinking: LLM is processing
+    - token: Individual token (for real-time display)
+    - tool_start: Tool execution began
+    - tool_result: Tool completed
+    - tool_error: Tool failed
+    - error: General error
+    - stream_end: Response complete with final content
+
+    Args:
+        request: ChatHistoryDetails with message array
+        current_user: Authenticated user from token
+        db: Database session
+
+    Returns:
+        StreamingResponse with SSE events
+    """
+    # Validate user
+    if current_user["regular_login_token"]["id"] != request.user_id:
+        raise HTTPException(status_code=400, detail="User ID mismatch")
+
+    chat_context = request.model_dump()
+    chat_history_id = chat_context["chat_history_id"]
+    user_id = request.user_id
+
+    logger.info(f"Processing streaming chat for chat_history_id: {chat_history_id}")
+
+    # Get latest user message
+    if not chat_context["message"]:
+        raise HTTPException(status_code=400, detail="No messages to process")
+
+    user_message = chat_context["message"][-1]["content"]
+
+    async def event_generator():
+        """Generate SSE events for streaming response."""
+        final_content = ""
+        tools_called = []
+
+        try:
+            # Get conversation history for context
+            conversation_history = [
+                {"role": msg.get("role"), "content": msg.get("content")}
+                for msg in chat_context["message"][:-1][-5:]  # Last 5 messages excluding current
+            ]
+
+            # Get report context summary
+            report_context = await get_report_context_summary(chat_history_id, db)
+
+            # Stream events from the agent
+            async for event in stream_chat_with_doc(
+                chat_history_id=chat_history_id,
+                user_message=user_message,
+                db=db,
+                conversation_history=conversation_history,
+                report_context=report_context,
+                user_id=user_id
+            ):
+                # Yield the SSE-formatted event
+                yield event.to_sse()
+
+                # Track final content for saving
+                if event.event_type == StreamEventType.STREAM_END:
+                    final_content = event.data.get("content", "")
+                    tools_called = event.data.get("tools_called", [])
+
+            # Save chat history after streaming completes
+            if final_content:
+                new_assistant_message = {
+                    "role": "assistant",
+                    "content": final_content,
+                    "timestamp": datetime.now().isoformat(),
+                    "selected": True,
+                    "type": "streaming_response",
+                    "tools_called": tools_called
+                }
+                chat_context["message"].append(new_assistant_message)
+                await save_chat_history(chat=chat_context, db=db)
+                logger.info(f"Streaming chat saved for {chat_history_id}")
+
+        except Exception as e:
+            logger.error(f"Streaming error for {chat_history_id}: {str(e)}")
+            from utils.streaming import error_event
+            yield error_event(
+                message="Streaming error occurred",
+                error_detail=str(e)
+            ).to_sse()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+            "Access-Control-Allow-Origin": "*",  # CORS for SSE
+        }
+    )
+

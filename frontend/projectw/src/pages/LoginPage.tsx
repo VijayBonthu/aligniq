@@ -96,10 +96,10 @@ const LoginPage: React.FC = () => {
         password: password
       });
 
-      const { access_token } = response.data;
+      const { access_token, refresh_token } = response.data;
       console.log("✅ Login API call successful, token:", access_token.substring(0, 10) + "...");
-      
-      const loginSuccess = await login(access_token);
+
+      const loginSuccess = await login(access_token, refresh_token);
       console.log("🔍 Login completed:", { loginSuccess, isAuthenticated });
       
       if (!loginSuccess) {
@@ -136,29 +136,20 @@ const LoginPage: React.FC = () => {
     }
     
     // Set up listener to receive the token from the popup
-    const handleAuthCallback = (event: MessageEvent) => {
+    const handleAuthCallback = async (event: MessageEvent) => {
       console.log("Received message:", event.data);
-      
-      // Check for the auth success message
+
       if (event.data && event.data.type === 'google_auth_success' && event.data.access_token) {
         console.log("Authentication successful, token received");
-        
-        // Get the token
-        const token = event.data.access_token;
-        
-        // Store token in localStorage
-        localStorage.setItem('google_auth_token', token);
-        
-        // Close the popup
+
         if (authWindow && !authWindow.closed) {
           authWindow.close();
         }
-        
-        // Navigate to dashboard
-        navigate('/dashboard');
-        
-        // Remove the event listener
+
         window.removeEventListener('message', handleAuthCallback);
+
+        await login(event.data.access_token, event.data.refresh_token);
+        navigate('/dashboard');
       }
     };
     

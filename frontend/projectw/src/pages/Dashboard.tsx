@@ -1,15 +1,19 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'react-hot-toast';
 import * as marked from 'marked'; // Change to namespace import
+import DOMPurify from 'dompurify';
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 // Import the Sidebar component
 import Sidebar from '../components/sidebar/Sidebar';
 import RightSidebar from '../components/integrations/RightSidebar';
 import JiraIssueDetail from '../components/integrations/jira/JiraIssueDetail';
+// Streaming chat hook and components
+import { useStreamingChat } from '../hooks/useStreamingChat';
+import { StreamingMessage } from '../components/chat/StreamingMessage';
 
 const API_URL = import.meta.env.VITE_API_URL;
 
@@ -19,6 +23,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  selected?: boolean;  // Track whether message is selected for AI context
 }
 
 // New unified question interface matching backend
@@ -156,6 +161,27 @@ interface GroupedConversations {
   older: ConversationMetadata[];
 }
 
+// Feature flag for streaming chat
+const USE_STREAMING = import.meta.env.VITE_USE_STREAMING === 'true';
+
+// Helper function to sanitize and parse markdown
+const sanitizeMarkdown = (content: string): string => {
+  const rawHtml = marked.parse(content);
+  const htmlString = typeof rawHtml === 'string' ? rawHtml : String(rawHtml);
+  return DOMPurify.sanitize(htmlString);
+};
+
+// Memoized message content component with XSS protection
+const MessageContent: React.FC<{ content: string }> = React.memo(({ content }) => {
+  const sanitizedHtml = useMemo(() => sanitizeMarkdown(content), [content]);
+
+  return (
+    <div dangerouslySetInnerHTML={{ __html: sanitizedHtml }} />
+  );
+});
+
+MessageContent.displayName = 'MessageContent';
+
 const Dashboard: React.FC = () => {
   const { isAuthenticated, logout } = useAuth();
   const navigate = useNavigate();
@@ -183,6 +209,17 @@ const Dashboard: React.FC = () => {
   });
   const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+
+  // Streaming chat hook
+  const {
+    isStreaming,
+    currentTool,
+    toolStatus,
+    thinkingMessage,
+    toolsUsed,
+    streamChat,
+  } = useStreamingChat();
+
   const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
   const [renamingConversation, setRenamingConversation] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
@@ -195,6 +232,8 @@ const Dashboard: React.FC = () => {
   const [integrationDropdownOpen, setIntegrationDropdownOpen] = useState(false);
   const [integrationTab, setIntegrationTab] = useState<'jira' | 'github' | 'azure'>('jira');
   const [isSplitView, setIsSplitView] = useState(false);
+  // Panel collapse state for dynamic layout
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   // Presales-specific state
   const [showKickstartPanel, setShowKickstartPanel] = useState(false);
   const [kickstartAnswers, setKickstartAnswers] = useState<Record<string, string>>({});
@@ -889,105 +928,172 @@ const Dashboard: React.FC = () => {
         selected: true  // New user messages are always selected by default
       };
 
-      // STEP 1: Call the chat-with-doc endpoint with ALL messages (with selection state)
-      const response = await axios.post(
-        `${API_URL}/chat-with-doc`,
-        {
-          chat_history_id: updatedConversation.chat_history_id || updatedConversation.id,  // Use actual chat_history_id
-          user_id: userId,
-          document_id: updatedConversation.document_id || '',
-          message: [...allMessagesWithSelection, userMessageForApi],  // ALL messages with selected field
-          title: updatedConversation.title
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
+      // Generate assistant message ID upfront
+      const assistantMsgId = `assistant-${Date.now()}`;
+
+      // STREAMING MODE: Use SSE for real-time token streaming
+      if (USE_STREAMING) {
+        try {
+          await streamChat({
+            chatHistoryId: updatedConversation.chat_history_id || updatedConversation.id,
+            userId,
+            messages: [...allMessagesWithSelection, userMessageForApi],
+            documentId: updatedConversation.document_id || '',
+            title: updatedConversation.title,
+            token,
+            onToken: (_newToken, accumulated) => {
+              // Update the message content in real-time
+              setActiveConversation(prev => {
+                if (!prev) return null;
+                const messages = [...prev.messages];
+                const lastIdx = messages.length - 1;
+                if (lastIdx >= 0 && messages[lastIdx].role === 'assistant') {
+                  messages[lastIdx] = {
+                    ...messages[lastIdx],
+                    content: accumulated
+                  };
+                }
+                return { ...prev, messages };
+              });
+            },
+            onToolStart: (toolName) => {
+              console.log('Tool started:', toolName);
+            },
+            onComplete: async (content) => {
+              // Create final assistant message
+              const assistantMessage: Message = {
+                id: assistantMsgId,
+                role: 'assistant',
+                content: content || "No response from the server",
+                timestamp: new Date().toISOString(),
+                selected: true
+              };
+
+              // Add to selected messages
+              setSelectedMessageIds(prev => [...prev, assistantMsgId]);
+
+              // Update conversation with final message
+              const finalMessages = updatedConversation.messages
+                .filter(msg => msg.role !== 'assistant' || msg.content !== '...')
+                .concat([assistantMessage]);
+
+              setActiveConversation({
+                ...updatedConversation,
+                messages: finalMessages
+              });
+
+              // Refresh conversation list
+              fetchConversations();
+              dataChanged.current = true;
+
+              // Scroll to bottom
+              setTimeout(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+              }, 100);
+            },
+            onError: (error) => {
+              toast.error(`Streaming error: ${error}`);
+            }
+          });
+        } catch (streamingError) {
+          console.error('Streaming chat error:', streamingError);
         }
-      );
-      
-      // Process the response
-      if (response.data) {
-        // Create assistant message from the response
-        const assistantMsgId = `assistant-${Date.now()}`;
-        const assistantMessage: Message = {
-          id: assistantMsgId,
-          role: 'assistant',
-          content: response.data.message || "No response from the server",
-          timestamp: new Date().toISOString(),
-          selected: true  // New assistant messages are selected by default
-        };
-
-        // Add the assistant response ID to selected messages
-        setSelectedMessageIds(prev => [...prev, assistantMsgId]);
-
-        // Update conversation with the final message
-        const finalMessages = updatedConversation.messages
-          .filter(msg => msg.role !== 'assistant' || msg.content !== '...') // Remove placeholder
-          .concat([assistantMessage]);
-
-        setActiveConversation({
-          ...updatedConversation,
-          messages: finalMessages
-        });
-
-        // Handle pending changes info from response
-        if (response.data.pending_changes) {
-          const pendingInfo = response.data.pending_changes;
-          setPendingChangesCount(pendingInfo.total_pending || 0);
-          setHasConflicts(pendingInfo.has_conflicts || false);
-
-          // Show toast notifications for undo/clear actions
-          if (pendingInfo.undone_change) {
-            toast.success('Change undone successfully');
-          }
-          if (pendingInfo.cleared_count !== undefined && pendingInfo.cleared_count > 0) {
-            toast.success(`Cleared ${pendingInfo.cleared_count} pending change(s)`);
-          }
-        }
-
-        // Handle action info for notifications
-        const actionType = response.data.action;
-        if (actionType === 'modify_requirements' || actionType === 'modify_architecture' || actionType === 'correct_assumptions') {
-          toast.success('Change tracked. Say "regenerate report" when ready.');
-        }
-
-        // STEP 2: Save the updated conversation to the /chat endpoint with ALL messages
-        // Clean messages for API (remove IDs but keep selected state)
-        const cleanMessages = finalMessages.map(msg => ({
-          role: msg.role,
-          content: msg.content,
-          timestamp: msg.timestamp,
-          // Use msg.selected if available, otherwise default to true
-          selected: msg.selected !== undefined ? msg.selected : true
-        }));
-        
-        await axios.post(
-          `${API_URL}/chat`,
+      } else {
+        // NON-STREAMING MODE: Original axios.post behavior
+        // STEP 1: Call the chat-with-doc endpoint with ALL messages (with selection state)
+        const response = await axios.post(
+          `${API_URL}/chat-with-doc`,
           {
+            chat_history_id: updatedConversation.chat_history_id || updatedConversation.id,
             user_id: userId,
             document_id: updatedConversation.document_id || '',
-            message: cleanMessages, // Send ALL messages in the correct format
-            title: updatedConversation.title || 'Chat Session'
+            message: [...allMessagesWithSelection, userMessageForApi],
+            title: updatedConversation.title
           },
           {
             headers: {
-              'Authorization': `Bearer ${token}`
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
             }
           }
         );
-        
-        // Refresh conversation list
-        fetchConversations();
-        
-        // Mark that data has changed
-        dataChanged.current = true;
-        
-        // Scroll to bottom
-        setTimeout(() => {
-          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        }, 100);
+
+        // Process the response
+        if (response.data) {
+          // Create assistant message from the response
+          const assistantMessage: Message = {
+            id: assistantMsgId,
+            role: 'assistant',
+            content: response.data.message || "No response from the server",
+            timestamp: new Date().toISOString(),
+            selected: true
+          };
+
+          // Add the assistant response ID to selected messages
+          setSelectedMessageIds(prev => [...prev, assistantMsgId]);
+
+          // Update conversation with the final message
+          const finalMessages = updatedConversation.messages
+            .filter(msg => msg.role !== 'assistant' || msg.content !== '...')
+            .concat([assistantMessage]);
+
+          setActiveConversation({
+            ...updatedConversation,
+            messages: finalMessages
+          });
+
+          // Handle pending changes info from response
+          if (response.data.pending_changes) {
+            const pendingInfo = response.data.pending_changes;
+            setPendingChangesCount(pendingInfo.total_pending || 0);
+            setHasConflicts(pendingInfo.has_conflicts || false);
+
+            if (pendingInfo.undone_change) {
+              toast.success('Change undone successfully');
+            }
+            if (pendingInfo.cleared_count !== undefined && pendingInfo.cleared_count > 0) {
+              toast.success(`Cleared ${pendingInfo.cleared_count} pending change(s)`);
+            }
+          }
+
+          // Handle action info for notifications
+          const actionType = response.data.action;
+          if (actionType === 'modify_requirements' || actionType === 'modify_architecture' || actionType === 'correct_assumptions') {
+            toast.success('Change tracked. Say "regenerate report" when ready.');
+          }
+
+          // STEP 2: Save the updated conversation to the /chat endpoint
+          const cleanMessages = finalMessages.map(msg => ({
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp,
+            selected: msg.selected !== undefined ? msg.selected : true
+          }));
+
+          await axios.post(
+            `${API_URL}/chat`,
+            {
+              user_id: userId,
+              document_id: updatedConversation.document_id || '',
+              message: cleanMessages,
+              title: updatedConversation.title || 'Chat Session'
+            },
+            {
+              headers: {
+                'Authorization': `Bearer ${token}`
+              }
+            }
+          );
+
+          // Refresh conversation list
+          fetchConversations();
+          dataChanged.current = true;
+
+          // Scroll to bottom
+          setTimeout(() => {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+          }, 100);
+        }
       }
     } catch (error) {
       console.error('Error sending message:', error);
@@ -2657,14 +2763,41 @@ const Dashboard: React.FC = () => {
       >
         {/* Main content area with horizontal split view */}
         <div className="flex flex-1 h-full">
-          {/* Main content area - improved responsive behavior */}
-          <div className={`${isSplitView && !isMobile ? 'w-1/2' : 'w-full'} h-full flex flex-col overflow-hidden`}>
+          {/* Main content area - dynamic width based on panel collapse state */}
+          <div className={`
+            ${isSplitView && !isMobile
+              ? rightPanelCollapsed
+                ? 'flex-1'
+                : 'w-1/2'
+              : 'w-full'
+            }
+            h-full flex flex-col overflow-hidden transition-all duration-300
+          `}>
             {activeConversation ? (
               // Chat window
               <div className="flex-1 flex flex-col h-full overflow-hidden">
                 {/* Chat header - improved for mobile */}
                 <div className="flex-none p-2 md:p-4 border-b border-white/10 flex justify-between items-center bg-indigo-950/50">
                   <h2 className="text-lg md:text-xl font-semibold text-white truncate">{activeConversation.title}</h2>
+                  {/* Panel expand button - shown when right panel is collapsed */}
+                  {isSplitView && rightPanelCollapsed && !isMobile && (
+                    <button
+                      onClick={() => setRightPanelCollapsed(false)}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-gray-300 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                      title="Expand Jira panel"
+                    >
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        className="h-4 w-4"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                      </svg>
+                      <span className="hidden md:inline">Show Jira</span>
+                    </button>
+                  )}
                 </div>
                 
                 {/* Chat messages - improved scrolling and spacing for mobile */}
@@ -2698,22 +2831,38 @@ const Dashboard: React.FC = () => {
                         
                         {msg.role === 'assistant' ? (
                           // AI message with export options - improved for mobile
-                          <div className="flex-1 flex flex-col space-y-1 md:space-y-2 bg-[#1a1745] rounded-lg p-2 md:p-4 max-w-full md:max-w-3xl overflow-hidden">
+                          <div className="flex-1 flex flex-col space-y-1 md:space-y-2 bg-[#1a1745] rounded-lg p-2 md:p-4 w-full max-w-full md:max-w-3xl">
                             <div className="flex items-start space-x-2 md:space-x-3">
                               <div className="h-6 w-6 md:h-8 md:w-8 rounded-md bg-gradient-to-br from-blue-400 to-purple-600 flex items-center justify-center flex-shrink-0">
                                 <span className="text-xs md:text-sm font-bold text-white">AI</span>
                               </div>
-                              <div className="flex-1 min-w-0 overflow-hidden">
-                                <div className="prose text-gray-100 max-w-none overflow-hidden break-words whitespace-pre-wrap text-sm md:text-base">
-                                  {/* Render markdown content */}
-                                  <div dangerouslySetInnerHTML={{ 
-                                    __html: typeof marked.parse(msg.content) === 'string' 
-                                      ? marked.parse(msg.content) as string 
-                                      : String(marked.parse(msg.content)) 
-                                  }} className="overflow-hidden" />
-                                </div>
-                                
-                                {/* Export options bar - improved for mobile */}
+                              <div className="flex-1 min-w-0">
+                                {/* Check if this is the streaming message */}
+                                {isStreaming && index === (activeConversation?.messages?.length ?? 0) - 1 && msg.content !== '...' ? (
+                                  // Use StreamingMessage for active streaming
+                                  <StreamingMessage
+                                    content={msg.content}
+                                    isStreaming={true}
+                                    currentTool={currentTool}
+                                    toolStatus={toolStatus}
+                                    thinkingMessage={thinkingMessage}
+                                    toolsUsed={toolsUsed}
+                                    sanitize={(html) => DOMPurify.sanitize(html)}
+                                  />
+                                ) : (
+                                  // Regular message rendering
+                                  <div className="prose prose-invert text-gray-100 max-w-none break-words text-sm md:text-base
+                                                [&_pre]:overflow-x-auto [&_pre]:max-w-full [&_pre]:rounded-lg [&_pre]:bg-black/30 [&_pre]:p-3
+                                                [&_code]:break-all [&_code]:bg-black/20 [&_code]:px-1 [&_code]:rounded
+                                                [&_table]:block [&_table]:overflow-x-auto [&_table]:w-max [&_table]:max-w-full
+                                                [&_img]:max-w-full [&_img]:h-auto">
+                                    {/* Render markdown content with XSS protection */}
+                                    <MessageContent content={msg.content} />
+                                  </div>
+                                )}
+
+                                {/* Export options bar - only show when not streaming */}
+                                {!(isStreaming && index === (activeConversation?.messages?.length ?? 0) - 1) && (
                                 <div className="mt-2 md:mt-4 pt-1 md:pt-2 border-t border-white/10 flex justify-end space-x-1 md:space-x-2">
                                   <button 
                                     onClick={() => handleCopyMessage(msg)}
@@ -2736,20 +2885,21 @@ const Dashboard: React.FC = () => {
                                     <span className="inline md:hidden">PDF</span>
                                   </button>
                                 </div>
+                                )}
                               </div>
                             </div>
                           </div>
                         ) : (
                           // User message - improved for mobile
-                          <div className="flex-1 bg-[#2b2a63] rounded-lg p-2 md:p-4 max-w-full md:max-w-3xl overflow-hidden">
+                          <div className="flex-1 bg-[#2b2a63] rounded-lg p-2 md:p-4 w-full max-w-full md:max-w-3xl">
                             <div className="flex items-start space-x-2 md:space-x-3">
                               <div className="h-6 w-6 md:h-8 md:w-8 rounded-full bg-white/10 flex items-center justify-center flex-shrink-0">
                                 <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 md:h-4 md:w-4 text-white" viewBox="0 0 20 20" fill="currentColor">
                                   <path fillRule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clipRule="evenodd" />
                                 </svg>
                               </div>
-                              <div className="flex-1 min-w-0 overflow-hidden">
-                                <p className="text-white whitespace-pre-wrap break-words overflow-hidden text-sm md:text-base">{msg.content}</p>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-white whitespace-pre-wrap break-words text-sm md:text-base">{msg.content}</p>
                               </div>
                             </div>
                           </div>
@@ -3324,12 +3474,46 @@ const Dashboard: React.FC = () => {
           
           {/* Right panel - Jira issue detail (only visible in split view AND on desktop) */}
           {isSplitView && selectedJiraIssue && !isMobile && (
-            <div className="w-1/2 border-l border-white/10 overflow-auto bg-indigo-950/80">
-              <JiraIssueDetail 
-                issueId={selectedJiraIssue} 
-                onClose={handleCloseSplitView}
-                onAddAttachmentToAnalysis={handleAddJiraAttachment}
-              />
+            <div className={`
+              ${rightPanelCollapsed ? 'w-12' : 'w-1/2'}
+              border-l border-white/10 bg-indigo-950/80 transition-all duration-300 relative flex flex-col
+            `}>
+              {/* Collapse/Expand toggle button */}
+              <button
+                onClick={() => setRightPanelCollapsed(!rightPanelCollapsed)}
+                className="absolute top-2 left-2 z-10 p-1.5 rounded-lg bg-white/10 hover:bg-white/20 transition-colors"
+                title={rightPanelCollapsed ? 'Expand panel' : 'Collapse panel'}
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  className={`h-4 w-4 text-white transition-transform ${rightPanelCollapsed ? 'rotate-180' : ''}`}
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+
+              {/* Panel content - hidden when collapsed */}
+              {!rightPanelCollapsed && (
+                <div className="flex-1 overflow-auto">
+                  <JiraIssueDetail
+                    issueId={selectedJiraIssue}
+                    onClose={handleCloseSplitView}
+                    onAddAttachmentToAnalysis={handleAddJiraAttachment}
+                  />
+                </div>
+              )}
+
+              {/* Collapsed state indicator */}
+              {rightPanelCollapsed && (
+                <div className="flex-1 flex items-center justify-center">
+                  <span className="text-white/50 text-xs transform -rotate-90 whitespace-nowrap">
+                    Jira Issue
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </div>

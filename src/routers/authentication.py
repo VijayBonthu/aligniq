@@ -1,15 +1,19 @@
 from oauth import flow, auth_callback, JiraOAuth
 from fastapi import Depends, HTTPException, Request, APIRouter, status, Header
 from sqlalchemy.orm import Session
-from models import get_db
+from models import get_db, User
 from database_scripts import create_user,UserCreationError, get_user_details
-from utils.token_generation import create_token, verify_password, TokenDecoder, validate_app_user, validate_token_incoming_requests, token_validator
+from utils.token_generation import create_token, verify_password, TokenDecoder, validate_app_user, validate_token_incoming_requests, token_validator, create_refresh_token, validate_refresh_token, revoke_refresh_token, rotate_refresh_token
 from p_model_type import Registration_login_password, login_details
+from pydantic import BaseModel
 import logging
 from jira_logic.jira_components import get_jira_user_info
 from typing import Dict
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
 
 
 logger = logging.getLogger(__name__)
@@ -65,37 +69,35 @@ async def callback(request: Request, db:Session=Depends(get_db)):
         "provider": user.provider,
         "email":user.email_address
     }
-     # creates JWT token
     token = create_token(user_data=payload)
+    refresh_token_val = create_refresh_token(user_id=user.user_id, db=db)
     print(token)
-    
-    # Return HTML instead of JSON
+
     html_content = f"""
     <html>
     <head><title>Authentication Complete</title></head>
     <body>
         <h2>Authentication Successful!</h2>
         <p>You can close this window and return to the application.</p>
-        
+
         <script>
-            // Send token back to opener window
             if (window.opener) {{
                 window.opener.postMessage(
-                    {{ 
-                        type: 'google_auth_success', 
-                        access_token: '{token}'
+                    {{
+                        type: 'google_auth_success',
+                        access_token: '{token}',
+                        refresh_token: '{refresh_token_val}'
                     }},
-                    '*'  // In production, you should limit this to your app's origin
+                    '*'
                 );
-                
-                // Close this window after a delay
+
                 setTimeout(() => window.close(), 3000);
             }}
         </script>
     </body>
     </html>
     """
-    
+
     return HTMLResponse(content=html_content)
 
 @router.post("/registration", status_code=status.HTTP_201_CREATED)
@@ -128,9 +130,10 @@ async def create_account(user_details:Registration_login_password, db:Session=De
     }
 
     token = create_token(user_data=payload)
+    refresh_token_val = create_refresh_token(user_id=user.user_id, db=db)
     print(token)
-    
-    return {"access_token": token, "token_type": "bearer"} 
+
+    return {"access_token": token, "refresh_token": refresh_token_val, "token_type": "bearer"}
 
 @router.post("/login", status_code=status.HTTP_200_OK)
 def log_into_account(login_details:login_details, db:Session=Depends(get_db)):
@@ -150,8 +153,9 @@ def log_into_account(login_details:login_details, db:Session=Depends(get_db)):
             "email":user_details[0],
         }
         token = create_token(user_data=payload)
+        refresh_token_val = create_refresh_token(user_id=user_details[1], db=db)
         print(token)
-        return {"access_token": token, "token_type": "bearer"}
+        return {"access_token": token, "refresh_token": refresh_token_val, "token_type": "bearer"}
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
@@ -286,6 +290,32 @@ async def jira_callback(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=str(e))
         
+
+@router.post("/auth/refresh", status_code=status.HTTP_200_OK)
+async def refresh_access_token(request_body: RefreshTokenRequest, db: Session = Depends(get_db)):
+    user_id = validate_refresh_token(request_body.refresh_token, db)
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    payload = {
+        "id": user.user_id,
+        "oauth_id": user.oauth_id,
+        "verified_email": user.verified_email,
+        "picture": user.picture,
+        "provider": user.provider,
+        "email": user.email_address
+    }
+    new_access_token = create_token(user_data=payload)
+    new_refresh_token = rotate_refresh_token(request_body.refresh_token, user_id, db)
+    return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
+
+@router.post("/auth/logout", status_code=status.HTTP_200_OK)
+async def logout(request_body: RefreshTokenRequest, db: Session = Depends(get_db)):
+    try:
+        revoke_refresh_token(request_body.refresh_token, db)
+    except Exception:
+        pass
+    return {"message": "Logged out successfully"}
 
 @router.get("/auth/jira/test")
 async def test_jira_auth():

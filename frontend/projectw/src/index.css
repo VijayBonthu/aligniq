@@ -78,9 +78,38 @@ button:focus-visible {
 /* Add these styles for the document renderer */
 .prose {
   color: inherit;
-  max-width: 65ch;
+  max-width: none; /* Allow prose to fill container width */
   font-size: 1rem;
   line-height: 1.75;
+}
+
+/* Code block overflow handling */
+.prose pre {
+  overflow-x: auto;
+  max-width: 100%;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 0.5rem;
+  padding: 1rem;
+}
+
+.prose code {
+  word-break: break-all;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.25rem;
+}
+
+/* Inline code should not break unless necessary */
+.prose :not(pre) > code {
+  word-break: normal;
+  white-space: nowrap;
+}
+
+/* Table overflow handling */
+.prose table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
 }
 
 .prose h1 {

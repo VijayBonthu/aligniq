@@ -8,6 +8,10 @@ import easyocr
 from typing import Dict
 import base64
 import json
+import secrets
+import hashlib
+from sqlalchemy.orm import Session
+import models
 from utils.logger import logger
 
 UPLOADS_DIR = "uploads"
@@ -20,14 +24,52 @@ def create_token(user_data:dict):
         to_encode = user_data.copy()
         to_encode.update({
             "iat":datetime.now(timezone.utc),
-            "exp":datetime.now(timezone.utc) + timedelta(days=int(settings.TOKEN_EXPIRED_TIME_IN_DAYS))
+            "exp":datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         })
         return jwt.encode(
-            to_encode, 
-            settings.SECRET_KEY_J, 
+            to_encode,
+            settings.SECRET_KEY_J,
             algorithm=settings.ALGORITHM)
     except JWTError as e:
         raise Exception(f"Failed to create token: {str(e)}")
+
+def create_refresh_token(user_id: str, db: Session) -> str:
+    raw_token = secrets.token_hex(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_token = models.RefreshToken(
+        user_id=user_id,
+        token_hash=token_hash,
+        expires_at=expires_at
+    )
+    db.add(refresh_token)
+    db.commit()
+    return raw_token
+
+def validate_refresh_token(raw_token: str, db: Session) -> str:
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    refresh_token = db.query(models.RefreshToken).filter(
+        models.RefreshToken.token_hash == token_hash,
+        models.RefreshToken.revoked == False
+    ).first()
+    if not refresh_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    if refresh_token.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
+    return refresh_token.user_id
+
+def revoke_refresh_token(raw_token: str, db: Session):
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    refresh_token = db.query(models.RefreshToken).filter(
+        models.RefreshToken.token_hash == token_hash
+    ).first()
+    if refresh_token:
+        refresh_token.revoked = True
+        db.commit()
+
+def rotate_refresh_token(old_raw: str, user_id: str, db: Session) -> str:
+    revoke_refresh_token(old_raw, db)
+    return create_refresh_token(user_id, db)
 
 async def validate_token(token:str, credential_exception):
     try:

@@ -73,6 +73,15 @@ class LoginDetails(Base):
     hashed_password = Column(String, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default= text("now()"))
 
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+    id = Column(Integer, primary_key=True, nullable=False, index=True)
+    user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    revoked = Column(Boolean, nullable=False, default=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
 class UserDocuments(Base):
     __tablename__ = "user_documents"
     document_id = Column(String, primary_key=True, nullable=False,index=True,default=lambda: str(uuid.uuid4()))

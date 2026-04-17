@@ -39,11 +39,8 @@ const Register = () => {
       });
 
       if (response.data.access_token) {
-        // Make sure to clear the auth header before setting the new one
         delete axios.defaults.headers.common['Authorization'];
-        
-        // Set the new token
-        login(response.data.access_token);
+        login(response.data.access_token, response.data.refresh_token);
         navigate('/dashboard');
       } else {
         setError('Registration successful. Please login.');
