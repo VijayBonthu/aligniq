@@ -7,6 +7,7 @@ import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/Register';
 import Dashboard from './pages/Dashboard';
+import PricingPage from './pages/PricingPage';
 
 // Create a client
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ function App() {
                 <Route path="/login" element={<LoginPage />} />
                 <Route path="/register" element={<RegisterPage />} />
                 <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/pricing" element={<PricingPage />} />
               </Routes>
             </div>
           </Router>

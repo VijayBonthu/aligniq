@@ -22,6 +22,8 @@ class Registration_login_password(BaseModel):
     given_name:str
     family_name:str
     password:str
+    username: Optional[str] = None
+    role: Optional[str] = None
 
 class login_details(BaseModel):
     email_address:str

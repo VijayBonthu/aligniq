@@ -62,9 +62,18 @@ class User(Base):
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
     verified_email = Column(Boolean, nullable=False)
-    picture = Column(String) 
-    provider = Column(String, nullable=False) 
+    picture = Column(String)
+    provider = Column(String, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default= text('now()'))
+    # Extended profile fields (migration 010)
+    username                 = Column(String(50), nullable=True, unique=True)
+    role                     = Column(String(50), nullable=True)
+    # Subscription fields (migration 009)
+    stripe_customer_id      = Column(String, nullable=True, unique=True, index=True)
+    subscription_tier       = Column(String(50), nullable=False, server_default=text("'free'"))
+    subscription_status     = Column(String(50), nullable=False, server_default=text("'active'"))
+    stripe_subscription_id  = Column(String, nullable=True)
+    subscription_period_end = Column(TIMESTAMP(timezone=True), nullable=True)
 
 class LoginDetails(Base):
     __tablename__="login_details"
@@ -81,6 +90,16 @@ class RefreshToken(Base):
     expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+class UsageTracking(Base):
+    __tablename__ = "usage_tracking"
+    id                        = Column(Integer, primary_key=True, index=True)
+    user_id                   = Column(String, ForeignKey("users.user_id"), nullable=False, index=True)
+    period_start              = Column(TIMESTAMP(timezone=True), nullable=False)
+    period_end                = Column(TIMESTAMP(timezone=True), nullable=False)
+    report_regenerations_used = Column(Integer, nullable=False, default=0)
+    created_at                = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at                = Column(TIMESTAMP(timezone=True), nullable=True)
 
 class UserDocuments(Base):
     __tablename__ = "user_documents"
@@ -100,7 +119,8 @@ class ChatHistory(Base):
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     modified_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     message = Column(String, nullable=False)
-    
+    message_count = Column(Integer, nullable=False, server_default=text("0"))
+
 
 class SelectedChat(Base):
     __tablename__ = "selected_chat"

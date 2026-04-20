@@ -15,8 +15,8 @@ class Settings:
     ALGORITHM=os.getenv("ALGORITHM")
     SECRET_KEY_J=os.getenv("SECRET_KEY_J")
     TOKEN_EXPIRED_TIME_IN_DAYS=os.getenv("TOKEN_EXPIRED_TIME_IN_DAYS")
-    ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-    REFRESH_TOKEN_EXPIRE_DAYS=int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+    ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1"))
+    REFRESH_TOKEN_EXPIRE_DAYS=int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "2"))
     FILE_SIZE = os.getenv("FILE_SIZE")
     OPENAI_CHATGPT = os.getenv("OPENAI_CHATGPT")
     IMAGE_TEXT_LANGUAGE=['en']
@@ -50,6 +50,15 @@ class Settings:
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
     LLM_RETRY_MIN_WAIT = int(os.getenv("LLM_RETRY_MIN_WAIT", "1"))  # seconds
     LLM_RETRY_MAX_WAIT = int(os.getenv("LLM_RETRY_MAX_WAIT", "10"))  # seconds
+
+    # Stripe billing
+    STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY")
+    STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")
+    STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET")
+    STRIPE_BASIC_PRICE_ID  = os.getenv("STRIPE_BASIC_PRICE_ID")
+    STRIPE_PLUS_PRICE_ID   = os.getenv("STRIPE_PLUS_PRICE_ID")
+    ADMIN_SECRET_KEY       = os.getenv("ADMIN_SECRET_KEY")
+    FRONTEND_URL           = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
     # Feature flags
     USE_TOOL_BASED_CHAT = os.getenv("USE_TOOL_BASED_CHAT", "false").lower() == "true"

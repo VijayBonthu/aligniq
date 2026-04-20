@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
 
 interface ProfileMenuProps {
   user: any | null;
@@ -6,8 +8,14 @@ interface ProfileMenuProps {
   sidebarExpanded: boolean;
 }
 
+const TIER_LABELS: Record<string, string> = {
+  free: 'Free', basic: 'Basic', plus: 'Plus', pro: 'Pro',
+};
+
 const ProfileMenu: React.FC<ProfileMenuProps> = ({ user, logout, sidebarExpanded }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const navigate = useNavigate();
+  const { subscription } = useAuth();
   const menuRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
@@ -140,9 +148,29 @@ const ProfileMenu: React.FC<ProfileMenuProps> = ({ user, logout, sidebarExpanded
             Help
           </button>
           
+          <button
+            onClick={() => {
+              setIsMenuOpen(false);
+              navigate('/pricing');
+            }}
+            className="w-full text-left px-4 py-2 text-sm hover:bg-white/5 flex items-center justify-between text-gray-200 transition-colors"
+          >
+            <span className="flex items-center">
+              <svg className="mr-2.5 h-4 w-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+              </svg>
+              Billing &amp; Plan
+            </span>
+            {subscription && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-indigo-600/30 text-indigo-300">
+                {TIER_LABELS[subscription.tier] || subscription.tier}
+              </span>
+            )}
+          </button>
+
           <div className="border-t border-indigo-600/20 my-1"></div>
-          
-          <button 
+
+          <button
             onClick={logout}
             className="w-full text-left px-4 py-2 text-sm hover:bg-white/5 flex items-center text-rose-400 transition-colors"
           >

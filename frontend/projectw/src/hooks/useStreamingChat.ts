@@ -5,6 +5,29 @@
  */
 
 import { useState, useCallback, useRef } from 'react';
+import api from '../services/api';
+
+// Attempt a token refresh using the shared api instance; returns the new access token or null.
+async function attemptTokenRefresh(): Promise<string | null> {
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (!refreshToken) return null;
+  try {
+    const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('refresh_token', data.refresh_token);
+    localStorage.setItem('regular_token', data.access_token);
+    api.defaults.headers.common['Authorization'] = `Bearer ${data.access_token}`;
+    return data.access_token;
+  } catch {
+    return null;
+  }
+}
+
+function clearAllAuthTokens() {
+  ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
+   'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
+  delete (api.defaults.headers.common as Record<string, string>)['Authorization'];
+}
 
 // SSE Event types from backend
 export type StreamEventType =
@@ -119,22 +142,36 @@ export function useStreamingChat(): UseStreamingChatReturn {
     const toolsUsed: Array<{ tool: string; args?: Record<string, unknown> }> = [];
 
     try {
-      const response = await fetch(`${API_URL}/chat-with-doc-stream`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'text/event-stream'
-        },
-        body: JSON.stringify({
-          chat_history_id: chatHistoryId,
-          user_id: userId,
-          message: messages,
-          document_id: documentId,
-          title: title
-        }),
-        signal: abortControllerRef.current.signal
-      });
+      const makeRequest = (activeToken: string) =>
+        fetch(`${API_URL}/chat-with-doc-stream`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeToken}`,
+            'Accept': 'text/event-stream'
+          },
+          body: JSON.stringify({
+            chat_history_id: chatHistoryId,
+            user_id: userId,
+            message: messages,
+            document_id: documentId,
+            title: title
+          }),
+          signal: abortControllerRef.current!.signal
+        });
+
+      let response = await makeRequest(token);
+
+      // On 401, refresh the token and retry once
+      if (response.status === 401) {
+        const newToken = await attemptTokenRefresh();
+        if (!newToken) {
+          clearAllAuthTokens();
+          window.location.href = '/login';
+          throw new Error('Session expired. Please log in again.');
+        }
+        response = await makeRequest(newToken);
+      }
 
       if (!response.ok) {
         const errorText = await response.text();

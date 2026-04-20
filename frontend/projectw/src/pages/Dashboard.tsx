@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import axios from 'axios';
+import { isAxiosError } from 'axios';
+import api from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'react-hot-toast';
 import * as marked from 'marked'; // Change to namespace import
@@ -14,6 +15,8 @@ import JiraIssueDetail from '../components/integrations/jira/JiraIssueDetail';
 // Streaming chat hook and components
 import { useStreamingChat } from '../hooks/useStreamingChat';
 import { StreamingMessage } from '../components/chat/StreamingMessage';
+import UpgradeModal from '../components/billing/UpgradeModal';
+import UsageCounter from '../components/billing/UsageCounter';
 
 const API_URL = import.meta.env.VITE_API_URL;
 
@@ -183,7 +186,7 @@ const MessageContent: React.FC<{ content: string }> = React.memo(({ content }) =
 MessageContent.displayName = 'MessageContent';
 
 const Dashboard: React.FC = () => {
-  const { isAuthenticated, logout } = useAuth();
+  const { isAuthenticated, logout, subscription, refreshSubscription } = useAuth();
   const navigate = useNavigate();
   const [files, setFiles] = useState<File[]>([]);
   const [fileProgresses, setFileProgresses] = useState<{[key: string]: number}>({});
@@ -209,6 +212,7 @@ const Dashboard: React.FC = () => {
   });
   const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [upgradeModal, setUpgradeModal] = useState<{ limitType: 'max_chats' | 'messages_per_chat' | 'monthly_report_regen'; current: number; limit: number } | null>(null);
 
   // Streaming chat hook
   const {
@@ -272,9 +276,14 @@ const Dashboard: React.FC = () => {
       // Fetch existing conversations only once at mount
       console.log("Initial conversations fetch on component mount");
       fetchConversations();
-      
-      // We don't need to refresh on visibility change - removing for performance
-      // Only refresh when actual data changes occur (uploads, chat interactions)
+
+      // Handle post-Stripe-checkout redirect
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('upgrade') === 'success') {
+        refreshSubscription();
+        toast.success('Your plan has been upgraded!');
+        window.history.replaceState({}, '', '/dashboard');
+      }
     }
   }, [isAuthenticated, navigate]);
 
@@ -325,22 +334,7 @@ const Dashboard: React.FC = () => {
       const timestamp = new Date().getTime();
       console.log(`Starting fetchConversations at timestamp: ${timestamp}`);
 
-      // Get the token for authentication
-      const token = localStorage.getItem('token') ||
-                  localStorage.getItem('regular_token') ||
-                  localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        console.error("No token found");
-        return;
-      }
-
-      // Set the authorization header explicitly and add cache-busting parameter
-      const response = await axios.get(`${API_URL}/chat?_t=${timestamp}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      });
+      const response = await api.get(`/chat?_t=${timestamp}`);
       
       console.log(`Received conversations data at timestamp: ${timestamp}`);
       
@@ -497,11 +491,7 @@ const Dashboard: React.FC = () => {
   // With this safer version that handles the null case:
   const decodeTokenAndSaveUserId = async (token: string) => {
     try {
-      const response = await axios.get(`${API_URL}/decode_token/${token}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      });
+      const response = await api.get(`/decode_token/${token}`);
       
       if (response.data && response.data.id) {
         const userId = response.data.id;
@@ -551,11 +541,7 @@ const Dashboard: React.FC = () => {
       }
       
       // Upload the files and get initial analysis
-      const uploadResponse = await axios.post(`${API_URL}/upload`, formData, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'multipart/form-data'
-        },
+      const uploadResponse = await api.post(`/upload`, formData, {
         onUploadProgress: (progressEvent) => {
           const percentCompleted = Math.round((progressEvent.loaded * 100) / (progressEvent.total || 1));
           setTotalProgress(percentCompleted);
@@ -663,20 +649,8 @@ const Dashboard: React.FC = () => {
       setPendingChangesCount(0);
       setHasConflicts(false);
 
-      const token = localStorage.getItem('token') ||
-                   localStorage.getItem('regular_token') ||
-                   localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        throw new Error("No authentication token found");
-      }
-
-      const authHeaders = { 'Authorization': `Bearer ${token}` };
-
       // Step 1: Fetch the main conversation (required first)
-      const response = await axios.get(`${API_URL}/chat/${chatHistoryId}`, {
-        headers: authHeaders
-      });
+      const response = await api.get(`/chat/${chatHistoryId}`);
 
       if (!response.data?.user_details) {
         throw new Error("Invalid response format");
@@ -737,18 +711,14 @@ const Dashboard: React.FC = () => {
         // Always try to fetch presales data if we have document_id
         if (details.document_id) {
           parallelRequests.push(
-            axios.get(`${API_URL}/presales/${details.document_id}`, {
-              headers: authHeaders
-            }).catch(() => null) // Don't fail if presales doesn't exist
+            api.get(`/presales/${details.document_id}`).catch(() => null) // Don't fail if presales doesn't exist
           );
         }
 
         // If we already know it's presales, also fetch questions in parallel
         if (presalesId) {
           parallelRequests.push(
-            axios.get(`${API_URL}/presales/${presalesId}/questions`, {
-              headers: authHeaders
-            }).catch(() => null)
+            api.get(`/presales/${presalesId}/questions`).catch(() => null)
           );
         }
 
@@ -788,9 +758,7 @@ const Dashboard: React.FC = () => {
           if (!questionsData && presalesId) {
             // Questions weren't fetched in parallel (presalesId was discovered), fetch now
             try {
-              const qRes = await axios.get(`${API_URL}/presales/${presalesId}/questions`, {
-                headers: authHeaders
-              });
+              const qRes = await api.get(`/presales/${presalesId}/questions`);
               questionsData = qRes.data;
             } catch (e) {
               console.log('Could not load questions');
@@ -823,9 +791,7 @@ const Dashboard: React.FC = () => {
 
           // Fetch pending changes for full report conversations (non-blocking)
           if (conversation.chat_history_id) {
-            axios.get(`${API_URL}/pending-changes/${conversation.chat_history_id}`, {
-              headers: authHeaders
-            }).then(pendingResponse => {
+            api.get(`/pending-changes/${conversation.chat_history_id}`).then(pendingResponse => {
               if (pendingResponse.data) {
                 setPendingChangesCount(pendingResponse.data.total_pending || 0);
                 setHasConflicts(pendingResponse.data.has_conflicts || false);
@@ -999,22 +965,16 @@ const Dashboard: React.FC = () => {
           console.error('Streaming chat error:', streamingError);
         }
       } else {
-        // NON-STREAMING MODE: Original axios.post behavior
+        // NON-STREAMING MODE: Original api.post behavior
         // STEP 1: Call the chat-with-doc endpoint with ALL messages (with selection state)
-        const response = await axios.post(
-          `${API_URL}/chat-with-doc`,
+        const response = await api.post(
+          `/chat-with-doc`,
           {
             chat_history_id: updatedConversation.chat_history_id || updatedConversation.id,
             user_id: userId,
             document_id: updatedConversation.document_id || '',
             message: [...allMessagesWithSelection, userMessageForApi],
             title: updatedConversation.title
-          },
-          {
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json'
-            }
           }
         );
 
@@ -1070,18 +1030,13 @@ const Dashboard: React.FC = () => {
             selected: msg.selected !== undefined ? msg.selected : true
           }));
 
-          await axios.post(
-            `${API_URL}/chat`,
+          await api.post(
+            `/chat`,
             {
               user_id: userId,
               document_id: updatedConversation.document_id || '',
               message: cleanMessages,
               title: updatedConversation.title || 'Chat Session'
-            },
-            {
-              headers: {
-                'Authorization': `Bearer ${token}`
-              }
             }
           );
 
@@ -1097,8 +1052,18 @@ const Dashboard: React.FC = () => {
       }
     } catch (error) {
       console.error('Error sending message:', error);
-      toast.error('Failed to send message');
-      
+
+      if (isAxiosError(error) && error.response?.status === 402) {
+        const detail = error.response.data?.detail;
+        if (detail?.limit_type) {
+          setUpgradeModal({ limitType: detail.limit_type, current: detail.current, limit: detail.limit });
+        } else {
+          toast.error('Message limit reached. Upgrade your plan.');
+        }
+      } else {
+        toast.error('Failed to send message');
+      }
+
       // Remove loading indicator on error
       setActiveConversation(prev => {
         if (!prev) return null;
@@ -1149,21 +1114,8 @@ const Dashboard: React.FC = () => {
     
     if (window.confirm('Are you sure you want to delete this conversation?')) {
       try {
-        const token = localStorage.getItem('token') || 
-                     localStorage.getItem('regular_token') || 
-                     localStorage.getItem('google_auth_token');
-                     
-        if (!token) {
-          console.error("No token found");
-        return;
-      }
-      
         // Delete the conversation from the backend
-        await axios.delete(`${API_URL}/chat/${chatId}`, {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        });
+        await api.delete(`/chat/${chatId}`);
         
         // Important: Reset active conversation FIRST if it's the one being deleted
         if (activeConversation?.id === chatId) {
@@ -1204,7 +1156,7 @@ const Dashboard: React.FC = () => {
         
         // If we get a 404, the conversation is already gone from backend
         // So we should still clean up the UI
-        if (axios.isAxiosError(error) && error.response?.status === 404) {
+        if (isAxiosError(error) && error.response?.status === 404) {
           if (activeConversation?.id === chatId) {
             setActiveConversation(null);
           }
@@ -1258,21 +1210,8 @@ const Dashboard: React.FC = () => {
     if (!newTitle.trim()) return;
     
     try {
-      const token = localStorage.getItem('token') || 
-                   localStorage.getItem('regular_token') || 
-                   localStorage.getItem('google_auth_token');
-                   
-      if (!token) {
-        console.error("No token found");
-        return;
-      }
-
       // First fetch the complete conversation details
-      const chatResponse = await axios.get(`${API_URL}/chat/${chatId}`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      });
+      const chatResponse = await api.get(`/chat/${chatId}`);
       
       if (!chatResponse.data || !chatResponse.data.user_details) {
         throw new Error("Invalid response when fetching conversation details");
@@ -1303,18 +1242,13 @@ const Dashboard: React.FC = () => {
       }
       
       // Update the conversation with POST
-      await axios.post(`${API_URL}/chat`, 
+      await api.post(`/chat`,
         {
           chat_history_id: chatId,
           user_id: userId,
           document_id: details.document_id || "",
           message: messages,
           title: newTitle.trim()
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
         }
       );
       
@@ -2022,27 +1956,11 @@ const Dashboard: React.FC = () => {
         formData.append('file', file);
       });
       
-      // Get the token for authentication
-      const token = localStorage.getItem('token') || 
-                    localStorage.getItem('regular_token') || 
-                    localStorage.getItem('google_auth_token');
-                  
-      if (!token) {
-        toast.error('Authentication token not found. Please log in again.');
-        setIsProcessing(false);
-        return;
-      }
-      
       // Log what we're sending to the backend
       console.log('Sending files to backend:', uploadedFiles.map(f => f.name));
-      
+
       // Call the backend API to process the files
-      const response = await axios.post(`${API_URL}/upload`, formData, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'multipart/form-data'
-        }
-      });
+      const response = await api.post(`/upload`, formData);
       
       console.log("Upload response:", response.data);
       
@@ -2064,7 +1982,7 @@ const Dashboard: React.FC = () => {
         // Only create chat history for full analysis mode
         if (!isPresales) {
           // Step 2: Save the message to the chat system with the correct payload format
-          const chatResponse = await axios.post(`${API_URL}/chat`, {
+          const chatResponse = await api.post(`/chat`, {
             user_id: userId,
             document_id: documentId,
             message: [
@@ -2076,10 +1994,6 @@ const Dashboard: React.FC = () => {
               }
             ], // Include role, content, timestamp, and selected
             title: response.data.title || `Document Analysis`
-          }, {
-            headers: {
-              'Authorization': `Bearer ${token}`
-            }
           });
 
           console.log("Chat creation response:", chatResponse.data);
@@ -2161,10 +2075,10 @@ const Dashboard: React.FC = () => {
     } catch (error) {
       console.error('Error processing documents:', error);
       
-      if (axios.isAxiosError(error) && error.response) {
+      if (isAxiosError(error) && error.response) {
         const errorDetail = error.response.data?.detail;
         console.log('Error detail:', errorDetail);
-        
+
         if (error.response.status === 401) {
           toast.error('Your session has expired. Please log in again.');
         } else {
@@ -2188,16 +2102,6 @@ const Dashboard: React.FC = () => {
     setIsProcessing(true);
 
     try {
-      const token = localStorage.getItem('token') ||
-                    localStorage.getItem('regular_token') ||
-                    localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        toast.error('Authentication token not found. Please log in again.');
-        setIsProcessing(false);
-        return;
-      }
-
       // Create FormData for the request
       const formData = new FormData();
       formData.append('presales_id', activeConversation.presales_id);
@@ -2220,12 +2124,7 @@ const Dashboard: React.FC = () => {
       }
 
       // Call the generate-full-report endpoint
-      const response = await axios.post(`${API_URL}/generate-full-report/`, formData, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'multipart/form-data'
-        }
-      });
+      const response = await api.post(`/generate-full-report/`, formData);
 
       console.log("Full report response:", response.data);
 
@@ -2267,7 +2166,14 @@ const Dashboard: React.FC = () => {
     } catch (error) {
       console.error('Error generating full report:', error);
 
-      if (axios.isAxiosError(error) && error.response) {
+      if (isAxiosError(error) && error.response?.status === 402) {
+        const detail = error.response.data?.detail;
+        if (detail?.limit_type) {
+          setUpgradeModal({ limitType: detail.limit_type, current: detail.current, limit: detail.limit });
+        } else {
+          toast.error('Report regeneration limit reached. Upgrade your plan.');
+        }
+      } else if (isAxiosError(error) && error.response) {
         toast.error(`Failed to generate full report: ${error.response.data?.detail || 'Unknown error'}`);
       } else {
         toast.error('Failed to generate full report. Please try again.');
@@ -2284,15 +2190,6 @@ const Dashboard: React.FC = () => {
     setIsPresalesChatting(true);
 
     try {
-      const token = localStorage.getItem('token') ||
-                    localStorage.getItem('regular_token') ||
-                    localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        toast.error('Authentication token not found. Please log in again.');
-        return;
-      }
-
       // Add user message to UI immediately
       const userMessage: Message = {
         id: `user-${Date.now()}`,
@@ -2334,15 +2231,9 @@ const Dashboard: React.FC = () => {
       const formData = new FormData();
       formData.append('message', currentMessage);
 
-      const response = await axios.post(
-        `${API_URL}/presales/${activeConversation.presales_id}/chat`,
-        formData,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'multipart/form-data'
-          }
-        }
+      const response = await api.post(
+        `/presales/${activeConversation.presales_id}/chat`,
+        formData
       );
 
       // Remove typing indicator and add real response
@@ -2374,13 +2265,8 @@ const Dashboard: React.FC = () => {
 
           // Refresh questions to show the updated answer
           try {
-            const questionsResponse = await axios.get(
-              `${API_URL}/presales/${activeConversation.presales_id}/questions`,
-              {
-                headers: {
-                  'Authorization': `Bearer ${token}`
-                }
-              }
+            const questionsResponse = await api.get(
+              `/presales/${activeConversation.presales_id}/questions`
             );
 
             if (questionsResponse.data?.questions) {
@@ -2441,30 +2327,14 @@ const Dashboard: React.FC = () => {
     setIsAnalyzing(true);
 
     try {
-      const token = localStorage.getItem('token') ||
-                    localStorage.getItem('regular_token') ||
-                    localStorage.getItem('google_auth_token');
-
-      console.log('Token found:', !!token);
-
-      if (!token) {
-        toast.error('Authentication token not found. Please log in again.');
-        return;
-      }
-
       // First, save the answers if there are any
       if (Object.keys(kickstartAnswers).length > 0) {
         console.log('Saving answers first...', kickstartAnswers);
         try {
-          await axios.post(
-            `${API_URL}/presales/${activeConversation.presales_id}/questions/answers`,
+          await api.post(
+            `/presales/${activeConversation.presales_id}/questions/answers`,
             { answers: JSON.stringify(kickstartAnswers) },
-            {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
-              }
-            }
+            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
           );
           console.log('Answers saved successfully');
         } catch (saveError) {
@@ -2476,15 +2346,10 @@ const Dashboard: React.FC = () => {
       }
 
       // Then run analysis
-      console.log('Starting analysis request to:', `${API_URL}/presales/${activeConversation.presales_id}/analyze`);
-      const response = await axios.post(
-        `${API_URL}/presales/${activeConversation.presales_id}/analyze`,
-        {},
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
+      console.log('Starting analysis request to:', `/presales/${activeConversation.presales_id}/analyze`);
+      const response = await api.post(
+        `/presales/${activeConversation.presales_id}/analyze`,
+        {}
       );
       console.log('Analysis response received:', response.data);
 
@@ -2605,15 +2470,6 @@ const Dashboard: React.FC = () => {
     }
 
     try {
-      const token = localStorage.getItem('token') ||
-                    localStorage.getItem('regular_token') ||
-                    localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        toast.error('Authentication required');
-        return;
-      }
-
       // Find the question_id from the question number (P1-1, Q2, etc.)
       // We need to get it from the questions in activeConversation
       const allQuestions = activeConversation.questions || [];
@@ -2624,14 +2480,9 @@ const Dashboard: React.FC = () => {
         return;
       }
 
-      const response = await axios.post(
-        `${API_URL}/presales/${activeConversation.presales_id}/questions/${questionToRestore.question_id}/restore`,
-        {},
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        }
+      const response = await api.post(
+        `/presales/${activeConversation.presales_id}/questions/${questionToRestore.question_id}/restore`,
+        {}
       );
 
       if (response.data.status === 'restored') {
@@ -2778,7 +2629,16 @@ const Dashboard: React.FC = () => {
               <div className="flex-1 flex flex-col h-full overflow-hidden">
                 {/* Chat header - improved for mobile */}
                 <div className="flex-none p-2 md:p-4 border-b border-white/10 flex justify-between items-center bg-indigo-950/50">
-                  <h2 className="text-lg md:text-xl font-semibold text-white truncate">{activeConversation.title}</h2>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <h2 className="text-lg md:text-xl font-semibold text-white truncate">{activeConversation.title}</h2>
+                    {subscription && (
+                      <UsageCounter
+                        label="Msgs"
+                        current={subscription.usage.chats}
+                        limit={subscription.limits.max_chats}
+                      />
+                    )}
+                  </div>
                   {/* Panel expand button - shown when right panel is collapsed */}
                   {isSplitView && rightPanelCollapsed && !isMobile && (
                     <button
@@ -3809,6 +3669,15 @@ const Dashboard: React.FC = () => {
         onTogglePanel={setShowIntegrationPanel}
         isSplitView={isSplitView}
       />
+
+      {upgradeModal && (
+        <UpgradeModal
+          limitType={upgradeModal.limitType}
+          current={upgradeModal.current}
+          limit={upgradeModal.limit}
+          onClose={() => setUpgradeModal(null)}
+        />
+      )}
     </div>
   );
 };

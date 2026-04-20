@@ -106,6 +106,8 @@ async def create_account(user_details:Registration_login_password, db:Session=De
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Required details are not provided")
     try:
         user_details = user_details.__dict__
+        username = user_details.get("username")
+        role = user_details.get("role")
         user_details.update(
             {
                 "id": None,
@@ -116,6 +118,10 @@ async def create_account(user_details:Registration_login_password, db:Session=De
             }
         )
         user = await create_user(user_data=user_details, provider="Local",db=db)
+        if username or role:
+            user.username = username
+            user.role = role
+            db.commit()
     except UserCreationError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Something went wrong, it is not you, Please try after sometime{e}")
     

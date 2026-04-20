@@ -29,14 +29,16 @@ async def create_user(user_data:dict,provider:str, db:Session):
     
     if not user_details:
         user_details = models.User(
-            oauth_id = user_data["id"], 
+            oauth_id = user_data["id"],
             email_address = user_data["email"],
             first_name = user_data["given_name"],
             last_name = user_data["family_name"],
             verified_email = user_data["verified_email"],
             full_name = user_data["name"],
             picture = user_data["picture"],
-            provider = provider
+            provider = provider,
+            subscription_tier = "free",
+            subscription_status = "active",
         )
         try: 
             db.add(user_details)

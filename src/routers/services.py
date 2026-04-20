@@ -4,6 +4,7 @@ from typing import Optional
 import os
 import json
 from utils.token_generation import token_validator
+from utils.subscription import check_chat_limit, check_message_limit, check_regen_limit, increment_message_count, increment_regen_count
 from utils.chat_history import save_chat_history, delete_chat_history, get_user_chat_history_details,get_single_user_chat_history, save_chat_with_doc, save_report_version
 from getdata import ExtractText
 from processdata import AccessLLM
@@ -700,6 +701,7 @@ async def generate_full_report_from_presales(
         Full technical report with chat_history_id
     """
     user_id = current_token["regular_login_token"]["id"]
+    check_regen_limit(user_id, db)
     logger.info(f"Generating full report from presales_id: {presales_id}")
 
     try:
@@ -928,6 +930,7 @@ async def generate_full_report_from_presales(
         except Exception as e:
             logger.error(f"Error saving report version: {str(e)}")
 
+        increment_regen_count(user_id, db)
         return {
             "message": agent_response_message,
             "document_id": presales["document_id"],
@@ -1899,10 +1902,12 @@ async def task_status_page(task_id: str, token: str = None):
 
 
 @router.post('/chat')
-async def add_chat_history(request: ChatHistoryDetails,db:Session=Depends(get_db)):
+async def add_chat_history(request: ChatHistoryDetails, current_user: dict = Depends(token_validator), db:Session=Depends(get_db)):
     try:
         chat = request.model_dump()
-        logger.info(f"got the details in api ,saving the chat history for user: {chat['user_id']}")
+        user_id = chat['user_id']
+        check_chat_limit(user_id, db)
+        logger.info(f"got the details in api ,saving the chat history for user: {user_id}")
         save_chat = await save_chat_history(chat=chat, db=db)
         return {"status":save_chat["status"], "chat_history_id":save_chat["chat_history_id"], "user_id":save_chat["user_id"],"message":save_chat["message"]}
     except Exception as e:
@@ -4822,6 +4827,8 @@ async def conversation_with_doc_v3(
 
         chat_context = request.model_dump()
         chat_history_id = chat_context["chat_history_id"]
+        user_id = current_user["regular_login_token"]["id"]
+        check_message_limit(chat_history_id, user_id, db)
         logger.info(f"Processing chat-with-doc-v3 for chat_history_id: {chat_history_id}")
         logger.info("using this api for the frontend /chaat with doc endpoint")
 
@@ -4873,6 +4880,7 @@ async def conversation_with_doc_v3(
             }
             chat_context["message"].append(new_assistant_message)
             await save_chat_history(chat=chat_context, db=db)
+            increment_message_count(chat_history_id, user_id, db)
 
             # Return response
             return {
@@ -4996,6 +5004,7 @@ async def conversation_with_doc_v3(
 
         chat_context["message"].append(new_assistant_message)
         await save_chat_history(chat=chat_context, db=db)
+        increment_message_count(chat_history_id, user_id, db)
 
         # 7. RETURN RESPONSE
         api_response = {
@@ -5132,6 +5141,7 @@ async def conversation_with_doc_stream(
                 }
                 chat_context["message"].append(new_assistant_message)
                 await save_chat_history(chat=chat_context, db=db)
+                increment_message_count(chat_history_id, user_id, db)
                 logger.info(f"Streaming chat saved for {chat_history_id}")
 
         except Exception as e:

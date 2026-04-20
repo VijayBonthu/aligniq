@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import models
 from models import engine
 from fastapi.middleware.cors import CORSMiddleware
-from routers import authentication, services, third_party_integrations
+from routers import authentication, services, third_party_integrations, billing
 from utils.logger import setup_logger
 from utils.rate_limit import lifespan
 from utils.middleware import CSRFMiddleware, RateLimitMiddleware
@@ -28,7 +28,8 @@ origins = [
     "http://localhost:3001",
     "http://localhost:5173",
     "http://192.168.2.26:3000",
-    "http://172.26.80.1:3000",
+    "http://192.168.2.26:3001",
+    "http://192.168.2.181:3001",
     "https://2jzp70s0-3000.use.devtunnels.ms",
     "https://2jzp70s0-5173.use.devtunnels.ms",
     "https://2jzp70s0-8080.use.devtunnels.ms",
@@ -49,6 +50,7 @@ app.add_middleware(
 app.include_router(authentication.router, prefix="/api/v1", tags=["authentication"])
 app.include_router(services.router, prefix="/api/v1", tags=["services"])
 app.include_router(third_party_integrations.router, prefix="/api/v1", tags=["third party integrations"])
+app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 
 @app.get("/")
 async def home():

@@ -7,6 +7,8 @@ interface UserData {
   email: string;
   verified_email: boolean;
   provider: string;
+  username?: string;
+  role?: string;
   iat: number;
   exp: number;
 }
@@ -33,17 +35,12 @@ const AuthContext = createContext<AuthContextType>(defaultValue);
 
 export const useAuth = () => useContext(AuthContext);
 
-interface AuthProviderProps {
-  children: ReactNode;
-}
-
-export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
-  console.log("🔄 AuthProvider rendering");
+export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    const token = localStorage.getItem('access_token') ||
-                 localStorage.getItem('regular_token') ||
-                 localStorage.getItem('google_auth_token');
-    console.log("🏁 Initial auth state check:", { hasToken: !!token });
+    const token =
+      localStorage.getItem('access_token') ||
+      localStorage.getItem('regular_token') ||
+      localStorage.getItem('google_auth_token');
     return !!token;
   });
   const [user, setUser] = useState<UserData | null>(null);
@@ -59,30 +56,22 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   };
 
   const decodeAndStoreUserData = async (token: string) => {
-    console.log("📞 decodeAndStoreUserData called with token:", token.substring(0, 10) + "...");
     try {
       const response = await api.get(`/decode_token/${token}`);
-      console.log("✅ decode_token API call successful, response:", response.data);
-
       const userData: UserData = response.data;
       setUser(userData);
       setIsAuthenticated(true);
-
       localStorage.setItem('user_id', userData.id);
       localStorage.setItem('user_email', userData.email);
       localStorage.setItem('user_provider', userData.provider);
-
       return userData;
-    } catch (error) {
-      console.error("❌ Error in decodeAndStoreUserData:", error);
+    } catch {
       setIsAuthenticated(false);
       return null;
     }
   };
 
   const login = async (accessToken: string, refreshToken?: string): Promise<boolean> => {
-    console.log("🔑 Login called with token:", accessToken.substring(0, 10) + "...");
-
     try {
       localStorage.removeItem('regular_token');
       localStorage.removeItem('google_auth_token');
@@ -104,75 +93,44 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         getSubscription().then(setSubscription).catch(() => {});
       }
 
-      console.log("🔐 Login completed:", {
-        success,
-        isAuthenticated: success,
-        hasUser: !!userData
-      });
-
       return success;
-    } catch (error) {
-      console.error("❌ Error in login:", error);
+    } catch {
       setIsAuthenticated(false);
       return false;
     }
   };
 
   useEffect(() => {
-    console.log("🏁 AuthProvider mounted");
-    const token = localStorage.getItem('access_token') ||
-                 localStorage.getItem('regular_token') ||
-                 localStorage.getItem('google_auth_token');
+    const token =
+      localStorage.getItem('access_token') ||
+      localStorage.getItem('regular_token') ||
+      localStorage.getItem('google_auth_token');
 
     if (token) {
-      console.log("🔄 Found token on mount, initializing auth");
-      decodeAndStoreUserData(token).then((userData) => {
+      decodeAndStoreUserData(token).then(userData => {
         if (userData) getSubscription().then(setSubscription).catch(() => {});
       });
     }
   }, []);
 
-  useEffect(() => {
-    console.log("🔄 Auth state changed:", { isAuthenticated, hasUser: !!user });
-  }, [isAuthenticated, user]);
-
   const logout = () => {
-    console.log("🚪 Logout called");
-
     const refreshToken = localStorage.getItem('refresh_token');
 
-    // Clear state immediately so navigation after logout works correctly
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
-    localStorage.removeItem('regular_token');
-    localStorage.removeItem('google_auth_token');
-    localStorage.removeItem('user_id');
-    localStorage.removeItem('user_email');
-    localStorage.removeItem('user_provider');
+    ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
+     'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
+
     delete api.defaults.headers.common['Authorization'];
     setIsAuthenticated(false);
     setUser(null);
     setSubscription(null);
 
-    // Best-effort revocation — fire and forget
     if (refreshToken) {
       api.post('/auth/logout', { refresh_token: refreshToken }).catch(() => {});
     }
-
-    console.log("✅ Logout complete");
-  };
-
-  const value = {
-    isAuthenticated,
-    user,
-    subscription,
-    login,
-    logout,
-    refreshSubscription,
   };
 
   return (
-    <AuthContext.Provider value={value}>
+    <AuthContext.Provider value={{ isAuthenticated, user, subscription, login, logout, refreshSubscription }}>
       {children}
     </AuthContext.Provider>
   );
