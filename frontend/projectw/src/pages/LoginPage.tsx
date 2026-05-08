@@ -32,7 +32,7 @@ const LoginPage: React.FC = () => {
     if (isAuthenticated && !hasNavigated) {
       console.log("Attempting navigation to dashboard");
       setHasNavigated(true);
-      navigate('/dashboard', { replace: true });
+      navigate('/projects', { replace: true });
     }
   }, [isAuthenticated, hasNavigated, navigate]);
 
@@ -149,7 +149,7 @@ const LoginPage: React.FC = () => {
         window.removeEventListener('message', handleAuthCallback);
 
         await login(event.data.access_token, event.data.refresh_token);
-        navigate('/dashboard');
+        navigate('/projects');
       }
     };
     

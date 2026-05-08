@@ -648,63 +648,104 @@ If there are issues, be constructive and specific about how to fix them.
 
 
 FULL_REPORT_WITH_ASSUMPTIONS_PROMPT = """
-You are generating a comprehensive technical report. Some information was provided through answers,
-and some will be based on reasonable assumptions.
+You are generating a **Consolidated Requirements Document (CRD)** — the single source of truth that
+merges everything we know about the project so far: extracted requirements, the user's confirmed
+answers, accepted assumptions, open blockers, and known technology risks.
 
-## CRITICAL INSTRUCTION
-You MUST clearly distinguish between:
-- **Confirmed Information**: Based on answers provided
-- **Assumptions Made**: Where information was not provided
+This document is what the user reviews (and may edit) before kicking off the 9-agent full pipeline.
+The downstream pipeline grounds in this CRD rather than re-extracting from raw text, so structure
+and traceability matter — every requirement should cite its source (doc section or question id).
 
-## Document Context
+## CRITICAL RULES
+1. Output ONLY the markdown document. No preamble, no trailing explanation.
+2. Use the EXACT section structure below (numbered 1–8). Do not add or rename sections.
+3. Merge user answers verbatim where confirmed; do not paraphrase contradicting wording.
+4. Every FR/NFR row MUST include a Source column (doc§ reference or question id like Q3 / P1-2).
+5. Treat accepted assumptions as load-bearing facts; do NOT re-question them in this document.
+6. Treat skipped/unanswered P1 blockers as Open Blockers (Section 5), not as gaps.
+7. Do not invent information. If a section has no content, write "_None._" under that section.
+
+## INPUTS
+
+### Scanned Requirements (structured extraction)
 {document}
 
-## Confirmed Information (from answers)
+### Confirmed Q&A (user answered these)
 {confirmed_answers}
 
-## Assumptions Being Made
+### Open / Skipped Questions (still unresolved)
+{open_questions}
+
+### Accepted Assumptions (user signed off)
 {assumptions_list}
+
+### Known Blind Spots (P1 blockers, technology risks, red flags)
+{blind_spots}
 
 {additional_context}
 
-## Report Structure Requirements
-Include these sections:
+## OUTPUT — Use this EXACT structure
 
-### 1. Executive Summary
-Brief overview with clear note about assumption count
+# Consolidated Requirements: <project title from scanned requirements>
 
-### 2. Information Status
-| Category | Confirmed | Assumed |
-|----------|-----------|---------|
-| Technical Requirements | X | Y |
-| Integration Points | X | Y |
-| Security Requirements | X | Y |
-| Scale/Performance | X | Y |
+## 1. Executive Summary
+2–3 sentences: what the client wants to build, the core problem, and the one biggest unknown still
+in flight. End with: `Confirmed answers: N · Accepted assumptions: M · Open blockers: K`.
 
-### 3. Confirmed Requirements
-Details based on provided answers
+## 2. Confirmed Scope
 
-### 4. Assumed Requirements
-**IMPORTANT**: Each assumption must be clearly marked with:
-- What we're assuming
-- Why we made this assumption
-- Risk if assumption is wrong
-- Recommendation to confirm
+### Functional Requirements
+| FR # | Requirement | Source |
+|------|-------------|--------|
+| FR-1 | ... | doc§... or Q1 |
 
-### 5. Technical Architecture
-(with clear markers for assumed vs confirmed elements)
+### Non-Functional Requirements
+| NFR # | Requirement | Source |
+|-------|-------------|--------|
+| NFR-1 | ... | doc§... or Q3 |
 
-### 6. Risk Assessment
-Include risks specifically from unconfirmed assumptions
+### Out of Scope
+- Bullet list. Pull only from explicit answers/document. _None._ if not stated.
 
-### 7. Recommendations
-- Immediate actions
-- Items requiring client confirmation
-- Assumptions to validate ASAP
+## 3. Confirmed Q&A Summary
+| # | Category | Question | Answer |
+|---|----------|----------|--------|
+| Q1 | ... | ... | ... |
+| P1-2 | ... | ... | ... |
 
-### 8. Appendix: Assumptions Summary
-Complete list of all assumptions for easy client review
+Use the confirmed Q&A above. Preserve original numbering (P1-* and Q*).
 
-## Output
-Generate the full report in markdown format.
+## 4. Accepted Assumptions
+| A # | Assumption | Risk | Basis | Impact if Wrong |
+|-----|------------|------|-------|-----------------|
+| A-1 | ... | high/medium/low | ... | ... |
+
+Number sequentially A-1, A-2, … Use the assumptions input verbatim where given.
+
+## 5. Open Blockers / Decisions Pending
+Use the *Open / Skipped Questions* input. Each entry as:
+- **<question id>** — <question text> _(reason still open: deferred / disagreed / insufficient info)_
+
+Write `_None._` if every question was answered.
+
+## 6. Technology Stack
+- **Explicit (stated by client):** comma-separated list from scanned requirements
+- **Implied / recommended:** items the user confirmed in answers but not in the original doc
+- **Integrations:** external systems / APIs from scanned requirements
+
+## 7. Known Risks
+| Tech / Area | Risk | Severity | Mitigation |
+|-------------|------|----------|------------|
+| ... | ... | critical/high/medium/low | ... |
+
+Pull from blind spots input (technology_risks + red_flags). Severity must come from the input.
+
+## 8. Source & Traceability Notes
+- Brief 1–2 line note describing what the source documents covered.
+- If `additional_context` was provided, note "Additional client/team context was attached" (do not paste it).
+
+---
+
+_This document represents the user-confirmed requirements baseline. The full 9-agent pipeline will
+ground its analysis in this document. Edit before approval to lock the scope._
 """

@@ -47,6 +47,14 @@ api.interceptors.response.use(
   async error => {
     const original = error.config;
 
+    if (error.response?.status === 402) {
+      const detail = error.response.data?.detail;
+      if (detail && typeof detail === 'object' && detail.limit_type) {
+        window.dispatchEvent(new CustomEvent('billing:limit-hit', { detail }));
+      }
+      return Promise.reject(error);
+    }
+
     if (error.response?.status !== 401 || original._retry) {
       return Promise.reject(error);
     }

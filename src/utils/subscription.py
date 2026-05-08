@@ -59,17 +59,43 @@ def get_user_subscription(user_id: str, db: Session) -> models.User:
     return _get_user(user_id, db)
 
 
+def _current_period_bounds(user: models.User, now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """
+    Period boundaries used by both chat-creation counting and regen tracking.
+    Paid users: anchored to subscription_period_end (Stripe billing cycle, ~one month back).
+    Free / lapsed users: calendar month.
+    Single source for period math so chat and regen limits roll over together.
+    """
+    now = now or datetime.now(timezone.utc)
+    if user.subscription_period_end and user.subscription_period_end > now:
+        period_end = user.subscription_period_end
+        month = period_end.month - 1 or 12
+        year = period_end.year if period_end.month > 1 else period_end.year - 1
+        period_start = period_end.replace(year=year, month=month)
+        return period_start, period_end
+    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if now.month == 12:
+        period_end = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        period_end = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return period_start, period_end
+
+
 def check_chat_limit(user_id: str, db: Session) -> None:
-    """Raise HTTP 402 if the user has reached their active chat limit."""
+    """
+    Raise HTTP 402 if the user has created their plan's allotment of chats this billing period.
+    Period-based (not workspace-state) so archive-and-recreate cannot bypass the limit.
+    """
     user = _get_user(user_id, db)
     limits = _limits_for(user)
     if limits["max_chats"] is None:
         return
+    period_start, _ = _current_period_bounds(user)
     count = (
         db.query(models.ChatHistory)
         .filter(
             models.ChatHistory.user_id == user_id,
-            models.ChatHistory.active_tag == True,
+            models.ChatHistory.created_at >= period_start,
         )
         .count()
     )
@@ -77,7 +103,7 @@ def check_chat_limit(user_id: str, db: Session) -> None:
         raise HTTPException(
             status_code=402,
             detail={
-                "error": "Chat limit reached. Upgrade your plan to create more chats.",
+                "error": "Project limit for this billing period reached. Upgrade to create more.",
                 "limit_type": "max_chats",
                 "current": count,
                 "limit": limits["max_chats"],
@@ -134,20 +160,7 @@ def get_or_create_usage_period(user_id: str, db: Session) -> models.UsageTrackin
     if row:
         return row
 
-    # Determine billing period boundaries
-    if user.subscription_period_end and user.subscription_period_end > now:
-        period_end = user.subscription_period_end
-        # One month back from period_end
-        month = period_end.month - 1 or 12
-        year = period_end.year if period_end.month > 1 else period_end.year - 1
-        period_start = period_end.replace(year=year, month=month)
-    else:
-        # Calendar month for free-tier users
-        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        if now.month == 12:
-            period_end = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-        else:
-            period_end = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    period_start, period_end = _current_period_bounds(user, now)
 
     row = models.UsageTracking(
         user_id=user_id,
@@ -231,9 +244,13 @@ def get_usage_summary(user_id: str, db: Session) -> dict:
     """Return full subscription + usage info for the billing endpoint."""
     from models import ChatHistory
     user = _get_user(user_id, db)
+    period_start, _ = _current_period_bounds(user)
     chat_count = (
         db.query(ChatHistory)
-        .filter(ChatHistory.user_id == user_id, ChatHistory.active_tag == True)
+        .filter(
+            ChatHistory.user_id == user_id,
+            ChatHistory.created_at >= period_start,
+        )
         .count()
     )
     usage = get_or_create_usage_period(user_id, db)

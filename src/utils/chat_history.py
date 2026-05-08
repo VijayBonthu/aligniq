@@ -308,6 +308,8 @@ async def get_single_user_chat_history(user_id:str, chat_history_id:str, db:Sess
             full_history["title"] = user_chat_details.title
             full_history["modified_at"] = user_chat_details.modified_at
             full_history["message"] = user_chat_details.message
+            # Per-chat counter so the UI can render "X / Y messages used".
+            full_history["message_count"] = user_chat_details.message_count or 0
             # Get analysis mode (presales vs full) from AnalysisLink
             analysis_info = get_analysis_mode(chat_history_id, db)
             full_history["analysis_mode"] = analysis_info.get("analysis_mode", "full")

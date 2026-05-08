@@ -38,7 +38,7 @@ const SignupPage: React.FC = () => {
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    if (isAuthenticated && step !== 3) navigate('/dashboard', { replace: true });
+    if (isAuthenticated && step !== 3) navigate('/projects', { replace: true });
   }, [isAuthenticated, navigate, step]);
 
   const strength = passwordStrength(password);
@@ -51,7 +51,7 @@ const SignupPage: React.FC = () => {
       window.removeEventListener('message', handler);
       popup?.close();
       const success = await login(event.data.access_token, event.data.refresh_token);
-      if (success) navigate('/dashboard');
+      if (success) navigate('/projects');
       else setError('Authentication failed.');
     };
     window.addEventListener('message', handler);
@@ -205,9 +205,9 @@ const SignupPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-primary auth-submit btn-lg"
-                onClick={() => navigate('/dashboard')}
+                onClick={() => navigate('/projects')}
               >
-                Go to dashboard →
+                Go to projects →
               </button>
             </div>
           )}

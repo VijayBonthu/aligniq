@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { isAxiosError } from 'axios';
 import { toast } from 'react-hot-toast';
 import * as marked from 'marked';
@@ -8,7 +8,7 @@ import { useAuth } from '../context/AuthContext';
 import { useStreamingChat } from '../hooks/useStreamingChat';
 import api from '../services/api';
 import * as conversationService from '../services/conversationService';
-import { createCheckoutSession } from '../services/billingService';
+import * as presalesService from '../services/presalesService';
 import type {
   Conversation, Message, GroupedConversations, ConversationMetadata,
   P1Blocker, KickstartQuestion, ReadinessResult, Assumption,
@@ -19,8 +19,53 @@ const API_URL = import.meta.env.VITE_API_URL;
 const USE_STREAMING = import.meta.env.VITE_USE_STREAMING === 'true';
 
 // ── Markdown helper ──────────────────────────────────────────────────────────
+// Box-drawing + common ASCII-art glyphs. If a paragraph has 2+ such lines,
+// we treat it as a diagram and wrap in a fenced code block so the prose CSS
+// renders it with monospace + white-space: pre + horizontal scroll.
+const ASCII_GLYPH_RE = /[─│┌┐└┘├┤┬┴┼╔╗╚╝║═╠╣╦╩╬▲▼◆●○]|[-+|]{3,}/;
+
+const wrapAsciiArt = (md: string): string => {
+  const lines = md.split('\n');
+  const out: string[] = [];
+  let buf: string[] = [];
+  let inFence = false;
+
+  const flush = () => {
+    if (buf.length === 0) return;
+    const matchCount = buf.filter(l => ASCII_GLYPH_RE.test(l)).length;
+    // Heuristic: at least 2 ascii lines AND ≥40% of the block.
+    if (matchCount >= 2 && matchCount / buf.length >= 0.4) {
+      out.push('```ascii');
+      out.push(...buf);
+      out.push('```');
+    } else {
+      out.push(...buf);
+    }
+    buf = [];
+  };
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      flush();
+      out.push(line);
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) { out.push(line); continue; }
+    if (line.trim() === '') {
+      flush();
+      out.push(line);
+    } else {
+      buf.push(line);
+    }
+  }
+  flush();
+  return out.join('\n');
+};
+
 const sanitizeMarkdown = (content: string): string => {
-  const raw = marked.parse(content);
+  const prepared = wrapAsciiArt(content);
+  const raw = marked.parse(prepared);
   return DOMPurify.sanitize(typeof raw === 'string' ? raw : String(raw));
 };
 
@@ -223,8 +268,9 @@ const Sidebar: React.FC<{
 
 // ── Main Dashboard ───────────────────────────────────────────────────────────
 const Dashboard: React.FC = () => {
-  const { isAuthenticated, logout, subscription, refreshSubscription } = useAuth();
+  const { isAuthenticated, logout, subscription, refreshSubscription, showLimitHit } = useAuth();
   const navigate = useNavigate();
+  const { chatHistoryId: urlChatHistoryId } = useParams<{ chatHistoryId?: string }>();
 
   // Core state
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
@@ -262,10 +308,6 @@ const Dashboard: React.FC = () => {
     can_generate_report: boolean;
   } | null>(null);
   const [showReadinessModal, setShowReadinessModal] = useState(false);
-
-  // Upgrade modal
-  const [upgradeModal, setUpgradeModal] = useState<{ tier: 'basic' | 'plus' } | null>(null);
-  const [isCheckingOut, setIsCheckingOut] = useState(false);
 
   // Streaming
   const { isStreaming, currentTool, toolStatus, thinkingMessage, toolsUsed, streamChat, cancelStream } = useStreamingChat();
@@ -317,6 +359,7 @@ const Dashboard: React.FC = () => {
     setAdditionalContext('');
     setShowKickstartPanel(false);
     setAnalysisResult(null);
+    if (urlChatHistoryId) navigate('/dashboard', { replace: true });
   };
 
   const handleSelectConversation = useCallback(async (chatHistoryId: string) => {
@@ -343,27 +386,57 @@ const Dashboard: React.FC = () => {
         presales_id: details.presales_id,
       };
 
-      if (conv.analysis_mode === 'presales' && conv.presales_id) {
-        const presalesResp = await api.get(`/presales/${conv.presales_id}`);
-        if (presalesResp.data?.presales_analysis) {
-          const pa = presalesResp.data.presales_analysis;
-          conv.p1_blockers = pa.p1_blockers || [];
-          conv.kickstart_questions = pa.kickstart_questions || [];
-          conv.blind_spots = pa.blind_spots;
+      let restoredAnswers: Record<string, string> = {};
+      if (conv.analysis_mode === 'presales' && conv.presales_id && conv.document_id) {
+        try {
+          const [briefResp, questionsResp] = await Promise.all([
+            api.get(`/presales/${conv.document_id}`),
+            presalesService.getQuestions(conv.presales_id),
+          ]);
+          const brief = briefResp.data;
+          if (brief) {
+            conv.p1_blockers = brief.p1_blockers || [];
+            conv.kickstart_questions = brief.kickstart_questions || [];
+            conv.blind_spots = brief.blind_spots;
+          }
+          const qs: Array<{ question_number?: string; answer?: string | null }> =
+            questionsResp?.questions || [];
+          for (const q of qs) {
+            if (!q.answer) continue;
+            const num = (q.question_number || '').trim().toUpperCase();
+            if (num.startsWith('P1-')) {
+              const n = parseInt(num.slice(3), 10);
+              if (Number.isFinite(n) && n >= 1) restoredAnswers[`p1_${n - 1}`] = q.answer;
+            } else if (num.startsWith('Q')) {
+              const n = parseInt(num.slice(1), 10);
+              if (Number.isFinite(n) && n >= 1) restoredAnswers[`question_${n - 1}`] = q.answer;
+            }
+          }
+        } catch (e) {
+          console.error('Failed to load presales details', e);
+          toast.error('Could not load saved questions/answers');
         }
       }
 
       setActiveConversation(conv);
       setShowUploadUI(false);
-      setKickstartAnswers({});
+      setKickstartAnswers(restoredAnswers);
+      if (conv.analysis_mode === 'presales') setShowKickstartPanel(true);
 
       if (isMobile) setSidebarExpanded(false);
     } catch {
       toast.error('Failed to load conversation');
+      navigate('/projects', { replace: true });
     } finally {
       setIsLoadingConversation(false);
     }
-  }, [isMobile]);
+  }, [isMobile, navigate]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !urlChatHistoryId) return;
+    if (activeConversation?.chat_history_id === urlChatHistoryId) return;
+    handleSelectConversation(urlChatHistoryId);
+  }, [isAuthenticated, urlChatHistoryId, activeConversation?.chat_history_id, handleSelectConversation]);
 
   const handleDeleteConversation = async (chatId: string) => {
     try {
@@ -402,13 +475,15 @@ const Dashboard: React.FC = () => {
   const handleUpload = async () => {
     if (files.length === 0) { setError('Please select a file to upload'); return; }
 
-    // Check free tier limit
-    if (subscription?.tier === 'free' && subscription.limits.max_chats !== null) {
-      const chatCount = subscription.usage.chats;
-      if (chatCount >= (subscription.limits.max_chats || 5)) {
-        setUpgradeModal({ tier: 'basic' });
-        return;
-      }
+    // Pre-flight chat limit check (UX only — backend is source of truth)
+    if (subscription && subscription.limits.max_chats !== null
+        && subscription.usage.chats >= subscription.limits.max_chats) {
+      showLimitHit({
+        limit_type: 'max_chats',
+        current: subscription.usage.chats,
+        limit: subscription.limits.max_chats,
+      });
+      return;
     }
 
     setIsUploading(true);
@@ -459,11 +534,12 @@ const Dashboard: React.FC = () => {
       await fetchConversations();
     } catch (err) {
       if (isAxiosError(err)) {
-        const detail = err.response?.data?.detail || '';
-        if (err.response?.status === 429 || detail.includes('limit')) {
-          setUpgradeModal({ tier: 'basic' });
+        // 402 quota errors are handled globally via the billing:limit-hit event.
+        if (err.response?.status === 402) {
+          // No-op: global UpgradeModal will appear.
         } else {
-          setError(detail || 'Upload failed. Please try again.');
+          const detail = err.response?.data?.detail;
+          setError(typeof detail === 'string' ? detail : 'Upload failed. Please try again.');
         }
       } else {
         setError('Upload failed. Please try again.');
@@ -550,8 +626,10 @@ const Dashboard: React.FC = () => {
         setActiveConversation(prev => prev ? { ...prev, messages: [...prev.messages, assistantMsg] } : prev);
         await fetchConversations();
       } catch (err) {
-        if (isAxiosError(err) && err.response?.status === 429) setUpgradeModal({ tier: 'basic' });
-        else toast.error('Failed to send message');
+        // 402 quota errors are handled by the global UpgradeModal.
+        if (!(isAxiosError(err) && err.response?.status === 402)) {
+          toast.error('Failed to send message');
+        }
       } finally {
         setIsSendingMessage(false);
       }
@@ -584,28 +662,85 @@ const Dashboard: React.FC = () => {
   };
 
   // ── Presales analysis ──
+  // Build the frontend-keyed answers object (p1_0, question_0, ...) — the
+  // backend maps these to question IDs in services.py:save_question_answers().
+  const collectFrontendAnswers = (): Record<string, string> => {
+    const answers: Record<string, string> = {};
+    (activeConversation?.p1_blockers || []).forEach((_, i) => {
+      const v = kickstartAnswers[`p1_${i}`];
+      if (v && v.trim()) answers[`p1_${i}`] = v;
+    });
+    (activeConversation?.kickstart_questions || []).forEach((_, i) => {
+      const v = kickstartAnswers[`question_${i}`];
+      if (v && v.trim()) answers[`question_${i}`] = v;
+    });
+    return answers;
+  };
+
   const handleSaveAndAnalyze = async () => {
     if (!activeConversation?.presales_id) return;
     setIsAnalyzing(true);
 
     try {
-      const answers: Record<string, string> = {};
-      (activeConversation.p1_blockers || []).forEach((_, i) => {
-        if (kickstartAnswers[`p1_${i}`]) answers[`P1-${i + 1}`] = kickstartAnswers[`p1_${i}`];
-      });
-      (activeConversation.kickstart_questions || []).forEach((_, i) => {
-        if (kickstartAnswers[`question_${i}`]) answers[`Q${i + 1}`] = kickstartAnswers[`question_${i}`];
-      });
+      const answers = collectFrontendAnswers();
 
-      await api.post(`/presales/${activeConversation.presales_id}/questions/answers`, { answers });
-      const analyzeResp = await api.post(`/presales/${activeConversation.presales_id}/analyze`);
+      // Skip the save call entirely when nothing is filled — the analyze
+      // endpoint will auto-generate assumptions for every unanswered question.
+      if (Object.keys(answers).length > 0) {
+        await presalesService.saveAnswers(activeConversation.presales_id, answers);
+      }
 
-      setAnalysisResult(analyzeResp.data);
+      const data = await presalesService.analyze(activeConversation.presales_id);
+
+      setAnalysisResult(data);
       setShowReadinessModal(true);
-    } catch {
-      toast.error('Analysis failed. Please try again.');
+    } catch (err) {
+      const detail = isAxiosError(err) ? err.response?.data?.detail : null;
+      toast.error(typeof detail === 'string' ? detail : 'Analysis failed. Please try again.');
     } finally {
       setIsAnalyzing(false);
+    }
+  };
+
+  // Map assumption question IDs (P1-1, Q4, case-insensitive) back to the
+  // frontend keys used by kickstartAnswers (p1_0, question_3). Preserves any
+  // text the user has already typed by appending on a new line.
+  const handleApplyAssumptions = (assumptions: Assumption[]) => {
+    if (!assumptions || assumptions.length === 0) {
+      toast('No assumptions to apply');
+      return;
+    }
+
+    const next: Record<string, string> = { ...kickstartAnswers };
+    let applied = 0;
+
+    for (const a of assumptions) {
+      const qid = (a.for_question_id || '').toLowerCase();
+      let key: string | null = null;
+
+      if (qid.startsWith('p1-')) {
+        const n = parseInt(qid.replace('p1-', ''), 10);
+        if (!isNaN(n) && n > 0) key = `p1_${n - 1}`;
+      } else if (qid.startsWith('q')) {
+        const n = parseInt(qid.replace('q', ''), 10);
+        if (!isNaN(n) && n > 0) key = `question_${n - 1}`;
+      }
+      if (!key) continue;
+
+      const current = next[key] || '';
+      const tagged = `[SYSTEM ASSUMPTION] ${a.assumption}`;
+      next[key] = current.trim() === '' ? tagged : `${current}\n\n${tagged}`;
+      applied++;
+    }
+
+    setKickstartAnswers(next);
+    setShowReadinessModal(false);
+    setShowKickstartPanel(true);
+
+    if (applied > 0) {
+      toast.success(`Applied ${applied} assumption${applied === 1 ? '' : 's'}. Review and click Save & Analyse again when ready.`);
+    } else {
+      toast.error('Could not map assumptions to any question fields.');
     }
   };
 
@@ -615,43 +750,26 @@ const Dashboard: React.FC = () => {
     setShowReadinessModal(false);
 
     try {
-      const answers: Record<string, string> = {};
-      (activeConversation.p1_blockers || []).forEach((_, i) => {
-        if (kickstartAnswers[`p1_${i}`]) answers[`P1-${i + 1}`] = kickstartAnswers[`p1_${i}`];
-      });
-      (activeConversation.kickstart_questions || []).forEach((_, i) => {
-        if (kickstartAnswers[`question_${i}`]) answers[`Q${i + 1}`] = kickstartAnswers[`question_${i}`];
-      });
+      const answers = collectFrontendAnswers();
+      const assumptions = analysisResult?.assumptions || [];
 
-      const resp = await api.post('/generate-full-report/', {
-        presales_id: activeConversation.presales_id,
-        user_answers: answers,
-        assumptions: analysisResult?.assumptions || [],
-        additional_context: additionalContext,
-      });
+      const data = await presalesService.generatePresalesReport(
+        activeConversation.presales_id,
+        Object.keys(answers).length > 0 ? JSON.stringify(answers) : undefined,
+        assumptions.length > 0 ? JSON.stringify(assumptions) : undefined,
+        additionalContext.trim() || undefined,
+      );
 
-      const content = resp.data?.report_content || resp.data?.message || '';
+      const content = data?.report || '';
       const assistantMsg: Message = { role: 'assistant', content, timestamp: new Date().toISOString() };
       setActiveConversation(prev => prev ? { ...prev, messages: [...(prev.messages || []), assistantMsg], analysis_mode: 'full' } : prev);
       await fetchConversations();
       toast.success('Full report generated!');
-    } catch {
-      toast.error('Report generation failed. Please try again.');
+    } catch (err) {
+      const detail = isAxiosError(err) ? err.response?.data?.detail : null;
+      toast.error(typeof detail === 'string' ? detail : 'Report generation failed. Please try again.');
     } finally {
       setIsProcessing(false);
-    }
-  };
-
-  // ── Checkout ──
-  const handleUpgrade = async (tier: 'basic' | 'plus') => {
-    setIsCheckingOut(true);
-    try {
-      const { checkout_url } = await createCheckoutSession(tier);
-      window.location.href = checkout_url;
-    } catch {
-      toast.error('Could not start checkout. Please try again.');
-    } finally {
-      setIsCheckingOut(false);
     }
   };
 
@@ -703,24 +821,66 @@ const Dashboard: React.FC = () => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            padding: '0 16px',
+            padding: '0 18px',
             background: 'var(--surface)',
+            gap: 12,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {activeConversation && (
-              <span style={{ fontSize: 14, color: 'var(--fg-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 300 }}>
-                {activeConversation.title}
-              </span>
-            )}
-            {isPresales && (
-              <span className="badge badge-accent" style={{ fontSize: 10 }}>PRESALES</span>
-            )}
-            {isFull && (
-              <span className="badge badge-ok" style={{ fontSize: 10 }}>FULL REPORT</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, flex: 1 }}>
+            <button
+              onClick={() => navigate('/projects')}
+              title="Back to projects"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: 'var(--fg-muted)', padding: '4px 6px', borderRadius: 6,
+                fontSize: 13, fontFamily: 'inherit', transition: 'color 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = 'var(--fg)'}
+              onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = 'var(--fg-muted)'}
+            >
+              <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              Projects
+            </button>
+            <div style={{ width: 1, height: 18, background: 'var(--border)', flexShrink: 0 }} />
+            {activeConversation ? (
+              <>
+                <span
+                  style={{
+                    fontSize: 14, color: 'var(--fg)', fontWeight: 500,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    minWidth: 0,
+                  }}
+                  title={activeConversation.title}
+                >
+                  {activeConversation.title}
+                </span>
+                {(isPresales || isFull) && (
+                  <span
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      fontFamily: 'var(--font-mono)', fontSize: 9,
+                      letterSpacing: '0.08em', textTransform: 'uppercase',
+                      color: isFull ? 'var(--ok)' : 'var(--accent)',
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 6, height: 6, borderRadius: '50%',
+                        background: isFull ? 'var(--ok)' : 'var(--accent)',
+                        animation: isPresales ? 'pulse 2s ease-in-out infinite' : undefined,
+                      }}
+                    />
+                    {isFull ? 'Full report' : 'Presales'}
+                  </span>
+                )}
+              </>
+            ) : (
+              <span style={{ fontSize: 14, color: 'var(--fg-muted)' }}>New analysis</span>
             )}
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
             {subscription && (
               <span className="label-mono" style={{ fontSize: 9, color: 'var(--fg-muted)' }}>
                 {subscription.tier.toUpperCase()} · {subscription.usage.chats}/{subscription.limits.max_chats ?? '∞'} chats
@@ -728,9 +888,9 @@ const Dashboard: React.FC = () => {
             )}
             {subscription?.tier === 'free' && (
               <button
-                onClick={() => setUpgradeModal({ tier: 'basic' })}
+                onClick={() => navigate('/pricing')}
                 className="btn btn-primary"
-                style={{ padding: '4px 10px', fontSize: 11 }}
+                style={{ padding: '4px 12px', fontSize: 11 }}
               >
                 Upgrade
               </button>
@@ -869,32 +1029,36 @@ const Dashboard: React.FC = () => {
                     Loading…
                   </div>
                 ) : (
-                  <div style={{ maxWidth: 800, margin: '0 auto', padding: '0 16px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  <div style={{ maxWidth: 780, margin: '0 auto', padding: '4px 28px', display: 'flex', flexDirection: 'column', gap: 14 }}>
                     {(activeConversation?.messages || []).map((msg, i) => {
                       const isUser = msg.role === 'user';
                       const isLastAssistant = !isUser && i === (activeConversation?.messages?.length || 0) - 1;
                       const showStreaming = isLastAssistant && (isStreaming || isSendingMessage);
 
                       return (
-                        <div key={i} style={{ display: 'flex', gap: 12, flexDirection: isUser ? 'row-reverse' : 'row' }}>
+                        <div
+                          key={i}
+                          className="animate-fade-up"
+                          style={{ display: 'flex', gap: 10, flexDirection: isUser ? 'row-reverse' : 'row', alignItems: 'flex-start' }}
+                        >
                           {/* avatar */}
                           <div
                             style={{
-                              width: 32, height: 32, borderRadius: '50%', flexShrink: 0,
+                              width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
                               background: isUser ? 'var(--accent-soft)' : 'var(--surface-2)',
                               border: `1px solid ${isUser ? 'rgba(255,138,101,0.3)' : 'var(--border)'}`,
                               display: 'flex', alignItems: 'center', justifyContent: 'center',
-                              fontSize: 12, color: isUser ? 'var(--accent)' : 'var(--fg-muted)',
-                              fontWeight: 600,
+                              fontSize: 11, color: isUser ? 'var(--accent)' : 'var(--fg-muted)',
+                              fontWeight: 600, marginTop: 2,
                             }}
                           >
                             {isUser ? 'U' : 'A'}
                           </div>
 
-                          {/* bubble */}
+                          {/* bubble — min-width: 0 is critical so <pre> blocks scroll horizontally instead of squishing */}
                           <div
                             style={{
-                              maxWidth: '75%',
+                              maxWidth: '82%', minWidth: 0,
                               padding: '10px 14px',
                               borderRadius: isUser ? '12px 4px 12px 12px' : '4px 12px 12px 12px',
                               background: isUser ? 'var(--accent-soft)' : 'var(--surface)',
@@ -925,9 +1089,9 @@ const Dashboard: React.FC = () => {
 
                     {/* streaming empty placeholder */}
                     {(isStreaming || isSendingMessage) && !activeConversation?.messages?.some(m => m.role === 'assistant') && (
-                      <div style={{ display: 'flex', gap: 12 }}>
-                        <div style={{ width: 32, height: 32, borderRadius: '50%', flexShrink: 0, background: 'var(--surface-2)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, color: 'var(--fg-muted)', fontWeight: 600 }}>A</div>
-                        <div style={{ padding: '10px 14px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '4px 12px 12px 12px' }}>
+                      <div className="animate-fade-up" style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                        <div style={{ width: 28, height: 28, borderRadius: '50%', flexShrink: 0, background: 'var(--surface-2)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--fg-muted)', fontWeight: 600, marginTop: 2 }}>A</div>
+                        <div style={{ padding: '10px 14px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '4px 12px 12px 12px', minWidth: 0 }}>
                           <StreamingMsg content="" isStreaming thinkingMessage={thinkingMessage} currentTool={currentTool} toolStatus={toolStatus} />
                         </div>
                       </div>
@@ -1085,7 +1249,7 @@ const Dashboard: React.FC = () => {
                     </button>
                   )}
                 </div>
-                <p style={{ textAlign: 'center', fontSize: 11, color: 'var(--fg-muted)', marginTop: 6 }}>
+                <p style={{ textAlign: 'center', fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: '0.1em', color: 'var(--fg-muted)', marginTop: 8, textTransform: 'uppercase' }}>
                   Enter to send · Shift+Enter for new line
                 </p>
               </div>
@@ -1135,12 +1299,18 @@ const Dashboard: React.FC = () => {
                 </div>
               )}
 
-              {analysisResult.assumptions.length > 0 && (
+              {analysisResult.assumptions.length > 0 ? (
                 <div>
-                  <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', margin: '0 0 8px' }}>Assumptions to be made ({analysisResult.assumptions.length})</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+                    <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', margin: 0 }}>Assumptions to be made ({analysisResult.assumptions.length})</p>
+                    <p className="label-mono" style={{ fontSize: 9, color: 'var(--fg-muted)', margin: 0 }}>System-generated</p>
+                  </div>
+                  <p style={{ fontSize: 12, color: 'var(--fg-dim)', margin: '0 0 10px', lineHeight: 1.5 }}>
+                    The system generated these assumptions for unanswered questions. Apply them to prefill the form, edit as needed, then re-run Save &amp; Analyse.
+                  </p>
                   {analysisResult.assumptions.map((a, i) => (
-                    <div key={i} style={{ padding: '10px 12px', background: 'var(--accent-soft2)', border: '1px solid rgba(255,138,101,0.1)', borderRadius: 8, marginBottom: 6, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                      <div>
+                    <div key={i} style={{ padding: '10px 12px', background: 'var(--accent-soft)', border: '1px solid rgba(255,138,101,0.18)', borderRadius: 8, marginBottom: 6, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                      <div style={{ minWidth: 0 }}>
                         <p style={{ margin: '0 0 2px', fontSize: 13, color: 'var(--fg)' }}>{a.assumption}</p>
                         <p style={{ margin: 0, fontSize: 11, color: 'var(--fg-muted)' }}>For: {a.for_question_id}</p>
                       </div>
@@ -1150,10 +1320,23 @@ const Dashboard: React.FC = () => {
                     </div>
                   ))}
                 </div>
+              ) : (
+                <p style={{ margin: 0, fontSize: 13, color: 'var(--fg-muted)', lineHeight: 1.5 }}>
+                  No assumptions needed — your answers covered every question.
+                </p>
               )}
             </div>
-            <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end', flexShrink: 0 }}>
+            <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, justifyContent: 'flex-end', flexShrink: 0, flexWrap: 'wrap' }}>
               <button onClick={() => setShowReadinessModal(false)} className="btn btn-ghost" style={{ fontSize: 13 }}>Back to Edit</button>
+              {analysisResult.assumptions.length > 0 && (
+                <button
+                  onClick={() => handleApplyAssumptions(analysisResult.assumptions)}
+                  className="btn btn-ghost"
+                  style={{ fontSize: 13, borderColor: 'var(--accent)', color: 'var(--accent)' }}
+                >
+                  Apply {analysisResult.assumptions.length} Assumption{analysisResult.assumptions.length === 1 ? '' : 's'}
+                </button>
+              )}
               {analysisResult.contradictions.length === 0 && (
                 <button
                   onClick={handleGenerateFullReport}
@@ -1169,44 +1352,6 @@ const Dashboard: React.FC = () => {
         </div>
       )}
 
-      {/* ── Upgrade modal ── */}
-      {upgradeModal && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 50, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', padding: 16 }}>
-          <div style={{ background: 'var(--surface)', border: '1px solid rgba(255,138,101,0.3)', borderRadius: 16, width: '100%', maxWidth: 400, padding: 28 }}>
-            <div style={{ textAlign: 'center', marginBottom: 24 }}>
-              <div style={{ fontSize: 36, marginBottom: 12 }}>🚀</div>
-              <h3 className="font-display" style={{ fontSize: 22, fontWeight: 400, margin: '0 0 8px', color: 'var(--fg)' }}>Upgrade your plan</h3>
-              <p style={{ fontSize: 14, color: 'var(--fg-dim)', margin: 0 }}>
-                You've reached your free tier limit. Upgrade to unlock unlimited conversations and full reports.
-              </p>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <button
-                onClick={() => handleUpgrade('basic')}
-                disabled={isCheckingOut}
-                className="btn btn-primary"
-                style={{ justifyContent: 'center', padding: '12px', fontSize: 14, opacity: isCheckingOut ? 0.7 : 1 }}
-              >
-                {isCheckingOut ? 'Redirecting…' : 'Upgrade to Basic — $29/mo'}
-              </button>
-              <button
-                onClick={() => handleUpgrade('plus')}
-                disabled={isCheckingOut}
-                className="btn btn-ghost"
-                style={{ justifyContent: 'center', padding: '12px', fontSize: 14 }}
-              >
-                Upgrade to Plus — $79/mo
-              </button>
-              <button
-                onClick={() => setUpgradeModal(null)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--fg-muted)', fontSize: 13, padding: '6px', textAlign: 'center' }}
-              >
-                Maybe later
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

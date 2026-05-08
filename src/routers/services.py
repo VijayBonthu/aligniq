@@ -4,7 +4,7 @@ from typing import Optional
 import os
 import json
 from utils.token_generation import token_validator
-from utils.subscription import check_chat_limit, check_message_limit, check_regen_limit, increment_message_count, increment_regen_count
+from utils.subscription import check_chat_limit, check_message_limit, check_regen_limit, increment_message_count, increment_regen_count, get_usage_summary
 from utils.chat_history import save_chat_history, delete_chat_history, get_user_chat_history_details,get_single_user_chat_history, save_chat_with_doc, save_report_version
 from getdata import ExtractText
 from processdata import AccessLLM
@@ -126,7 +126,9 @@ from database_scripts import (
     resolve_pending_action,
     get_active_pending_actions,
     get_next_pending_action_id,
-    clear_pending_actions
+    clear_pending_actions,
+    # Projects overview aggregation
+    fetch_projects_overview,
 )
 from agents.agentic_workflow import main_report_summary, regenerate_report_sections
 import models
@@ -265,6 +267,10 @@ async def upload_file(
         For presales mode: Pre-sales brief with blockers, questions, risks
         For full mode: Comprehensive technical report
     """
+    # Plan enforcement: refuse before any S3/parse work so quota-exhausted users
+    # don't burn upload bandwidth or LLM cost. Period-based — see check_chat_limit.
+    check_chat_limit(current_token["regular_login_token"]["id"], db)
+
     entire_doc_details = []
     for content_document in file:
         file_content = b''
@@ -531,8 +537,18 @@ async def _run_presales_analysis(
     logger.info(f"Starting pre-sales analysis for document_id: {document_id}")
 
     try:
-        # Run the pre-sales pipeline
-        result = await run_presales_pipeline(document=raw_requirements, timeout=180)
+        # Pre-generate presales_id so initial-scan LLM rows can be tagged with it
+        # before save_presales_analysis runs. chat_history_id is created later in
+        # the flow (after the scan completes).
+        import uuid as _uuid
+        _presales_id_pre = str(_uuid.uuid4())
+        from utils.llm_metrics import LLMCallRecorder, use_recorder
+        _presales_recorder = LLMCallRecorder(
+            db=db, user_id=user_id, presales_id=_presales_id_pre,
+        )
+        with use_recorder(_presales_recorder):
+            # Run the pre-sales pipeline
+            result = await run_presales_pipeline(document=raw_requirements, timeout=180)
 
         if result.get("error"):
             logger.error(f"Pre-sales pipeline failed: {result['error']}")
@@ -543,6 +559,7 @@ async def _run_presales_analysis(
 
         # Save pre-sales analysis to database
         presales_data = {
+            "presales_id": _presales_id_pre,
             "document_id": document_id,
             "user_id": user_id,
             "scanned_requirements": result.get("scanned_requirements"),
@@ -674,280 +691,359 @@ async def _run_presales_analysis(
 # PRE-SALES API ENDPOINTS
 # =============================================================================
 
-@router.post("/generate-full-report/")
-async def generate_full_report_from_presales(
+@router.post("/generate-presales-report/")
+async def generate_presales_report(
     presales_id: str = Form(...),
-    user_answers: Optional[str] = Form(default=None),  # JSON string of answers to kickstart questions
-    assumptions: Optional[str] = Form(default=None),  # JSON string of assumptions from readiness analysis
-    additional_context: Optional[str] = Form(default=None),  # Free-form additional context from user
+    user_answers: Optional[str] = Form(default=None),       # JSON string of answers to kickstart questions
+    assumptions: Optional[str] = Form(default=None),        # JSON string of assumptions from readiness analysis
+    additional_context: Optional[str] = Form(default=None), # Free-form additional context from user
     current_token: dict = Depends(token_validator),
     db: Session = Depends(get_db)
 ):
     """
-    Generate a full comprehensive report from a pre-sales analysis.
+    Generate the SHORT presales-style brief that defines the requirements
+    feeding the (later, async) 9-agent full pipeline.
 
-    This endpoint triggers the full agent pipeline using the pre-sales
-    analysis as context, along with any user-provided answers to kickstart questions.
-    If assumptions are provided (from readiness analysis), the report will clearly
-    distinguish between confirmed information and assumptions made.
-
-    Args:
-        presales_id: ID of the pre-sales analysis to build upon
-        user_answers: JSON string of answers to kickstart questions
-        assumptions: JSON string of assumptions list from readiness analysis
-        additional_context: Free-form text with additional requirements, client notes, etc.
-
-    Returns:
-        Full technical report with chat_history_id
+    Always synchronous (~2-3 min) — uses ``generate_report_with_assumptions``
+    so confirmed answers and assumptions are clearly distinguished. Saves the
+    output to chat_history with ``type='presales_brief'`` (NOT 'full_report')
+    and does NOT mark ``analysis_link.full_report_generated``. The full
+    pipeline is started later via ``POST /full-pipeline/start``.
     """
     user_id = current_token["regular_login_token"]["id"]
     check_regen_limit(user_id, db)
-    logger.info(f"Generating full report from presales_id: {presales_id}")
+    logger.info(f"Generating presales brief for presales_id: {presales_id}")
 
     try:
-        # Get the pre-sales analysis
         presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
-
         if not presales:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Pre-sales analysis not found: {presales_id}"
+                detail=f"Pre-sales analysis not found: {presales_id}",
             )
 
-        # Parse user answers if provided
-        answers_dict = None
+        # Persist user answers (if any) so /full-pipeline/start can read the same context.
         if user_answers:
             try:
                 answers_dict = json.loads(user_answers)
-                # Save user answers
-                await save_user_answers(
-                    presales_id=presales_id,
-                    user_answers=answers_dict,
-                    db=db
-                )
-                logger.info(f"Saved user answers for presales_id: {presales_id}")
+                await save_user_answers(presales_id=presales_id, user_answers=answers_dict, db=db)
             except json.JSONDecodeError as e:
-                logger.warning(f"Invalid user_answers JSON: {str(e)}")
+                logger.warning(f"Invalid user_answers JSON: {e}")
 
-        # Parse assumptions if provided
         assumptions_list = []
         if assumptions:
             try:
                 assumptions_list = json.loads(assumptions)
-                logger.info(f"Received {len(assumptions_list)} assumptions for report generation")
             except json.JSONDecodeError as e:
-                logger.warning(f"Invalid assumptions JSON: {str(e)}")
+                logger.warning(f"Invalid assumptions JSON: {e}")
 
-        # Log additional context if provided
-        if additional_context:
-            logger.info(f"Received additional context ({len(additional_context)} chars) for report generation")
-
-        # Get questions with answers
         questions = await get_presales_questions(presales_id, user_id, db)
-
-        # Get the analysis link
         analysis_link = await get_analysis_link(
-            document_id=presales["document_id"],
-            user_id=user_id,
-            db=db
+            document_id=presales["document_id"], user_id=user_id, db=db
         )
 
-        # If we have assumptions, use the assumptions-aware report generator
-        if assumptions_list:
-            logger.info(f"Generating report with {len(assumptions_list)} assumptions")
-
-            # Build document context
-            document_context = json.dumps(presales.get('extracted_requirements', {}))
-
-            # Generate report with assumptions
+        document_context = json.dumps(presales.get("extracted_requirements", {}))
+        from utils.llm_metrics import LLMCallRecorder, use_recorder
+        _existing_chat_id = analysis_link.get("chat_history_id") if analysis_link else None
+        _brief_recorder = LLMCallRecorder(
+            db=db, user_id=user_id,
+            chat_history_id=_existing_chat_id,
+            presales_id=presales_id,
+        )
+        with use_recorder(_brief_recorder):
             result = await generate_report_with_assumptions(
                 document=document_context,
-                scanned_requirements=presales.get('extracted_requirements', {}),
+                scanned_requirements=presales.get("extracted_requirements", {}),
                 confirmed_answers=questions,
                 assumptions_list=assumptions_list,
                 additional_context=additional_context,
-                timeout=180
+                blind_spots=presales.get("blind_spots") or {},
+                timeout=180,
+            )
+        if result.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Report generation failed: {result['error']}",
             )
 
-            if result.get("error"):
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Report generation failed: {result['error']}"
-                )
+        report_text = result["report"]
+        document_title = (
+            presales.get("extracted_requirements", {}).get("project_summary")
+            or "Presales Brief"
+        )[:100]
 
-            agent_response_message = result["report"]
-            logger.info(f"Report with assumptions generated: {result['confirmed_count']} confirmed, {result['assumptions_count']} assumed")
-
-        else:
-            # No assumptions - use original pipeline
-            # Build enhanced context from pre-sales output
-            additional_context_section = ""
-            if additional_context:
-                additional_context_section = f"""
-                                    ### Additional Context from Client/Team
-                                    {additional_context}
-                                    """
-
-            enhanced_context = f"""
-                                    ## Pre-Sales Analysis Context
-
-                                    ### Project Summary
-                                    {presales.get('extracted_requirements', {}).get('project_summary', 'N/A')}
-
-                                    ### Technologies Identified
-                                    {json.dumps(presales.get('extracted_requirements', {}).get('technologies_mentioned', []), indent=2)}
-
-                                    ### Blind Spots & Risks Identified
-                                    {json.dumps(presales.get('blind_spots', {}), indent=2)}
-
-                                    ### User-Provided Answers to Kickstart Questions
-                                    {json.dumps(answers_dict, indent=2) if answers_dict else 'No additional context provided'}
-                                    {additional_context_section}
-                                    ---
-
-                                    ## Original Document Content
-                                    (Note: Using pre-analyzed requirements for efficiency)
-                                    """
-
-            # Run the full agent pipeline with enhanced context
-            result = await run_agent_pipeline(document=[enhanced_context])
-            logger.info(f"Full agent pipeline completed for presales_id: {presales_id}")
-
-            if not result.get("message") or len(result["message"]) == 0:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Report generation failed: No report was generated"
-                )
-
-            # Get the final report content
-            final_message = result["message"][-1]
-            agent_response_message = final_message.content if hasattr(final_message, 'content') else str(final_message)
-
-        # Extract title
-        document_title = presales.get('extracted_requirements', {}).get('project_summary', 'Technical Analysis Report')[:100]
-
-        # Check if presales already has a chat_history_id (from when presales was created)
+        # Append (or create) the chat_history with this brief. type='presales_brief'
+        # so the future full_report message is a separate, identifiable entry.
         existing_chat_history_id = analysis_link.get("chat_history_id") if analysis_link else None
 
         if existing_chat_history_id:
-            # Presales already has a chat history - append full report to existing conversation
-            logger.info(f"Appending full report to existing chat_history: {existing_chat_history_id}")
-
-            # Get existing messages from the chat history
             existing_chat = await get_single_user_chat_history(
-                chat_history_id=existing_chat_history_id,
-                user_id=user_id,
-                db=db
+                chat_history_id=existing_chat_history_id, user_id=user_id, db=db
             )
+            existing_raw = existing_chat.get("message", []) if existing_chat else []
+            try:
+                existing_messages = (
+                    json.loads(existing_raw) if isinstance(existing_raw, str)
+                    else (existing_raw if isinstance(existing_raw, list) else [])
+                )
+            except json.JSONDecodeError:
+                existing_messages = []
 
-            existing_messages_raw = existing_chat.get("message", []) if existing_chat else []
-            # Parse JSON string if needed (database stores as JSON string)
-            if isinstance(existing_messages_raw, str):
-                try:
-                    existing_messages = json.loads(existing_messages_raw)
-                except json.JSONDecodeError:
-                    existing_messages = []
-            else:
-                existing_messages = existing_messages_raw if isinstance(existing_messages_raw, list) else []
-
-            # Append the full report message
-            updated_messages = existing_messages + [
-                {
-                    "role": "assistant",
-                    "content": agent_response_message,
-                    "timestamp": datetime.now().isoformat(),
-                    "type": "full_report",
-                    "selected": True
-                }
-            ]
-
-            # Update the chat history with appended message
-            updated_chat_data = {
-                "chat_history_id": existing_chat_history_id,
-                "user_id": user_id,
-                "document_id": presales["document_id"],
-                "message": updated_messages,
-                "title": document_title  # Update title to reflect full report
-            }
-
-            await save_chat_history(chat=updated_chat_data, db=db)
+            updated_messages = list(existing_messages) + [{
+                "role":      "assistant",
+                "content":   report_text,
+                "timestamp": datetime.now().isoformat(),
+                "type":      "presales_brief",
+                "selected":  True,
+            }]
+            await save_chat_history(
+                chat={
+                    "chat_history_id": existing_chat_history_id,
+                    "user_id":         user_id,
+                    "document_id":     presales["document_id"],
+                    "message":         updated_messages,
+                    "title":           document_title,
+                },
+                db=db,
+            )
             chat_history_id = existing_chat_history_id
-            logger.info(f"Appended full report to existing chat history: {chat_history_id}")
-
         else:
-            # No existing chat history (legacy presales) - create new one
-            logger.info(f"Creating new chat history for presales: {presales_id}")
-
             initial_chat_data = {
-                "user_id": user_id,
+                "user_id":     user_id,
                 "document_id": presales["document_id"],
-                "message": [
-                    {
-                        "role": "assistant",
-                        "content": agent_response_message,
-                        "timestamp": datetime.now().isoformat(),
-                        "type": "full_report",
-                        "selected": True
-                    }
-                ],
-                "title": document_title
+                "message": [{
+                    "role":      "assistant",
+                    "content":   report_text,
+                    "timestamp": datetime.now().isoformat(),
+                    "type":      "presales_brief",
+                    "selected":  True,
+                }],
+                "title": document_title,
             }
-
-            save_chat = await save_chat_history(chat=initial_chat_data, db=db)
-            chat_history_id = save_chat["chat_history_id"]
-            logger.info(f"Created new chat history: {chat_history_id}")
-
-        # Update analysis link with full report (marks as generated)
-        await update_analysis_link_with_full_report(
-            presales_id=presales_id,
-            chat_history_id=chat_history_id,
-            db=db
-        )
-
-        # Chunk and embed for vector DB
-        try:
-            final_report_chunks = await chunking.chunk_text(text=agent_response_message)
-            await vector_db.create_embeddings(
-                texts=final_report_chunks,
-                model=settings.EMBEDDING_MODEL,
-                chat_history_id=chat_history_id
-            )
-            logger.info(f"Created embeddings for chat_history_id: {chat_history_id}")
-        except Exception as e:
-            logger.error(f"Error creating embeddings: {str(e)}")
-
-        # Create summary (version 1 for initial generation)
-        try:
-            summary_report = await main_report_summary(main_report=agent_response_message, version_number=1)
-            summary_detail_report = {
-                "chat_history_id": chat_history_id,
-                "user_id": user_id,
-                "report_content": agent_response_message,
-                "summary_report": summary_report
-            }
-            await save_report_version(summary_report_details=summary_detail_report, db=db)
-            logger.info(f"Saved report version for chat_history_id: {chat_history_id}")
-        except Exception as e:
-            logger.error(f"Error saving report version: {str(e)}")
+            saved = await save_chat_history(chat=initial_chat_data, db=db)
+            chat_history_id = saved["chat_history_id"]
 
         increment_regen_count(user_id, db)
         return {
-            "message": agent_response_message,
-            "document_id": presales["document_id"],
-            "presales_id": presales_id,
+            "report":          report_text,
+            "document_id":     presales["document_id"],
+            "presales_id":     presales_id,
             "chat_history_id": chat_history_id,
-            "title": document_title,
-            "status": "completed"
+            "title":           document_title,
+            "status":          "completed",
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error generating full report: {str(e)}")
+        logger.error(f"Error generating presales report: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error generating full report: {str(e)}"
+            detail=f"Error generating presales report: {str(e)}",
         )
+
+
+@router.patch("/presales-report/{chat_history_id}")
+async def update_presales_report(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Overwrite the most recent ``presales_brief`` message in the given
+    chat_history with user-edited markdown. Used by the wizard's Review step
+    to let the user refine the Consolidated Requirements Document before
+    kicking off the full 9-agent pipeline.
+    """
+    user_id = current_token["regular_login_token"]["id"]
+    content = (payload or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="`content` (non-empty string) is required.",
+        )
+
+    chat = await get_single_user_chat_history(
+        chat_history_id=chat_history_id, user_id=user_id, db=db
+    )
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat history not found: {chat_history_id}",
+        )
+
+    raw_messages = chat.get("message", [])
+    try:
+        messages = (
+            json.loads(raw_messages) if isinstance(raw_messages, str)
+            else (raw_messages if isinstance(raw_messages, list) else [])
+        )
+    except json.JSONDecodeError:
+        messages = []
+
+    # Find the latest presales_brief message and rewrite its content in place.
+    target_idx = next(
+        (i for i in range(len(messages) - 1, -1, -1)
+         if isinstance(messages[i], dict) and messages[i].get("type") == "presales_brief"),
+        None,
+    )
+    if target_idx is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No presales_brief message exists in this chat to update.",
+        )
+
+    messages[target_idx] = {
+        **messages[target_idx],
+        "content": content,
+        "edited_at": datetime.now().isoformat(),
+        "edited_by_user": True,
+    }
+
+    await save_chat_history(
+        chat={
+            "chat_history_id": chat_history_id,
+            "user_id":         user_id,
+            "document_id":     chat.get("document_id"),
+            "message":         messages,
+            "title":           chat.get("title"),
+        },
+        db=db,
+    )
+
+    return {
+        "chat_history_id": chat_history_id,
+        "status":          "updated",
+        "edited_at":       messages[target_idx]["edited_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Full 9-agent pipeline — async start + status polling
+# ---------------------------------------------------------------------------
+
+@router.post("/full-pipeline/start", status_code=status.HTTP_202_ACCEPTED)
+async def start_full_pipeline(
+    background_tasks: BackgroundTasks,
+    chat_history_id: str = Form(...),
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Kick off the 9-agent pipeline asynchronously. Returns 202 immediately;
+    progress is tracked in pipeline_runs and polled via /full-pipeline/status.
+    """
+    from database_scripts import create_or_reset_pipeline_run, get_pipeline_run_by_chat
+    from agents.pipeline_runner import run_full_pipeline_async
+
+    user_id = current_token["regular_login_token"]["id"]
+    check_regen_limit(user_id, db)
+
+    # Verify the chat belongs to the user and find its presales context.
+    chat = await get_single_user_chat_history(
+        chat_history_id=chat_history_id, user_id=user_id, db=db
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat history not found")
+
+    document_id = chat.get("document_id")
+    if not document_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chat is missing document_id")
+
+    link = await get_analysis_link(document_id=document_id, user_id=user_id, db=db)
+    if not link or not link.get("presales_id"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No presales analysis linked to this chat — generate the presales brief first.",
+        )
+    presales_id = link["presales_id"]
+    presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
+    if not presales:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+
+    # Reject if a run is already in flight.
+    existing = await get_pipeline_run_by_chat(chat_history_id, db)
+    if existing and existing["status"] in ("queued", "running"):
+        return {
+            "run_id":          existing["run_id"],
+            "chat_history_id": chat_history_id,
+            "status":          existing["status"],
+            "current_stage":   existing["current_stage"],
+            "message":         "Pipeline already in progress",
+        }
+
+    # Build the document the pipeline runs on. Use the presales-derived
+    # requirements + the latest presales_brief message as input.
+    raw_messages = chat.get("message") or "[]"
+    try:
+        msgs = json.loads(raw_messages) if isinstance(raw_messages, str) else (raw_messages or [])
+    except json.JSONDecodeError:
+        msgs = []
+    presales_brief_text = ""
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("type") == "presales_brief":
+            presales_brief_text = m.get("content", "")
+            break
+
+    extracted = presales.get("extracted_requirements") or {}
+    blind_spots = presales.get("blind_spots") or {}
+    enhanced_context = (
+        "## Pre-Sales Analysis Context\n\n"
+        f"### Project Summary\n{extracted.get('project_summary', 'N/A')}\n\n"
+        f"### Technologies Identified\n{json.dumps(extracted.get('technologies_mentioned', []), indent=2)}\n\n"
+        f"### Blind Spots & Risks Identified\n{json.dumps(blind_spots, indent=2)}\n\n"
+        f"### Approved Presales Brief\n{presales_brief_text or '(brief not available — using extracted requirements only)'}\n"
+    )
+    title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
+
+    run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
+
+    # Schedule the long-running pipeline. BackgroundTasks runs after the
+    # response is sent and lives in the same FastAPI event loop.
+    background_tasks.add_task(
+        run_full_pipeline_async,
+        run_id=run["run_id"],
+        chat_history_id=chat_history_id,
+        user_id=user_id,
+        document_id=document_id,
+        presales_id=presales_id,
+        document=[enhanced_context],
+        title=title,
+    )
+    increment_regen_count(user_id, db)
+
+    return {
+        "run_id":          run["run_id"],
+        "chat_history_id": chat_history_id,
+        "status":          run["status"],
+        "current_stage":   run["current_stage"],
+    }
+
+
+@router.get("/full-pipeline/status/{chat_history_id}")
+async def get_full_pipeline_status_endpoint(
+    chat_history_id: str,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll endpoint: returns current state of the run, or status='idle' if no
+    run has been started yet for this chat.
+    """
+    from database_scripts import get_pipeline_run_by_chat
+
+    user_id = current_token["regular_login_token"]["id"]
+    chat = await get_single_user_chat_history(
+        chat_history_id=chat_history_id, user_id=user_id, db=db
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat history not found")
+
+    run = await get_pipeline_run_by_chat(chat_history_id, db)
+    if not run:
+        return {"status": "idle", "chat_history_id": chat_history_id}
+    return run
 
 
 @router.get("/presales/{document_id}")
@@ -1206,6 +1302,11 @@ async def presales_chat(
         chat_history_id = analysis_link.get("chat_history_id") if analysis_link else None
         document_id = presales.get("document_id")
 
+        # Plan enforcement: refuse before the LLM call if this chat has hit its
+        # per-chat message ceiling. Mirror of the /chat-with-doc check (line ~4937).
+        if chat_history_id:
+            check_message_limit(chat_history_id, user_id, db)
+
         # Load existing conversation history
         conversation_history = []
         if chat_history_id:
@@ -1397,6 +1498,9 @@ async def presales_chat(
                     db=db
                 )
                 logger.info(f"Saved conversation to chat_history_id: {chat_history_id}")
+                # Count this user turn against the per-chat message ceiling.
+                # Atomic UPDATE...RETURNING; one increment per turn (matches /chat-with-doc).
+                increment_message_count(chat_history_id, user_id, db)
             except Exception as e:
                 logger.warning(f"Could not save conversation history: {str(e)}")
 
@@ -1995,8 +2099,37 @@ async def get_user_chat_history(current_user = Depends(token_validator), db:Sess
 
 @router.get('/chat/{chat_history_id}')
 async def get_user_chat_history_by_id(chat_history_id:str,current_user = Depends(token_validator), db:Session=Depends(get_db)):
+    from database_scripts import get_pipeline_run_by_chat
     single_record = await get_single_user_chat_history(user_id=current_user["regular_login_token"]["id"], chat_history_id=chat_history_id, db=db)
+    # Surface pipeline_status so the frontend can route between the wizard,
+    # the /full-pipeline progress page, and the chat view.
+    pipeline_run = await get_pipeline_run_by_chat(chat_history_id, db)
+    if isinstance(single_record, dict):
+        single_record["pipeline_status"] = pipeline_run["status"] if pipeline_run else "idle"
     return {"user_details": single_record}
+
+
+@router.get('/projects/overview')
+async def get_projects_overview(current_user = Depends(token_validator), db: Session = Depends(get_db)):
+    """
+    Aggregated data for the Projects Overview page.
+
+    Returns KPI block, per-project summary rows, a cross-project Questions Inbox,
+    and the user's current subscription/usage so the frontend can render the
+    page in one round-trip.
+    """
+    user_id = current_user["regular_login_token"]["id"]
+    overview = await fetch_projects_overview(user_id=user_id, db=db)
+    try:
+        subscription = get_usage_summary(user_id=user_id, db=db)
+    except HTTPException:
+        subscription = None
+    return {
+        "kpis": overview["kpis"],
+        "projects": overview["projects"],
+        "questions_inbox": overview["questions_inbox"],
+        "subscription": subscription,
+    }
 
 # @router.post('/chat-with-doc')
 # async def conversation_with_doc(request:ChatHistoryDetails,current_user = Depends(token_validator), db:Session=Depends(get_db)):
@@ -2563,6 +2696,13 @@ async def conversation_with_doc_v2(
         chat_context = request.model_dump()
         logger.info(f"Processing chat-with-docs-v2 for user: {request.user_id}, chat_history_id: {request.chat_history_id}")
         logger.info(f"Total messages received: {len(chat_context['message'])}")
+
+        # Plan enforcement: check + increment at the top because this handler has
+        # ~6 save_chat_history exit branches and a per-branch increment would
+        # almost certainly miss one. message_count tracks "user turns submitted",
+        # so once we accept the request we count it; the LLM cost is downstream.
+        check_message_limit(request.chat_history_id, request.user_id, db)
+        increment_message_count(request.chat_history_id, request.user_id, db)
 
         # 2. Extract ONLY selected messages for processing
         selected_messages = [msg for msg in chat_context["message"] if msg.get("selected", True)]
@@ -4344,21 +4484,32 @@ If you'd like to make modifications, just let me know what you'd like to change 
 
                             logger.info(f"Starting section regeneration for chat_history_id: {chat_context['chat_history_id']}")
 
-                            # Regenerate affected sections
-                            regenerated_report = await regenerate_report_sections(
-                                original_report=original_report_content,
-                                regeneration_plan=regen_plan,
-                                pending_changes=pending_changes
+                            # Bind a recorder so regen + summary calls land in llm_call_log.
+                            from utils.llm_metrics import LLMCallRecorder, use_recorder
+                            from database_scripts import get_presales_id_for_chat
+                            _regen_chat_id = chat_context.get('chat_history_id')
+                            _regen_recorder = LLMCallRecorder(
+                                db=db,
+                                chat_history_id=_regen_chat_id,
+                                presales_id=get_presales_id_for_chat(_regen_chat_id, db),
+                                user_id=user_id,
                             )
+                            with use_recorder(_regen_recorder):
+                                # Regenerate affected sections
+                                regenerated_report = await regenerate_report_sections(
+                                    original_report=original_report_content,
+                                    regeneration_plan=regen_plan,
+                                    pending_changes=pending_changes
+                                )
 
-                            logger.info(f"Section regeneration completed, new report length: {len(regenerated_report)} chars")
+                                logger.info(f"Section regeneration completed, new report length: {len(regenerated_report)} chars")
 
-                            # Calculate new version number before creating summary
-                            current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
-                            new_version_number = current_version + 1
+                                # Calculate new version number before creating summary
+                                current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
+                                new_version_number = current_version + 1
 
-                            # Create summary for the new report with correct version number
-                            new_summary = await main_report_summary(main_report=regenerated_report, version_number=new_version_number)
+                                # Create summary for the new report with correct version number
+                                new_summary = await main_report_summary(main_report=regenerated_report, version_number=new_version_number)
                             logger.info(f"Generated summary for regenerated report (version {new_version_number})")
 
                             # Create new version
@@ -4820,6 +4971,11 @@ async def conversation_with_doc_v3(
     Returns:
         Dict with AI response message and metadata
     """
+    # Bind the LLM call recorder for this request: every router_llm /
+    # tool_chat_agent / chain.ainvoke call inside the handler will append
+    # one row to llm_call_log attributed to this chat_history_id.
+    from utils.llm_metrics import LLMCallRecorder, use_recorder
+    _chat_recorder_ctx = None
     try:
         # 1. VALIDATE USER
         if current_user["regular_login_token"]["id"] != request.user_id:
@@ -4831,6 +4987,17 @@ async def conversation_with_doc_v3(
         check_message_limit(chat_history_id, user_id, db)
         logger.info(f"Processing chat-with-doc-v3 for chat_history_id: {chat_history_id}")
         logger.info("using this api for the frontend /chaat with doc endpoint")
+
+        from database_scripts import get_presales_id_for_chat
+        _chat_recorder_ctx = use_recorder(
+            LLMCallRecorder(
+                db=db,
+                chat_history_id=chat_history_id,
+                presales_id=get_presales_id_for_chat(chat_history_id, db),
+                user_id=user_id,
+            )
+        )
+        _chat_recorder_ctx.__enter__()
 
         # Get latest user message
         if not chat_context["message"]:
@@ -5038,6 +5205,12 @@ async def conversation_with_doc_v3(
     except Exception as e:
         logger.error(f"Error in chat-with-doc-v3: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
+    finally:
+        if _chat_recorder_ctx is not None:
+            try:
+                _chat_recorder_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -5097,11 +5270,35 @@ async def conversation_with_doc_stream(
 
     user_message = chat_context["message"][-1]["content"]
 
+    # Plan enforcement: refuse BEFORE the SSE response starts so a 402 is returned
+    # as a normal HTTP error (the post-stream increment alone lets concurrent
+    # streams at limit-1 all complete). Source of truth is still the post-stream
+    # increment_message_count below.
+    check_message_limit(chat_history_id, user_id, db)
+
+    # Bind a recorder so every LLM call inside the SSE stream lands in llm_call_log.
+    # Look up presales_id once (covers chat-with-doc-stream rollups under the project).
+    from utils.llm_metrics import LLMCallRecorder, use_recorder
+    from database_scripts import get_presales_id_for_chat
+    _stream_recorder = LLMCallRecorder(
+        db=db,
+        chat_history_id=chat_history_id,
+        presales_id=get_presales_id_for_chat(chat_history_id, db),
+        user_id=user_id,
+    )
+
     async def event_generator():
         """Generate SSE events for streaming response."""
         final_content = ""
         tools_called = []
 
+        # Bind the recorder contextvar inside the generator: SSE generators run
+        # in their own task and don't inherit a context set in the outer handler.
+        # Use manual __enter__/__exit__ instead of `with` so we don't have to
+        # re-indent the whole block (Python disallows yield-from across some
+        # context-manager boundaries cleanly here).
+        _ctx = use_recorder(_stream_recorder)
+        _ctx.__enter__()
         try:
             # Get conversation history for context
             conversation_history = [
@@ -5151,6 +5348,11 @@ async def conversation_with_doc_stream(
                 message="Streaming error occurred",
                 error_detail=str(e)
             ).to_sse()
+        finally:
+            try:
+                _ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
     return StreamingResponse(
         event_generator(),
@@ -5163,3 +5365,122 @@ async def conversation_with_doc_stream(
         }
     )
 
+
+@router.get("/admin/llm-stats")
+async def get_llm_stats(
+    pipeline_run_id: Optional[str] = None,
+    chat_history_id: Optional[str] = None,
+    presales_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Aggregate LLM call telemetry from llm_call_log.
+
+    Filters (all optional, AND-combined):
+      - pipeline_run_id: scope to one full-pipeline run
+      - chat_history_id: scope to one chat session
+      - presales_id: scope to one project (covers presales scan + brief +
+        full pipeline + chat-with-doc — i.e. end-to-end project cost)
+      - user_id: scope to one user
+      - start_date / end_date: ISO 8601 timestamps (inclusive lower, exclusive upper)
+
+    Returns per-agent breakdown plus a totals row. cache_hit_ratio is
+    cached_input_tokens / input_tokens (0 when no input tokens).
+    """
+    from sqlalchemy import func
+
+    q = db.query(
+        models.LLMCallLog.agent_name,
+        models.LLMCallLog.model,
+        func.count(models.LLMCallLog.id).label("calls"),
+        func.coalesce(func.sum(models.LLMCallLog.input_tokens), 0).label("input_tokens"),
+        func.coalesce(func.sum(models.LLMCallLog.cached_input_tokens), 0).label("cached_input_tokens"),
+        func.coalesce(func.sum(models.LLMCallLog.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0).label("cost_usd"),
+        func.coalesce(func.avg(models.LLMCallLog.latency_ms), 0).label("avg_latency_ms"),
+    )
+
+    if pipeline_run_id:
+        q = q.filter(models.LLMCallLog.pipeline_run_id == pipeline_run_id)
+    if chat_history_id:
+        q = q.filter(models.LLMCallLog.chat_history_id == chat_history_id)
+    if presales_id:
+        q = q.filter(models.LLMCallLog.presales_id == presales_id)
+    if user_id:
+        q = q.filter(models.LLMCallLog.user_id == user_id)
+    if start_date:
+        try:
+            start_dt = datetime.fromisoformat(start_date)
+            q = q.filter(models.LLMCallLog.created_at >= start_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format (use ISO 8601)")
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(end_date)
+            q = q.filter(models.LLMCallLog.created_at < end_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format (use ISO 8601)")
+
+    rows = q.group_by(models.LLMCallLog.agent_name, models.LLMCallLog.model).all()
+
+    by_agent = []
+    total_calls = 0
+    total_input = 0
+    total_cached = 0
+    total_output = 0
+    total_cost = 0.0
+
+    for r in rows:
+        input_tok = int(r.input_tokens or 0)
+        cached_tok = int(r.cached_input_tokens or 0)
+        output_tok = int(r.output_tokens or 0)
+        calls = int(r.calls or 0)
+        cost = float(r.cost_usd or 0)
+        ratio = (cached_tok / input_tok) if input_tok > 0 else 0.0
+
+        by_agent.append({
+            "agent_name": r.agent_name,
+            "model": r.model,
+            "calls": calls,
+            "input_tokens": input_tok,
+            "cached_input_tokens": cached_tok,
+            "output_tokens": output_tok,
+            "cache_hit_ratio": round(ratio, 4),
+            "cost_usd": round(cost, 6),
+            "avg_latency_ms": int(r.avg_latency_ms or 0),
+        })
+
+        total_calls += calls
+        total_input += input_tok
+        total_cached += cached_tok
+        total_output += output_tok
+        total_cost += cost
+
+    # Sort hottest agents first.
+    by_agent.sort(key=lambda x: x["cost_usd"], reverse=True)
+
+    totals = {
+        "calls": total_calls,
+        "input_tokens": total_input,
+        "cached_input_tokens": total_cached,
+        "output_tokens": total_output,
+        "cache_hit_ratio": round(total_cached / total_input, 4) if total_input > 0 else 0.0,
+        "cost_usd": round(total_cost, 6),
+    }
+
+    return {
+        "filters": {
+            "pipeline_run_id": pipeline_run_id,
+            "chat_history_id": chat_history_id,
+            "presales_id": presales_id,
+            "user_id": user_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        "totals": totals,
+        "by_agent": by_agent,
+    }

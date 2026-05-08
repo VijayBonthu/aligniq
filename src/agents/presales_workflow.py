@@ -26,6 +26,7 @@ from utils.presales_prompts import (
     PRESALES_BRIEF_PROMPT
 )
 from utils.logger import logger
+from utils.llm_metrics import callback_for, hash_prompt
 import json
 import asyncio
 import time
@@ -89,6 +90,15 @@ json_parser = JsonOutputParser()
 fixed_parser = OutputFixingParser.from_llm(parser=json_parser, llm=llm_parser)
 
 
+# Pre-computed prompt hashes for llm_call_log.prompt_hash. See agentic_workflow.py
+# for rationale.
+_PRESALES_HASHES = {
+    "presales_scanner":             hash_prompt(PRESALES_SCANNER_PROMPT),
+    "presales_blindspot":           hash_prompt(BLINDSPOT_DETECTOR_PROMPT),
+    "presales_brief_generator":     hash_prompt(PRESALES_BRIEF_PROMPT),
+}
+
+
 # =============================================================================
 # STATE DEFINITION
 # =============================================================================
@@ -136,27 +146,30 @@ def presales_retry():
     )
 
 
-async def invoke_presales_agent(chain, input_dict: dict, timeout: int, agent_name: str):
+async def invoke_presales_agent(
+    chain,
+    input_dict: dict,
+    timeout: int,
+    agent_name: str,
+    *,
+    model: str = None,
+    prompt_hash: str = None,
+):
     """
-    Invoke a pre-sales agent with timeout and retry.
+    Invoke a pre-sales agent with timeout, retry, and per-call telemetry.
 
-    Args:
-        chain: The LangChain chain to invoke
-        input_dict: Input parameters
-        timeout: Timeout in seconds
-        agent_name: Name for logging
-
-    Returns:
-        The chain response
-
-    Raises:
-        PresalesAgentError: If agent fails after retries
+    The metrics callback is wired here so every presales agent gets logged
+    to llm_call_log without per-call boilerplate. No-op when no recorder
+    is bound on the contextvar.
     """
+    model = model or settings.GENERATING_REPORT_MODEL
+    config = callback_for(agent_name=agent_name, model=model, prompt_hash=prompt_hash)
+
     @presales_retry()
     async def _invoke():
         try:
             return await asyncio.wait_for(
-                chain.ainvoke(input_dict),
+                chain.ainvoke(input_dict, config=config) if config else chain.ainvoke(input_dict),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -226,7 +239,8 @@ async def scanner_node(state: PresalesState) -> PresalesState:
             chain=chain,
             input_dict={"document": state["document"]},
             timeout=60,
-            agent_name="scanner"
+            agent_name="presales_scanner",
+            prompt_hash=_PRESALES_HASHES["presales_scanner"],
         )
 
         # Response should already be parsed by fixed_parser
@@ -283,7 +297,8 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
                 "technologies": ", ".join(technologies) if technologies else "None specified"
             },
             timeout=90,
-            agent_name="blindspot"
+            agent_name="presales_blindspot",
+            prompt_hash=_PRESALES_HASHES["presales_blindspot"],
         )
 
         # Response should already be parsed by fixed_parser
@@ -350,7 +365,8 @@ async def brief_generator_node(state: PresalesState) -> PresalesState:
                 "red_flags": json.dumps(state.get("red_flags", []), indent=2)
             },
             timeout=60,
-            agent_name="brief_generator"
+            agent_name="presales_brief_generator",
+            prompt_hash=_PRESALES_HASHES["presales_brief_generator"],
         )
 
         state["presales_brief"] = response
@@ -501,6 +517,7 @@ async def generate_report_with_assumptions(
     confirmed_answers: list,
     assumptions_list: list,
     additional_context: str = None,
+    blind_spots: dict = None,
     timeout: int = 180
 ) -> dict:
     """
@@ -526,21 +543,31 @@ async def generate_report_with_assumptions(
     logger.info("Starting report generation with assumptions")
     logger.info(f"Confirmed answers: {len(confirmed_answers)}, Assumptions: {len(assumptions_list)}")
     start_time = time.time()
+    _report_phash = hash_prompt(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
 
     try:
-        # Format confirmed answers for the prompt
+        # Format confirmed answers for the prompt (answered) and open questions (unanswered)
         confirmed_formatted = []
+        open_formatted = []
         for answer in confirmed_answers:
             q_type = answer.get("question_type", "unknown")
             q_num = answer.get("question_number", "?")
             q_text = answer.get("question_text", "")
             ans = answer.get("answer", "")
+            status_field = (answer.get("status") or "").lower()
 
-            if ans:  # Only include answered questions
+            if ans:
                 confirmed_formatted.append(f"""
 **{q_num}** ({q_type})
 - Question: {q_text}
 - Answer: {ans}
+""")
+            else:
+                reason = "deferred" if status_field in ("skipped", "deferred") else "insufficient_info"
+                open_formatted.append(f"""
+**{q_num}** ({q_type})
+- Question: {q_text}
+- Reason still open: {reason}
 """)
 
         # Format assumptions for the prompt
@@ -555,6 +582,25 @@ async def generate_report_with_assumptions(
 - Impact if wrong: {assumption.get('impact_if_wrong', 'May require rework')}
 """)
 
+        # Format blind spots (technology risks + red flags + p1 blockers) for the prompt
+        blind_spots = blind_spots or {}
+        blind_spot_lines = []
+        for risk in blind_spots.get("technology_risks", []) or []:
+            techs = ", ".join(risk.get("technologies", []) or []) or "—"
+            blind_spot_lines.append(
+                f"- **Tech risk** ({risk.get('severity', 'medium')}): {risk.get('risk_title', '')} "
+                f"[{techs}] — {risk.get('description', '')} · Mitigation: {risk.get('mitigation_hint', '—')}"
+            )
+        for flag in blind_spots.get("red_flags", []) or []:
+            blind_spot_lines.append(
+                f"- **Red flag**: {flag.get('signal', '')} — {flag.get('concern', '')}"
+            )
+        for blocker in blind_spots.get("p1_blockers", []) or []:
+            blind_spot_lines.append(
+                f"- **P1 blocker** ({blocker.get('area', '')}): {blocker.get('blocker', '')} — "
+                f"{blocker.get('why_it_matters', '')}"
+            )
+
         prompt = ChatPromptTemplate.from_template(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
         chain = prompt | llm_reasoning | StrOutputParser()
 
@@ -567,13 +613,23 @@ async def generate_report_with_assumptions(
 """
             logger.info(f"Including additional context ({len(additional_context)} chars) in report")
 
+        _report_config = callback_for(
+            agent_name="presales_full_report_with_assumptions",
+            model=settings.GENERATING_REPORT_MODEL,
+            prompt_hash=_report_phash,
+        )
         response = await asyncio.wait_for(
-            chain.ainvoke({
-                "document": document[:15000],  # Limit document size
-                "confirmed_answers": "\n".join(confirmed_formatted) if confirmed_formatted else "No confirmed answers provided.",
-                "assumptions_list": "\n".join(assumptions_formatted) if assumptions_formatted else "No assumptions needed - all information confirmed.",
-                "additional_context": additional_context_text
-            }),
+            chain.ainvoke(
+                {
+                    "document": document[:15000],  # Limit document size
+                    "confirmed_answers": "\n".join(confirmed_formatted) if confirmed_formatted else "No confirmed answers provided.",
+                    "open_questions": "\n".join(open_formatted) if open_formatted else "All questions were answered.",
+                    "assumptions_list": "\n".join(assumptions_formatted) if assumptions_formatted else "No assumptions needed - all information confirmed.",
+                    "blind_spots": "\n".join(blind_spot_lines) if blind_spot_lines else "No additional blind spots flagged.",
+                    "additional_context": additional_context_text,
+                },
+                config=_report_config,
+            ),
             timeout=timeout
         )
 

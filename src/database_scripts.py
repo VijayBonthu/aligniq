@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from utils.logger import logger
 import copy
 import uuid
+from typing import Optional
 
 class UserCreationError(Exception):
     pass
@@ -1206,7 +1207,15 @@ async def save_presales_analysis(presales_data: dict, db: Session) -> dict:
         HTTPException: If save fails
     """
     try:
+        # Allow caller to pre-generate the presales_id so it can be passed to
+        # the LLM recorder *before* the scan runs (lets us tag every initial-scan
+        # llm_call_log row with the project-level identifier). Falls through to
+        # the model default uuid if not supplied.
+        kwargs = {}
+        if presales_data.get("presales_id"):
+            kwargs["presales_id"] = presales_data["presales_id"]
         presales = models.PresalesAnalysis(
+            **kwargs,
             document_id=presales_data["document_id"],
             user_id=presales_data["user_id"],
             extracted_requirements=presales_data.get("scanned_requirements"),
@@ -1579,6 +1588,27 @@ async def get_analysis_link_by_presales_id(presales_id: str, user_id: str, db: S
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving analysis link: {str(e)}"
         )
+
+
+def get_presales_id_for_chat(chat_history_id: str, db: Session) -> Optional[str]:
+    """
+    Resolve the presales_id linked to a chat_history_id, or None.
+
+    Used by telemetry (utils/llm_metrics.py) so chat-with-doc and regenerate-report
+    LLM calls can be rolled up against the project (presales_id) the chat belongs
+    to. Returns None for legacy chats that predate AnalysisLink — telemetry must
+    not fail because of missing linkage.
+    """
+    if not chat_history_id:
+        return None
+    try:
+        link = db.query(models.AnalysisLink).filter(
+            models.AnalysisLink.chat_history_id == chat_history_id
+        ).first()
+        return link.presales_id if link else None
+    except Exception as e:
+        logger.warning(f"get_presales_id_for_chat failed for {chat_history_id}: {e}")
+        return None
 
 
 def get_analysis_mode(chat_history_id: str, db: Session) -> dict:
@@ -3437,3 +3467,489 @@ async def get_regeneration_context(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving regeneration context: {str(e)}"
         )
+
+
+# ============================================================
+# PROJECTS OVERVIEW AGGREGATION (for /projects/overview page)
+# ============================================================
+
+async def fetch_projects_overview(user_id: str, db: Session) -> dict:
+    """
+    Aggregate everything the Projects Overview page needs in one pass:
+      - KPI block (total/presales/full counts, avg readiness, 7d trend)
+      - Per-project rows with readiness, question counts, pending-change count,
+        report-version count, last message preview
+      - Cross-project questions_inbox of pending / needs_review questions
+
+    Returns a dict ready to be merged with subscription data by the router.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import func, case
+
+    try:
+        # --- 1. Load all active chats for the user -------------------------
+        chats = (
+            db.query(models.ChatHistory)
+            .filter(
+                models.ChatHistory.user_id == user_id,
+                models.ChatHistory.active_tag == "True",
+            )
+            .order_by(models.ChatHistory.modified_at.desc())
+            .all()
+        )
+
+        chat_ids = [c.chat_history_id for c in chats]
+
+        # Empty state -- no projects yet
+        if not chat_ids:
+            return {
+                "kpis": {
+                    "total_projects": 0,
+                    "presales_count": 0,
+                    "full_report_count": 0,
+                    "avg_readiness": 0.0,
+                    "readiness_trend_7d": 0.0,
+                },
+                "projects": [],
+                "questions_inbox": [],
+            }
+
+        # --- 2. AnalysisLink -> analysis_mode + presales_id per chat --------
+        links = (
+            db.query(models.AnalysisLink)
+            .filter(models.AnalysisLink.chat_history_id.in_(chat_ids))
+            .all()
+        )
+        link_by_chat = {l.chat_history_id: l for l in links}
+
+        presales_ids = [l.presales_id for l in links if l.presales_id]
+
+        # --- 3. PresalesAnalysis rows (for readiness scores) ---------------
+        presales_rows = {}
+        if presales_ids:
+            for pa in (
+                db.query(models.PresalesAnalysis)
+                .filter(models.PresalesAnalysis.presales_id.in_(presales_ids))
+                .all()
+            ):
+                presales_rows[pa.presales_id] = pa
+
+        # --- 4. Question summary counts per presales_id ---------------------
+        # Group by presales_id, question_type, status to build summary
+        question_counts: dict = {}
+        vague_counts: dict = {}
+        if presales_ids:
+            rows = (
+                db.query(
+                    models.PresalesQuestion.presales_id,
+                    models.PresalesQuestion.question_type,
+                    models.PresalesQuestion.status,
+                    func.count(models.PresalesQuestion.question_id).label("cnt"),
+                )
+                .filter(models.PresalesQuestion.presales_id.in_(presales_ids))
+                .group_by(
+                    models.PresalesQuestion.presales_id,
+                    models.PresalesQuestion.question_type,
+                    models.PresalesQuestion.status,
+                )
+                .all()
+            )
+            for presales_id, qtype, qstatus, cnt in rows:
+                bucket = question_counts.setdefault(presales_id, {})
+                type_bucket = bucket.setdefault(qtype, {"total": 0, "answered": 0})
+                type_bucket["total"] += cnt
+                if qstatus == "answered":
+                    type_bucket["answered"] += cnt
+
+            vague_rows = (
+                db.query(
+                    models.PresalesQuestion.presales_id,
+                    func.count(models.PresalesQuestion.question_id).label("cnt"),
+                )
+                .filter(
+                    models.PresalesQuestion.presales_id.in_(presales_ids),
+                    models.PresalesQuestion.answer_quality == "vague",
+                )
+                .group_by(models.PresalesQuestion.presales_id)
+                .all()
+            )
+            vague_counts = {pid: cnt for pid, cnt in vague_rows}
+
+        # --- 5. Default ReportVersion per chat (for pending_changes count) --
+        default_versions = (
+            db.query(models.ReportVersions)
+            .filter(
+                models.ReportVersions.chat_history_id.in_(chat_ids),
+                models.ReportVersions.is_default == True,
+            )
+            .all()
+        )
+        default_by_chat = {v.chat_history_id: v for v in default_versions}
+
+        # --- 6. Report version counts per chat ------------------------------
+        version_count_rows = (
+            db.query(
+                models.ReportVersions.chat_history_id,
+                func.count(models.ReportVersions.report_version_id).label("cnt"),
+            )
+            .filter(models.ReportVersions.chat_history_id.in_(chat_ids))
+            .group_by(models.ReportVersions.chat_history_id)
+            .all()
+        )
+        version_counts = {cid: cnt for cid, cnt in version_count_rows}
+
+        # --- 6b. Pipeline status per chat (for /full-pipeline progress) ----
+        pipeline_status_map = await get_pipeline_status_map(chat_ids, db)
+
+        # --- 7. Assemble per-project rows -----------------------------------
+        projects = []
+        readiness_scores_all = []
+        readiness_scores_last_7d = []
+        readiness_scores_older = []
+        now = datetime.now(timezone.utc)
+        seven_days_ago = now - timedelta(days=7)
+
+        presales_count = 0
+        full_count = 0
+
+        for c in chats:
+            link = link_by_chat.get(c.chat_history_id)
+            presales_id = link.presales_id if link else None
+            analysis_mode = "full"
+            if link and not link.full_report_generated and presales_id:
+                analysis_mode = "presales"
+            if analysis_mode == "presales":
+                presales_count += 1
+            else:
+                full_count += 1
+
+            pa = presales_rows.get(presales_id) if presales_id else None
+            readiness_score = float(pa.readiness_score) if pa and pa.readiness_score is not None else 0.0
+            readiness_status = pa.readiness_status if pa else "not_analyzed"
+
+            if pa and pa.readiness_score is not None:
+                readiness_scores_all.append(readiness_score)
+                # Use chat.modified_at to split 7d window
+                mod = c.modified_at
+                if mod is not None:
+                    if mod.tzinfo is None:
+                        mod = mod.replace(tzinfo=timezone.utc)
+                    if mod >= seven_days_ago:
+                        readiness_scores_last_7d.append(readiness_score)
+                    else:
+                        readiness_scores_older.append(readiness_score)
+
+            qcounts = question_counts.get(presales_id, {}) if presales_id else {}
+            p1 = qcounts.get("p1_blocker", {"total": 0, "answered": 0})
+            kick = qcounts.get("kickstart", {"total": 0, "answered": 0})
+
+            default_v = default_by_chat.get(c.chat_history_id)
+            pending_list = (default_v.pending_changes if default_v and default_v.pending_changes else []) or []
+            pending_total = len(pending_list) if isinstance(pending_list, list) else 0
+
+            # Last message preview from stored JSON string
+            last_preview = ""
+            try:
+                if c.message:
+                    import json as _json
+                    msgs = _json.loads(c.message) if isinstance(c.message, str) else c.message
+                    if isinstance(msgs, list) and msgs:
+                        tail = msgs[-1]
+                        last_preview = (tail.get("content", "") or "")[:180]
+            except Exception:
+                last_preview = ""
+
+            projects.append({
+                "chat_history_id": c.chat_history_id,
+                "document_id": c.document_id,
+                "title": c.title or "Untitled project",
+                "analysis_mode": analysis_mode,
+                "presales_id": presales_id,
+                "full_report_generated": bool(link.full_report_generated) if link else False,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "modified_at": c.modified_at.isoformat() if c.modified_at else None,
+                "readiness": {
+                    "score": readiness_score,
+                    "status": readiness_status,
+                },
+                "questions_summary": {
+                    "p1_total": p1["total"],
+                    "p1_answered": p1["answered"],
+                    "kickstart_total": kick["total"],
+                    "kickstart_answered": kick["answered"],
+                    "vague_count": int(vague_counts.get(presales_id, 0)) if presales_id else 0,
+                },
+                "pending_changes": {
+                    "total": pending_total,
+                    "has_conflicts": False,  # Conflict detection is on-demand elsewhere
+                },
+                "report_versions": int(version_counts.get(c.chat_history_id, 0)),
+                "last_message_preview": last_preview,
+                "pipeline_status": pipeline_status_map.get(c.chat_history_id, "idle"),
+            })
+
+        # --- 8. KPI aggregation --------------------------------------------
+        avg_readiness = (
+            sum(readiness_scores_all) / len(readiness_scores_all)
+            if readiness_scores_all else 0.0
+        )
+        avg_last_7d = (
+            sum(readiness_scores_last_7d) / len(readiness_scores_last_7d)
+            if readiness_scores_last_7d else 0.0
+        )
+        avg_older = (
+            sum(readiness_scores_older) / len(readiness_scores_older)
+            if readiness_scores_older else 0.0
+        )
+        readiness_trend_7d = round(avg_last_7d - avg_older, 4) if readiness_scores_older else 0.0
+
+        kpis = {
+            "total_projects": len(chats),
+            "presales_count": presales_count,
+            "full_report_count": full_count,
+            "avg_readiness": round(avg_readiness, 4),
+            "readiness_trend_7d": readiness_trend_7d,
+        }
+
+        # --- 9. Questions inbox (pending / needs_review, P1 first) ---------
+        questions_inbox: list = []
+        if presales_ids:
+            inbox_rows = (
+                db.query(models.PresalesQuestion, models.ChatHistory.chat_history_id, models.ChatHistory.title)
+                .join(
+                    models.AnalysisLink,
+                    models.AnalysisLink.presales_id == models.PresalesQuestion.presales_id,
+                )
+                .join(
+                    models.ChatHistory,
+                    models.ChatHistory.chat_history_id == models.AnalysisLink.chat_history_id,
+                )
+                .filter(
+                    models.PresalesQuestion.presales_id.in_(presales_ids),
+                    models.PresalesQuestion.status.in_(["pending", "needs_review"]),
+                )
+                .order_by(
+                    case((models.PresalesQuestion.question_type == "p1_blocker", 0), else_=1),
+                    models.PresalesQuestion.updated_at.desc().nullslast(),
+                    models.PresalesQuestion.created_at.desc(),
+                )
+                .limit(50)
+                .all()
+            )
+            for q, chat_id, chat_title in inbox_rows:
+                questions_inbox.append({
+                    "question_id": q.question_id,
+                    "chat_history_id": chat_id,
+                    "project_title": chat_title or "Untitled project",
+                    "presales_id": q.presales_id,
+                    "question_number": q.question_number,
+                    "question_type": q.question_type,
+                    "title": q.title,
+                    "question_text": q.question_text,
+                    "status": q.status,
+                    "area_or_category": q.area_or_category,
+                })
+
+        return {
+            "kpis": kpis,
+            "projects": projects,
+            "questions_inbox": questions_inbox,
+        }
+
+    except SQLAlchemyError as e:
+        logger.error(f"Error building projects overview for user {user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error building projects overview: {str(e)}"
+        )
+
+
+# ============================================================================
+# PIPELINE RUNS (9-agent full-pipeline async execution tracking)
+# ============================================================================
+
+PIPELINE_STAGES_ORDER = [
+    "requirements_analyzer",
+    "ambiguity_resolver",
+    "validator_agent",
+    "solution_architectures",
+    "critic_agent",
+    "evidence_gather_agent",
+    "feasibility_estimator",
+    "ba_final_report_generation",
+]
+
+
+def _serialize_pipeline_run(run: "models.PipelineRun") -> dict:
+    return {
+        "run_id": run.run_id,
+        "chat_history_id": run.chat_history_id,
+        "user_id": run.user_id,
+        "status": run.status,
+        "current_stage": run.current_stage,
+        "stages_completed": run.stages_completed or [],
+        "loop_count": run.loop_count or 0,
+        "error": run.error,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
+
+
+async def create_or_reset_pipeline_run(chat_history_id: str, user_id: str, db: Session) -> dict:
+    """
+    Insert a new pipeline_runs row for the project, or reset an existing one
+    back to status='queued' (used on retry after a failure). Always returns
+    the run in queued state with empty stages_completed.
+    """
+    try:
+        run = (
+            db.query(models.PipelineRun)
+            .filter(models.PipelineRun.chat_history_id == chat_history_id)
+            .first()
+        )
+        if run:
+            run.status = models.PipelineRunStatus.QUEUED
+            run.current_stage = None
+            run.stages_completed = []
+            run.loop_count = 0
+            run.error = None
+            run.completed_at = None
+            flag_modified(run, "stages_completed")
+        else:
+            run = models.PipelineRun(
+                run_id=str(uuid.uuid4()),
+                chat_history_id=chat_history_id,
+                user_id=user_id,
+                status=models.PipelineRunStatus.QUEUED,
+                stages_completed=[],
+                loop_count=0,
+            )
+            db.add(run)
+        db.commit()
+        db.refresh(run)
+        return _serialize_pipeline_run(run)
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Failed to create/reset pipeline_run for {chat_history_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create pipeline run: {str(e)}",
+        )
+
+
+async def mark_stage_started(run_id: str, stage_name: str, db: Session) -> None:
+    """Update pipeline_runs.current_stage and flip status to 'running'."""
+    from datetime import datetime
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            logger.warning(f"mark_stage_started: run_id {run_id} not found")
+            return
+        run.current_stage = stage_name
+        if run.status == models.PipelineRunStatus.QUEUED:
+            run.status = models.PipelineRunStatus.RUNNING
+            run.started_at = run.started_at or datetime.utcnow()
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"mark_stage_started failed for {run_id}/{stage_name}: {e}")
+
+
+async def mark_stage_completed(run_id: str, stage_name: str, duration_ms: int, db: Session) -> None:
+    """Append a completed-stage entry to stages_completed (JSON array)."""
+    from datetime import datetime
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            logger.warning(f"mark_stage_completed: run_id {run_id} not found")
+            return
+        completed = list(run.stages_completed or [])
+        completed.append({
+            "stage": stage_name,
+            "completed_at": datetime.utcnow().isoformat(),
+            "duration_ms": int(duration_ms),
+        })
+        run.stages_completed = completed
+        flag_modified(run, "stages_completed")
+        # Clear current_stage if it matches the just-completed one
+        if run.current_stage == stage_name:
+            run.current_stage = None
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"mark_stage_completed failed for {run_id}/{stage_name}: {e}")
+
+
+async def increment_loop_count(run_id: str, db: Session) -> None:
+    """Bump loop_count when the critic loops back to solution_architect."""
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            return
+        run.loop_count = (run.loop_count or 0) + 1
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"increment_loop_count failed for {run_id}: {e}")
+
+
+async def complete_pipeline_run(run_id: str, db: Session) -> None:
+    """Mark a pipeline run as successfully completed."""
+    from datetime import datetime
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            return
+        run.status = models.PipelineRunStatus.COMPLETED
+        run.current_stage = None
+        run.completed_at = datetime.utcnow()
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"complete_pipeline_run failed for {run_id}: {e}")
+
+
+async def fail_pipeline_run(run_id: str, error_msg: str, db: Session) -> None:
+    """Mark a pipeline run as failed and record the error message."""
+    from datetime import datetime
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            return
+        run.status = models.PipelineRunStatus.FAILED
+        run.error = (error_msg or "Unknown error")[:4000]
+        run.completed_at = datetime.utcnow()
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"fail_pipeline_run failed for {run_id}: {e}")
+
+
+async def get_pipeline_run_by_chat(chat_history_id: str, db: Session):
+    """Return the serialized pipeline run for a project, or None if no row exists."""
+    try:
+        run = (
+            db.query(models.PipelineRun)
+            .filter(models.PipelineRun.chat_history_id == chat_history_id)
+            .first()
+        )
+        return _serialize_pipeline_run(run) if run else None
+    except SQLAlchemyError as e:
+        logger.error(f"get_pipeline_run_by_chat failed for {chat_history_id}: {e}")
+        return None
+
+
+async def get_pipeline_status_map(chat_history_ids: list, db: Session) -> dict:
+    """Bulk fetch pipeline_status keyed by chat_history_id for the projects overview."""
+    if not chat_history_ids:
+        return {}
+    try:
+        rows = (
+            db.query(models.PipelineRun.chat_history_id, models.PipelineRun.status)
+            .filter(models.PipelineRun.chat_history_id.in_(chat_history_ids))
+            .all()
+        )
+        return {cid: status for cid, status in rows}
+    except SQLAlchemyError as e:
+        logger.error(f"get_pipeline_status_map failed: {e}")
+        return {}

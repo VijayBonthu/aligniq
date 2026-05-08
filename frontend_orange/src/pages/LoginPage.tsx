@@ -17,7 +17,7 @@ const LoginPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (isAuthenticated) navigate('/dashboard', { replace: true });
+    if (isAuthenticated) navigate('/projects', { replace: true });
   }, [isAuthenticated, navigate]);
 
   const handleGoogleLogin = () => {
@@ -28,7 +28,7 @@ const LoginPage: React.FC = () => {
       window.removeEventListener('message', handler);
       popup?.close();
       const success = await login(event.data.access_token, event.data.refresh_token);
-      if (success) navigate('/dashboard');
+      if (success) navigate('/projects');
       else setError('Authentication failed.');
     };
     window.addEventListener('message', handler);
@@ -45,7 +45,7 @@ const LoginPage: React.FC = () => {
     try {
       const res = await api.post('/login', { email_address: email.trim(), password });
       const success = await login(res.data.access_token, res.data.refresh_token);
-      if (success) navigate('/dashboard');
+      if (success) navigate('/projects');
       else setError('Login failed.');
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'response' in err) {

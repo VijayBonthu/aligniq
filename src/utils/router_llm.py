@@ -17,9 +17,35 @@ from utils.prompts import (
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 import tiktoken
 from utils.logger import logger
+from utils.llm_metrics import callback_for, hash_prompt
 
 llm_router = ChatOpenAI(api_key=settings.OPENAI_CHATGPT, model=settings.SUMMARIZATION_MODEL, temperature=0)
 llm_response = ChatOpenAI(api_key=settings.OPENAI_CHATGPT, model=settings.SUMMARIZATION_MODEL, temperature=0.3)
+
+# Pre-computed prompt hashes for telemetry — segments llm_call_log rows by
+# prompt version so a prompt edit doesn't silently corrupt before/after compares.
+_HASHES = {
+    "ROUTER_LLM_PROMPT":              hash_prompt(ROUTER_LLM_PROMPT),
+    "SUMMARIZE_CHATCONVERSATION":     hash_prompt(SUMMARIZE_CHATCONVERSATION_PROMPT),
+    "ACTION_RESPONSE_PROMPT":         hash_prompt(ACTION_RESPONSE_PROMPT),
+    "CHANGE_ACKNOWLEDGMENT_PROMPT":   hash_prompt(CHANGE_ACKNOWLEDGMENT_PROMPT),
+    "CONFLICT_RESOLUTION_PROMPT":     hash_prompt(CONFLICT_RESOLUTION_PROMPT),
+    "REGENERATE_WITH_CHANGES_PROMPT": hash_prompt(REGENERATE_WITH_CHANGES_PROMPT),
+    "HYBRID_INTENT_CLASSIFIER":       hash_prompt(HYBRID_INTENT_CLASSIFIER_PROMPT),
+    "HYBRID_RESPONSE_PROMPT":         hash_prompt(HYBRID_RESPONSE_PROMPT),
+    "MULTI_INTENT_CLASSIFIER":        hash_prompt(MULTI_INTENT_CLASSIFIER_PROMPT),
+    "SEMANTIC_INTENT_CLASSIFIER":     hash_prompt(SEMANTIC_INTENT_CLASSIFIER_PROMPT),
+    "ARCHITECTURE_DEFENSE_PROMPT":    hash_prompt(ARCHITECTURE_DEFENSE_PROMPT),
+}
+
+
+def _cb(agent_name: str, prompt_hash: str) -> dict:
+    """Build a callback config for chain.ainvoke. No-ops when no recorder is bound."""
+    return callback_for(
+        agent_name=agent_name,
+        model=settings.SUMMARIZATION_MODEL,
+        prompt_hash=prompt_hash,
+    )
 
 # Actions that should track changes instead of regenerating
 CHANGE_TRACKING_ACTIONS = ["modify_requirements", "modify_architecture", "correct_assumptions"]
@@ -31,7 +57,10 @@ async def router_query_llm(user_message:str, conversation_summary:dict, report_s
                   "conversation_summary": conversation_summary,
                   "user_message": user_message
                   }
-    response = await chain.ainvoke(input_dict)
+    response = await chain.ainvoke(
+        input_dict,
+        config=_cb("router_query_llm", _HASHES["ROUTER_LLM_PROMPT"]),
+    )
     return response
 
 async def conversation_summary_llm(conversation:list[dict]) -> str:
@@ -39,7 +68,10 @@ async def conversation_summary_llm(conversation:list[dict]) -> str:
     parser = JsonOutputParser()
     chain = summary_prompt | llm_router | parser
     input_dict = {"conversation": conversation}
-    response = await chain.ainvoke(input_dict)
+    response = await chain.ainvoke(
+        input_dict,
+        config=_cb("conversation_summary", _HASHES["SUMMARIZE_CHATCONVERSATION"]),
+    )
     return response
 
 async def count_token(data:list[dict]) -> int:
@@ -87,7 +119,10 @@ async def generate_action_response(
             "retrieved_context": retrieved_context
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_action_response", _HASHES["ACTION_RESPONSE_PROMPT"]),
+        )
         logger.info(f"Generated response for action: {action}")
         return response
     except Exception as e:
@@ -133,7 +168,10 @@ async def generate_change_acknowledgment(
             "change_id": change_id
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_change_acknowledgment", _HASHES["CHANGE_ACKNOWLEDGMENT_PROMPT"]),
+        )
         logger.info(f"Generated change acknowledgment for {change_id}")
         return response
     except Exception as e:
@@ -165,7 +203,10 @@ async def generate_conflict_resolution(
             "all_pending_changes": all_pending_changes
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_conflict_resolution", _HASHES["CONFLICT_RESOLUTION_PROMPT"]),
+        )
         logger.info(f"Generated conflict resolution prompt for {len(conflicts)} conflicts")
         return response
     except Exception as e:
@@ -200,7 +241,10 @@ async def generate_regeneration_plan(
             "conversation_context": conversation_context
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_regeneration_plan", _HASHES["REGENERATE_WITH_CHANGES_PROMPT"]),
+        )
         logger.info(f"Generated regeneration plan for {len(pending_changes)} changes")
         return response
     except Exception as e:
@@ -480,7 +524,10 @@ async def classify_hybrid_intent(
             "pending_actions": "None"  # Required by MULTI_INTENT_CLASSIFIER_PROMPT
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("classify_hybrid_intent", _HASHES["HYBRID_INTENT_CLASSIFIER"]),
+        )
         logger.info(f"Hybrid intent classification: is_hybrid={response.get('is_hybrid', False)}")
         return response
 
@@ -544,7 +591,10 @@ async def generate_hybrid_response(
             "retrieved_context": retrieved_context
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_hybrid_response", _HASHES["HYBRID_RESPONSE_PROMPT"]),
+        )
         logger.info(f"Generated hybrid response for question + suggestion")
         return response
 
@@ -719,7 +769,10 @@ async def classify_multi_intent(
             "user_message": user_message
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("classify_multi_intent", _HASHES["MULTI_INTENT_CLASSIFIER"]),
+        )
 
         # Log the classification result
         primary_intent = response.get("primary_intent", "unknown")
@@ -875,7 +928,10 @@ async def classify_unified_intent(
             "user_message": user_message
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("classify_unified_intent", _HASHES["MULTI_INTENT_CLASSIFIER"]),
+        )
 
         # Enrich the response with additional computed fields
         intents = response.get("intents", [])
@@ -1160,7 +1216,10 @@ async def classify_semantic_intent(
             "user_message": user_message
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("classify_semantic_intent", _HASHES["SEMANTIC_INTENT_CLASSIFIER"]),
+        )
 
         # Ensure required fields exist
         if "intents" not in response:
@@ -1261,7 +1320,10 @@ async def generate_architecture_defense(
             "recent_messages": recent_formatted or "No recent messages"
         }
 
-        response = await chain.ainvoke(input_dict)
+        response = await chain.ainvoke(
+            input_dict,
+            config=_cb("generate_architecture_defense", _HASHES["ARCHITECTURE_DEFENSE_PROMPT"]),
+        )
         logger.info(f"Generated architecture defense for: {challenge_topic}")
         return response
 

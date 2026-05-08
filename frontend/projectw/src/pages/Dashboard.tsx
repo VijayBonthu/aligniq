@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { isAxiosError } from 'axios';
 import api from '../services/api';
 import { useAuth } from '../context/AuthContext';
@@ -188,6 +188,7 @@ MessageContent.displayName = 'MessageContent';
 const Dashboard: React.FC = () => {
   const { isAuthenticated, logout, subscription, refreshSubscription } = useAuth();
   const navigate = useNavigate();
+  const { chatHistoryId: routeChatHistoryId } = useParams<{ chatHistoryId?: string }>();
   const [files, setFiles] = useState<File[]>([]);
   const [fileProgresses, setFileProgresses] = useState<{[key: string]: number}>({});
   const [isUploading, setIsUploading] = useState(false);
@@ -286,6 +287,15 @@ const Dashboard: React.FC = () => {
       }
     }
   }, [isAuthenticated, navigate]);
+
+  // Auto-select conversation when deep-linking via /dashboard/:chatHistoryId
+  const autoSelectedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isAuthenticated || !routeChatHistoryId) return;
+    if (autoSelectedRef.current === routeChatHistoryId) return;
+    autoSelectedRef.current = routeChatHistoryId;
+    selectConversation(routeChatHistoryId);
+  }, [isAuthenticated, routeChatHistoryId]);
 
   // Simplify the resize effect
   useEffect(() => {

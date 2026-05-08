@@ -41,7 +41,7 @@ const Register = () => {
       if (response.data.access_token) {
         delete axios.defaults.headers.common['Authorization'];
         login(response.data.access_token, response.data.refresh_token);
-        navigate('/dashboard');
+        navigate('/projects');
       } else {
         setError('Registration successful. Please login.');
         navigate('/login');

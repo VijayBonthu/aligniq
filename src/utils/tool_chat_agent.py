@@ -18,6 +18,9 @@ import json
 from config import settings
 from utils.chat_tools import get_all_tools, tool_context, TOOL_SYSTEM_PROMPT
 from utils.logger import logger
+from utils.llm_metrics import callback_for, hash_prompt
+
+_TOOL_PROMPT_HASH = hash_prompt(TOOL_SYSTEM_PROMPT)
 
 
 class ToolChatAgent:
@@ -95,8 +98,16 @@ class ToolChatAgent:
             iteration += 1
 
             try:
-                # Call LLM
-                response = await self.llm.ainvoke(messages)
+                # Call LLM. callback_for(...) attaches the usage callback when a
+                # recorder is bound by the request handler; otherwise no-op.
+                response = await self.llm.ainvoke(
+                    messages,
+                    config=callback_for(
+                        agent_name="chat_with_doc_tool_agent",
+                        model=settings.SUMMARIZATION_MODEL or "gpt-4o-mini",
+                        prompt_hash=_TOOL_PROMPT_HASH,
+                    ),
+                )
             except Exception as e:
                 logger.error(f"LLM call error in iteration {iteration}: {str(e)}")
                 return {

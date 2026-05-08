@@ -7,6 +7,7 @@ import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/Register';
 import Dashboard from './pages/Dashboard';
+import ProjectsOverview from './pages/ProjectsOverview';
 import PricingPage from './pages/PricingPage';
 
 // Create a client
@@ -23,7 +24,9 @@ function App() {
                 <Route path="/" element={<LandingPage />} />
                 <Route path="/login" element={<LoginPage />} />
                 <Route path="/register" element={<RegisterPage />} />
+                <Route path="/projects" element={<ProjectsOverview />} />
                 <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/dashboard/:chatHistoryId" element={<Dashboard />} />
                 <Route path="/pricing" element={<PricingPage />} />
               </Routes>
             </div>

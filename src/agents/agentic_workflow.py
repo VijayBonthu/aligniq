@@ -5,6 +5,7 @@ from langchain.output_parsers import OutputFixingParser
 from config import settings
 from utils.prompts import Requirements_analyzer_prompt, Ambiguity_Resolver_Prompt, Validator_agent_prompt, midway_ba_report_prompt, Solution_Architect_Agent_Prompt, Critic_Agent_Prompt,Evidence_Gatherer_Agent_prompt, feasibility_estimator_prompt, Report_Generator_Prompt, SUMMARIZE_CHATCONVERSATION_PROMPT, SUMMARIAZE_MAIN_REPORT_PROMPT, SECTION_REGENERATION_PROMPT, CHANGELOG_SUMMARY_PROMPT
 from utils.logger import logger
+from utils.llm_metrics import callback_for, hash_prompt
 import json
 import asyncio
 from tenacity import (
@@ -22,6 +23,26 @@ import logging
 llm = ChatOpenAI(api_key=settings.OPENAI_CHATGPT, model=settings.GENERATING_REPORT_MODEL, reasoning_effort="low")
 llm_parser = ChatOpenAI(api_key=settings.OPENAI_CHATGPT, model=settings.SUMMARIZATION_MODEL, temperature=0)
 fixed_parser = OutputFixingParser.from_llm(parser=JsonOutputParser(), llm=llm_parser)
+
+
+# Pre-computed prompt hashes for llm_call_log.prompt_hash. Lets us segment
+# metrics across prompt versions: any edit to the prompt text automatically
+# changes the hash, so before/after comparisons stay honest.
+_HASHES = {
+    "requirements_analyzer":     hash_prompt(Requirements_analyzer_prompt),
+    "ambiguity_resolver":        hash_prompt(Ambiguity_Resolver_Prompt),
+    "validator_agent":           hash_prompt(Validator_agent_prompt),
+    "midway_report":             hash_prompt(midway_ba_report_prompt),
+    "solution_architect":        hash_prompt(Solution_Architect_Agent_Prompt),
+    "critic_agent":              hash_prompt(Critic_Agent_Prompt),
+    "evidence_gather_agent":     hash_prompt(Evidence_Gatherer_Agent_prompt),
+    "feasibility_estimator":     hash_prompt(feasibility_estimator_prompt),
+    "ba_final_report_generation":hash_prompt(Report_Generator_Prompt),
+    "conversational_summary":    hash_prompt(SUMMARIZE_CHATCONVERSATION_PROMPT),
+    "main_report_summary":       hash_prompt(SUMMARIAZE_MAIN_REPORT_PROMPT),
+    "generate_changelog_summary":hash_prompt(CHANGELOG_SUMMARY_PROMPT),
+    "section_regeneration":      hash_prompt(SECTION_REGENERATION_PROMPT),
+}
 
 
 # Custom exceptions for pipeline errors
@@ -59,30 +80,30 @@ def llm_retry():
     )
 
 
-async def invoke_with_timeout(chain, input_dict: dict, timeout: int = None, agent_name: str = "unknown"):
+async def invoke_with_timeout(
+    chain,
+    input_dict: dict,
+    timeout: int = None,
+    agent_name: str = "unknown",
+    model: str = None,
+    prompt_hash: str = None,
+):
     """
-    Invoke a LangChain chain with timeout and proper error handling.
+    Invoke a LangChain chain with timeout, retry, and per-call telemetry.
 
-    Args:
-        chain: The LangChain chain to invoke
-        input_dict: Input parameters for the chain
-        timeout: Timeout in seconds (defaults to settings.LLM_CALL_TIMEOUT)
-        agent_name: Name of the agent for logging
-
-    Returns:
-        The chain response
-
-    Raises:
-        LLMTimeoutError: If the call times out
-        LLMRetryExhaustedError: If all retries are exhausted
+    The metrics callback is wired here (single choke point) so every agent
+    in the pipeline gets logged to llm_call_log without per-agent boilerplate.
+    No-op when no recorder is bound on the contextvar.
     """
     timeout = timeout or settings.LLM_CALL_TIMEOUT
+    model = model or settings.GENERATING_REPORT_MODEL
+    config = callback_for(agent_name=agent_name, model=model, prompt_hash=prompt_hash)
 
     @llm_retry()
     async def _invoke():
         try:
             return await asyncio.wait_for(
-                chain.ainvoke(input_dict),
+                chain.ainvoke(input_dict, config=config) if config else chain.ainvoke(input_dict),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -137,7 +158,11 @@ async def requirements_analyzer(docs: list) -> dict:
     chain = req_analyzer_prompt | llm | fixed_parser
     input_dict = {"requirements_text": docs}
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="requirements_analyzer")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="requirements_analyzer",
+        prompt_hash=_HASHES["requirements_analyzer"],
+    )
     logger.info("Completed requirements_analyzer")
     return validate_response(response, "requirements_analyzer")
 
@@ -166,7 +191,11 @@ async def ambiguity_resolver(req_analyzer_json, raw_document, process_flow, org_
         "org_policies": json.dumps(org_policies)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="ambiguity_resolver")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="ambiguity_resolver",
+        prompt_hash=_HASHES["ambiguity_resolver"],
+    )
     logger.info("Completed ambiguity_resolver")
     return validate_response(response, "ambiguity_resolver")
 
@@ -190,7 +219,11 @@ async def validator_agent(req_analyzer_json: dict, amb_resolver_json: dict) -> d
         "clarified_assumptions": json.dumps(amb_resolver_json)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="validator_agent")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="validator_agent",
+        prompt_hash=_HASHES["validator_agent"],
+    )
     logger.info("Completed validator_agent")
     return validate_response(response, "validator_agent")
 
@@ -217,7 +250,11 @@ async def midway_report(req_analyzer_json: dict, amb_resolver_json: dict, valida
         "validator": json.dumps(validator_json)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="midway_report")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="midway_report",
+        prompt_hash=_HASHES["midway_report"],
+    )
     logger.info("Completed midway_report generation")
     return validate_response(response, "midway_report")
 
@@ -245,7 +282,11 @@ async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, v
         "critic_feedback": json.dumps(critic_feedback)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="solution_architect")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="solution_architect",
+        prompt_hash=_HASHES["solution_architect"],
+    )
     logger.info("Completed solution_architect")
     return validate_response(response, "solution_architect")
 
@@ -271,7 +312,11 @@ async def evidence_gather_agent(recommendations_json: dict, validated_requiremen
         "solution_architectures": json.dumps(solution_architectures)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="evidence_gather_agent")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="evidence_gather_agent",
+        prompt_hash=_HASHES["evidence_gather_agent"],
+    )
     logger.info("Completed evidence_gather_agent")
     return validate_response(response, "evidence_gather_agent")
 
@@ -299,7 +344,11 @@ async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_a
         "previous_critic_feedback": json.dumps(previous_critic_feedback)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="critic_agent")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="critic_agent",
+        prompt_hash=_HASHES["critic_agent"],
+    )
     logger.info("Completed critic_agent")
     return validate_response(response, "critic_agent")
 
@@ -327,7 +376,11 @@ async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, s
         "evidence_json": json.dumps(evidence_gather_json)
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="feasibility_estimator")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="feasibility_estimator",
+        prompt_hash=_HASHES["feasibility_estimator"],
+    )
     logger.info("Completed feasibility_estimator")
     return validate_response(response, "feasibility_estimator")
 
@@ -375,7 +428,8 @@ async def ba_final_report_generation(
         chain,
         input_dict,
         timeout=settings.LLM_CALL_TIMEOUT * 2,  # Double timeout for final report
-        agent_name="ba_final_report_generation"
+        agent_name="ba_final_report_generation",
+        prompt_hash=_HASHES["ba_final_report_generation"],
     )
     logger.info("Completed ba_final_report_generation")
     return validate_response(response, "ba_final_report_generation")
@@ -401,7 +455,12 @@ async def conversational_summary(chat_history: list, main_report_summary: str) -
         "main report_summary": main_report_summary
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="conversational_summary")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="conversational_summary",
+        model=settings.SUMMARIZATION_MODEL,
+        prompt_hash=_HASHES["conversational_summary"],
+    )
     logger.info("Completed conversational_summary")
     return validate_response(response, "conversational_summary")
 
@@ -426,7 +485,12 @@ async def main_report_summary(main_report: str, version_number: int = 1) -> dict
         "version_number": f"v{version_number}"
     }
 
-    response = await invoke_with_timeout(chain, input_dict, agent_name="main_report_summary")
+    response = await invoke_with_timeout(
+        chain, input_dict,
+        agent_name="main_report_summary",
+        model=settings.SUMMARIZATION_MODEL,
+        prompt_hash=_HASHES["main_report_summary"],
+    )
     logger.info(f"Completed main_report_summary for version {version_number}")
     return validate_response(response, "main_report_summary")
 
@@ -478,7 +542,12 @@ async def generate_changelog_summary(
     }
 
     try:
-        response = await invoke_with_timeout(chain, input_dict, agent_name="generate_changelog_summary")
+        response = await invoke_with_timeout(
+            chain, input_dict,
+            agent_name="generate_changelog_summary",
+            model=settings.SUMMARIZATION_MODEL,
+            prompt_hash=_HASHES["generate_changelog_summary"],
+        )
         logger.info(f"Completed generate_changelog_summary for v{previous_version} -> v{new_version}")
         return response.strip() if response else "Changes applied to generate this version."
     except Exception as e:
@@ -543,7 +612,8 @@ async def regenerate_report_sections(
         chain,
         input_dict,
         timeout=settings.LLM_CALL_TIMEOUT * 2,  # Double timeout for regeneration
-        agent_name="section_regeneration"
+        agent_name="section_regeneration",
+        prompt_hash=_HASHES["section_regeneration"],
     )
 
     logger.info("Section regeneration completed")

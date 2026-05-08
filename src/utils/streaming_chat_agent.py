@@ -17,6 +17,9 @@ import json
 from config import settings
 from utils.chat_tools import get_all_tools, tool_context, TOOL_SYSTEM_PROMPT
 from utils.logger import logger
+from utils.llm_metrics import callback_for, hash_prompt
+
+_STREAM_TOOL_PROMPT_HASH = hash_prompt(TOOL_SYSTEM_PROMPT)
 from utils.streaming import (
     StreamEvent,
     StreamEventType,
@@ -61,12 +64,16 @@ class StreamingToolChatAgent:
         self.tools = get_all_tools()
         self.tool_map = {tool.name: tool for tool in self.tools}
 
-        # Initialize LLM with streaming enabled and tools bound
+        # Initialize LLM with streaming enabled and tools bound. stream_usage
+        # forces OpenAI to send the final usage chunk inside the stream, which
+        # is what UsageCaptureHandler.on_llm_end reads to log token counts /
+        # cache hits — without it, streaming responses log nothing.
         self.llm = ChatOpenAI(
             model=settings.SUMMARIZATION_MODEL or "gpt-4o-mini",
             temperature=0.3,
             api_key=settings.OPENAI_CHATGPT,
-            streaming=True  # Enable streaming
+            streaming=True,
+            stream_usage=True,
         ).bind_tools(self.tools)
 
         logger.info(f"StreamingToolChatAgent initialized with {len(self.tools)} tools for chat {chat_history_id}")
@@ -118,8 +125,17 @@ class StreamingToolChatAgent:
             )
 
             try:
-                # Stream LLM response using astream_events
-                async for event in self.llm.astream_events(messages, version="v2"):
+                # Stream LLM response using astream_events. callback_for(...)
+                # attaches the usage callback when a recorder is bound by the
+                # request handler; otherwise no-op.
+                _stream_cb = callback_for(
+                    agent_name="chat_with_doc_stream",
+                    model=settings.SUMMARIZATION_MODEL or "gpt-4o-mini",
+                    prompt_hash=_STREAM_TOOL_PROMPT_HASH,
+                )
+                async for event in self.llm.astream_events(
+                    messages, version="v2", config=_stream_cb,
+                ):
                     event_kind = event.get("event", "")
 
                     if event_kind == "on_chat_model_stream":

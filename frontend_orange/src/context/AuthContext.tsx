@@ -1,6 +1,7 @@
-import React, { createContext, useState, useContext, useEffect, ReactNode } from 'react';
+import React, { createContext, useState, useContext, useEffect, useCallback, ReactNode } from 'react';
 import api from '../services/api';
 import { getSubscription, SubscriptionData } from '../services/billingService';
+import type { LimitHitDetail } from '../components/billing/UpgradeModal';
 
 interface UserData {
   id: string;
@@ -20,6 +21,9 @@ interface AuthContextType {
   login: (accessToken: string, refreshToken?: string) => Promise<boolean>;
   logout: () => void;
   refreshSubscription: () => Promise<void>;
+  limitHit: LimitHitDetail | null;
+  showLimitHit: (detail: LimitHitDetail) => void;
+  clearLimitHit: () => void;
 }
 
 const defaultValue: AuthContextType = {
@@ -29,6 +33,9 @@ const defaultValue: AuthContextType = {
   login: async () => false,
   logout: () => {},
   refreshSubscription: async () => {},
+  limitHit: null,
+  showLimitHit: () => {},
+  clearLimitHit: () => {},
 };
 
 const AuthContext = createContext<AuthContextType>(defaultValue);
@@ -45,6 +52,19 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   });
   const [user, setUser] = useState<UserData | null>(null);
   const [subscription, setSubscription] = useState<SubscriptionData | null>(null);
+  const [limitHit, setLimitHit] = useState<LimitHitDetail | null>(null);
+
+  const showLimitHit = useCallback((detail: LimitHitDetail) => setLimitHit(detail), []);
+  const clearLimitHit = useCallback(() => setLimitHit(null), []);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<LimitHitDetail>).detail;
+      if (detail?.limit_type) setLimitHit(detail);
+    };
+    window.addEventListener('billing:limit-hit', handler);
+    return () => window.removeEventListener('billing:limit-hit', handler);
+  }, []);
 
   const refreshSubscription = async () => {
     try {
@@ -130,7 +150,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   return (
-    <AuthContext.Provider value={{ isAuthenticated, user, subscription, login, logout, refreshSubscription }}>
+    <AuthContext.Provider value={{
+      isAuthenticated, user, subscription, login, logout, refreshSubscription,
+      limitHit, showLimitHit, clearLimitHit,
+    }}>
       {children}
     </AuthContext.Provider>
   );

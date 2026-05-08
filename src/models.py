@@ -114,6 +114,10 @@ class ChatHistory(Base):
     chat_history_id = Column(String, primary_key=True, nullable=False, index=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String,ForeignKey(User.user_id), nullable=False,index=True)
     document_id = Column(String, ForeignKey(UserDocuments.document_id), nullable=False, index=True)
+    # active_tag is UX-only: hides archived chats from the list view.
+    # It does NOT affect billing — check_chat_limit counts chats by created_at
+    # within the billing period (utils/subscription.py). Any future "restore"
+    # endpoint that flips this to True must NOT also re-grant a billing slot.
     active_tag = Column(Boolean, nullable=False, default=text("True"))
     title = Column(String, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
@@ -496,6 +500,43 @@ class TransactionActionType:
     CLEAR_ALL = "clear_all"             # Cleared all changes
 
 
+class PipelineRunStatus:
+    """Lifecycle states for a 9-agent full pipeline run."""
+    QUEUED    = "queued"
+    RUNNING   = "running"
+    COMPLETED = "completed"
+    FAILED    = "failed"
+    CANCELLED = "cancelled"
+
+
+class PipelineRun(Base):
+    """
+    Tracks one asynchronous execution of the 9-agent full pipeline.
+
+    Created when the user clicks "Open Chat" on the presales report. The
+    background task updates this row as each LangGraph node executes so the
+    frontend can poll /full-pipeline/status/{chat_history_id} and render
+    per-stage progress. UNIQUE(chat_history_id) enforces a single in-flight
+    run per project; restarts overwrite the row.
+    """
+    __tablename__ = "pipeline_runs"
+
+    run_id           = Column(String, primary_key=True, nullable=False, index=True,
+                              default=lambda: str(uuid.uuid4()))
+    chat_history_id  = Column(String, ForeignKey(ChatHistory.chat_history_id),
+                              nullable=False, unique=True, index=True)
+    user_id          = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
+
+    status           = Column(String(20), nullable=False, default=PipelineRunStatus.QUEUED, index=True)
+    current_stage    = Column(String(64), nullable=True)
+    stages_completed = Column(JSON, nullable=False, default=list)
+    loop_count       = Column(Integer, nullable=False, default=0)
+    error            = Column(Text, nullable=True)
+
+    started_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    completed_at     = Column(TIMESTAMP(timezone=True), nullable=True)
+
+
 class TransactionHistory(Base):
     """
     Tracks all reversible actions for undo/redo functionality.
@@ -531,3 +572,38 @@ class TransactionHistory(Base):
     # Timestamps
     created_at = Column(TIMESTAMP(timezone=True), nullable=False,
                         server_default=text("now()"))
+
+
+class LLMCallLog(Base):
+    """
+    Per-call LLM telemetry. One row per ChatOpenAI invocation across the
+    agentic / presales pipelines and the chat paths. Powers /admin/llm-stats
+    and the prompt-caching before/after comparison (see migration 013).
+
+    cached_input_tokens is the OpenAI prompt-cache hit subset and is billed
+    at the discounted cached rate by utils.llm_pricing.compute_cost.
+    """
+    __tablename__ = "llm_call_log"
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    chat_history_id     = Column(String, ForeignKey(ChatHistory.chat_history_id),
+                                 nullable=True, index=True)
+    pipeline_run_id     = Column(String, ForeignKey("pipeline_runs.run_id"),
+                                 nullable=True, index=True)
+    presales_id         = Column(String, ForeignKey(PresalesAnalysis.presales_id),
+                                 nullable=True, index=True)
+    user_id             = Column(String, nullable=True, index=True)
+
+    agent_name          = Column(String(64), nullable=False, index=True)
+    model               = Column(String(64), nullable=False)
+
+    prompt_hash         = Column(String(64), nullable=True, index=True)
+
+    input_tokens        = Column(Integer, nullable=False, default=0)
+    cached_input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens       = Column(Integer, nullable=False, default=0)
+    latency_ms          = Column(Integer, nullable=False, default=0)
+    cost_usd            = Column(Float, nullable=False, default=0.0)
+
+    created_at          = Column(TIMESTAMP(timezone=True), nullable=False,
+                                 server_default=text("now()"))

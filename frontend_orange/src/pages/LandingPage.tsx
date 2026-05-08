@@ -4,6 +4,7 @@ import { Logo } from '../components/Logo';
 import { HeroVisual } from '../components/landing/HeroVisual';
 import { Demo } from '../components/landing/Demo';
 import { TypingHeadline } from '../components/landing/TypingHeadline';
+import { PLANS, PRO_CONTACT_EMAIL } from '../data/plans';
 
 // ── Small icon set ────────────────────────────────────────────────────────────
 const Ico = {
@@ -47,7 +48,7 @@ const FAQS = [
   { q: 'What does the output look like?',
     a: 'A structured alignment report: risks ranked by severity, clarifying questions, a first-pass architecture, week-level phasing, and a resource plan. All Markdown-exportable.' },
   { q: 'Can I bring my own LLM?',
-    a: 'On the Team and Enterprise tiers, yes — OpenAI, Anthropic, or Azure OpenAI. Starter uses our shared inference.' },
+    a: 'On the Pro plan, yes — OpenAI, Anthropic, or Azure OpenAI. Free, Basic and Plus use our shared inference.' },
   { q: 'Is my client data used for training?',
     a: 'No. Inputs are processed ephemerally and are not used to train any models. SOC 2 Type II, GDPR, ISO 27001.' },
 ];
@@ -236,53 +237,49 @@ const LandingPage: React.FC = () => {
       <section id="pricing" className="section">
         <div className="container">
           <div className="eyebrow section-eyebrow">Pricing</div>
-          <h2 className="display section-h">Priced per seat, not per word.</h2>
+          <h2 className="display section-h">Simple, transparent pricing.</h2>
           <div className="tiers">
-            <div className="tier">
-              <div className="tier-name display">Starter</div>
-              <div className="tier-price-row"><span className="display tier-price">$0</span><span className="tier-per">/ forever</span></div>
-              <div className="tier-sub">Solo consultants. Students. Tire-kickers.</div>
-              <div className="tier-sep" />
-              <ul className="tier-feats">
-                <li>{Ico.check}<span>3 scoping reports / mo</span></li>
-                <li>{Ico.check}<span>Core 9-agent pipeline</span></li>
-                <li>{Ico.check}<span>Markdown export</span></li>
-                <li>{Ico.check}<span>Community support</span></li>
-              </ul>
-              <Link to="/signup" className="btn btn-ghost" style={{ width: '100%' }}>Start free</Link>
-            </div>
-
-            <div className="tier featured">
-              <div className="tier-badge">MOST POPULAR</div>
-              <div className="tier-name display">Team</div>
-              <div className="tier-price-row"><span className="display tier-price">$49</span><span className="tier-per">/ seat / mo</span></div>
-              <div className="tier-sub">Consulting practices. Boutique studios.</div>
-              <div className="tier-sep" />
-              <ul className="tier-feats">
-                <li>{Ico.check}<span>Unlimited reports</span></li>
-                <li>{Ico.check}<span>Shared workspace + version history</span></li>
-                <li>{Ico.check}<span>Jira / Linear / Notion export</span></li>
-                <li>{Ico.check}<span>Bring-your-own-LLM</span></li>
-                <li>{Ico.check}<span>Priority support</span></li>
-              </ul>
-              <Link to="/signup" className="btn btn-primary" style={{ width: '100%' }}>Start 14-day trial</Link>
-            </div>
-
-            <div className="tier">
-              <div className="tier-name display">Enterprise</div>
-              <div className="tier-price-row"><span className="display tier-price">Custom</span></div>
-              <div className="tier-sub">Large consultancies. Regulated industries.</div>
-              <div className="tier-sep" />
-              <ul className="tier-feats">
-                <li>{Ico.check}<span>Everything in Team</span></li>
-                <li>{Ico.check}<span>SSO (SAML / OIDC)</span></li>
-                <li>{Ico.check}<span>Private cloud deploy</span></li>
-                <li>{Ico.check}<span>SOC 2, GDPR, ISO 27001 addenda</span></li>
-                <li>{Ico.check}<span>Named success manager</span></li>
-              </ul>
-              <a href="mailto:sales@aligniq.io" className="btn btn-ghost" style={{ width: '100%' }}>Talk to sales</a>
-            </div>
+            {PLANS.map(plan => {
+              const ctaTo =
+                plan.ctaKind === 'contact'
+                  ? `mailto:${PRO_CONTACT_EMAIL}?subject=AlignIQ Pro Plan`
+                  : plan.ctaKind === 'free'
+                  ? '/signup'
+                  : `/signup?intent=upgrade&tier=${plan.id}`;
+              const isExternal = plan.ctaKind === 'contact';
+              const btnClass = plan.highlight ? 'btn btn-primary' : 'btn btn-ghost';
+              const periodLabel = plan.period ? plan.period.replace(/^\//, '/ ') : '';
+              return (
+                <div key={plan.id} className={`tier${plan.highlight ? ' featured' : ''}`}>
+                  {plan.highlight && <div className="tier-badge">MOST POPULAR</div>}
+                  <div className="tier-name display">{plan.name}</div>
+                  <div className="tier-price-row">
+                    <span className="display tier-price">{plan.price}</span>
+                    {periodLabel && <span className="tier-per">{periodLabel}</span>}
+                  </div>
+                  <div className="tier-sub">{plan.description}</div>
+                  <div className="tier-sep" />
+                  <ul className="tier-feats">
+                    {plan.features.map(f => (
+                      <li key={f}>{Ico.check}<span>{f}</span></li>
+                    ))}
+                  </ul>
+                  {isExternal ? (
+                    <a href={ctaTo} className={btnClass} style={{ width: '100%' }}>
+                      {plan.ctaLabel}
+                    </a>
+                  ) : (
+                    <Link to={ctaTo} className={btnClass} style={{ width: '100%' }}>
+                      {plan.ctaLabel}
+                    </Link>
+                  )}
+                </div>
+              );
+            })}
           </div>
+          <p style={{ textAlign: 'center', marginTop: 28, fontSize: 13, color: 'var(--fg-dim)' }}>
+            Already have an account? <Link to="/pricing" style={{ color: 'var(--accent)' }}>View detailed plans →</Link>
+          </p>
         </div>
       </section>
 
