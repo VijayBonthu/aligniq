@@ -35,28 +35,43 @@ function loadMermaid() {
 
 function MermaidDiagram({ source, id }: { source: string; id: string }) {
   const [svg, setSvg] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    const renderId = `mmd-${id}`;
     loadMermaid()
       .then(async (mermaid) => {
         try {
-          const { svg: out } = await mermaid.render(`mmd-${id}`, source);
+          const valid = await mermaid
+            .parse(source, { suppressErrors: true })
+            .catch(() => false);
+          if (!valid) {
+            if (!cancelled) setFailed(true);
+            return;
+          }
+          const { svg: out } = await mermaid.render(renderId, source);
+          if (out.includes('aria-roledescription="error"') || out.includes('Syntax error')) {
+            if (!cancelled) setFailed(true);
+            return;
+          }
           if (!cancelled) setSvg(out);
-        } catch (err) {
-          if (!cancelled) setError(err instanceof Error ? err.message : 'Diagram render failed');
+        } catch {
+          if (!cancelled) setFailed(true);
+        } finally {
+          const orphan = document.getElementById(`d${renderId}`);
+          if (orphan && orphan.parentNode === document.body) orphan.remove();
         }
       })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Mermaid failed to load');
+      .catch(() => {
+        if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
     };
   }, [source, id]);
 
-  if (error) {
+  if (failed) {
     return (
       <pre
         style={{
@@ -65,12 +80,14 @@ function MermaidDiagram({ source, id }: { source: string; id: string }) {
           border: '1px solid var(--border)',
           borderRadius: 8,
           fontSize: 12,
-          color: 'var(--danger)',
-          whiteSpace: 'pre-wrap',
+          color: 'var(--fg-dim)',
+          whiteSpace: 'pre',
+          overflowX: 'auto',
           margin: '8px 0',
+          fontFamily: 'var(--font-mono)',
         }}
       >
-        Mermaid render failed: {error}
+        {source}
       </pre>
     );
   }

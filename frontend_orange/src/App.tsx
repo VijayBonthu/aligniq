@@ -11,6 +11,7 @@ import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
 import ChatView from './pages/ChatView';
 import FullPipelineProgress from './pages/FullPipelineProgress';
+import DeliverableBuilder from './pages/DeliverableBuilder';
 import Messages from './pages/Messages';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
@@ -26,6 +27,7 @@ function BgLayers() {
     pathname.startsWith('/new-project') ||
     pathname.startsWith('/chat') ||
     pathname.startsWith('/full-pipeline') ||
+    pathname.startsWith('/deliverable') ||
     pathname.startsWith('/messages') ||
     pathname.startsWith('/reports') ||
     pathname.startsWith('/settings') ||
@@ -148,6 +150,16 @@ function App() {
                 <ProtectedRoute>
                   <AppShell>
                     <FullPipelineProgress />
+                  </AppShell>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/deliverable/:chatHistoryId"
+              element={
+                <ProtectedRoute>
+                  <AppShell>
+                    <DeliverableBuilder />
                   </AppShell>
                 </ProtectedRoute>
               }

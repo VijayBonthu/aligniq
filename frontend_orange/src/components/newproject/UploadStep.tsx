@@ -8,7 +8,7 @@ interface UploadStepProps {
   onBeforeUpload?: () => boolean;
 }
 
-const ACCEPTED = '.pdf,.docx,.pptx';
+const ACCEPTED = '.pdf,.docx,.pptx,.txt,.md,.markdown,.mdx,.csv';
 
 export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepProps) {
   const [file, setFile] = useState<File | null>(null);
@@ -176,7 +176,7 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
                     textTransform: 'uppercase',
                   }}
                 >
-                  PDF · DOCX · PPTX
+                  PDF · DOCX · PPTX · TXT · MD · CSV
                 </p>
               </div>
             )}

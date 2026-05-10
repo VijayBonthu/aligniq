@@ -7,6 +7,9 @@ import { useAuth } from '../context/AuthContext';
 import useStreamingChat from '../hooks/useStreamingChat';
 import RichMessage, { type ChatMessage } from '../components/chat/RichMessage';
 import IntegrationsSidebar from '../components/chat/IntegrationsSidebar';
+import PreMortemPanel from '../components/chat/PreMortemPanel';
+
+type TabKey = 'chat' | 'premortem';
 
 interface ChatRecord {
   chat_history_id: string;
@@ -66,6 +69,8 @@ export default function ChatView() {
   const [input, setInput] = useState('');
   const [contextMode, setContextMode] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<TabKey>('chat');
+  const reportReady = record?.pipeline_status === 'completed' || record?.pipeline_status === 'idle' || record?.pipeline_status == null;
   // Server is the source of truth on hydration; bumped locally on each send so
   // the indicator updates without re-fetching /chat/{id} after every message.
   const [messageCount, setMessageCount] = useState(0);
@@ -318,10 +323,67 @@ export default function ChatView() {
             FULL REPORT
           </span>
           <button
-            onClick={() => setContextMode((p) => !p)}
-            title="Select messages to include in LLM context"
+            onClick={() => reportReady && navigate(`/deliverable/${chatHistoryId}`)}
+            disabled={!reportReady}
+            title={
+              reportReady
+                ? 'Curate a client-clean deliverable from this report'
+                : 'Available after the full pipeline finishes'
+            }
             style={{
               display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '5px 11px',
+              borderRadius: 999,
+              border: `1px solid ${reportReady ? 'var(--accent)' : 'var(--border)'}`,
+              background: reportReady ? 'var(--accent-soft)' : 'transparent',
+              color: reportReady ? 'var(--accent)' : 'var(--fg-muted)',
+              fontSize: 11,
+              fontFamily: 'var(--font-mono)',
+              letterSpacing: '.06em',
+              cursor: reportReady ? 'pointer' : 'not-allowed',
+              opacity: reportReady ? 1 : 0.6,
+            }}
+          >
+            <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" strokeWidth="2" strokeLinejoin="round" />
+              <path d="M14 2v6h6" strokeWidth="2" strokeLinejoin="round" />
+            </svg>
+            Build Deliverable
+          </button>
+          <div
+            role="tablist"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 2,
+              marginRight: 4,
+            }}
+          >
+            <TabButton
+              active={tab === 'chat'}
+              onClick={() => setTab('chat')}
+              label="Chat"
+            />
+            <TabButton
+              active={tab === 'premortem'}
+              onClick={() => reportReady && setTab('premortem')}
+              label="Pre-Mortem"
+              disabled={!reportReady}
+              title={
+                reportReady
+                  ? 'Adversarial buyer-side objections (CFO / CISO / Procurement)'
+                  : 'Pre-Mortem becomes available once the full pipeline finishes'
+              }
+            />
+          </div>
+          <button
+            onClick={() => setContextMode((p) => !p)}
+            title="Select messages to include in LLM context"
+            disabled={tab !== 'chat'}
+            style={{
+              display: tab === 'chat' ? 'flex' : 'none',
               alignItems: 'center',
               gap: 5,
               padding: '5px 10px',
@@ -346,6 +408,10 @@ export default function ChatView() {
           </button>
         </div>
 
+        {tab === 'premortem' && chatHistoryId ? (
+          <PreMortemPanel chatHistoryId={chatHistoryId} />
+        ) : (
+        <>
         {contextMode && (
           <div
             style={{
@@ -640,8 +706,53 @@ export default function ChatView() {
             </p>
           </div>
         </div>
+        </>
+        )}
       </div>
       <IntegrationsSidebar />
     </div>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  label,
+  disabled,
+  title,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      style={{
+        background: 'transparent',
+        border: 'none',
+        padding: '6px 12px',
+        fontSize: 12,
+        fontFamily: 'var(--font-mono)',
+        letterSpacing: '.05em',
+        textTransform: 'uppercase',
+        color: disabled
+          ? 'var(--fg-muted)'
+          : active
+            ? 'var(--fg)'
+            : 'var(--fg-dim)',
+        borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {label}
+    </button>
   );
 }

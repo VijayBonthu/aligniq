@@ -6,8 +6,10 @@ from sqlalchemy.orm.attributes import flag_modified
 from p_model_type import Registration_login
 from sqlalchemy import and_
 from utils.token_generation import hash_passwords
+from utils.report_sections import parse_sections
 from fastapi import HTTPException, status
 from utils.logger import logger
+from datetime import datetime
 import copy
 import uuid
 from typing import Optional
@@ -110,6 +112,70 @@ async def get_summary_report(chat_history_id:str, db:Session)-> dict:
         return record
     except SQLAlchemyError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error occured with the DB, chat history id: {chat_history_id}, error: {str(e)}")
+
+
+# ============================================================
+# A6 — PRE-MORTEM (adversarial-persona objections cache)
+# ============================================================
+
+async def get_pre_mortem(chat_history_id: str, db: Session) -> Optional[dict]:
+    """
+    Return the cached pre_mortem JSON from the latest report_version of this
+    chat, or None if no report exists yet, or None if pre_mortem hasn't been
+    generated yet for that version.
+    """
+    try:
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+        if not record:
+            return None
+        return copy.deepcopy(record.pre_mortem) if record.pre_mortem else None
+    except SQLAlchemyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error reading pre_mortem: {str(e)}"
+        )
+
+
+async def save_pre_mortem(chat_history_id: str, pre_mortem: dict, db: Session) -> None:
+    """
+    Persist pre_mortem onto the latest report_version row for this chat.
+    No locking — last writer wins (acceptable: cost of a duplicate write is
+    one wasted LLM call already paid upstream).
+    """
+    try:
+        record = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No report_version found for chat {chat_history_id}"
+            )
+        record.pre_mortem = pre_mortem
+        flag_modified(record, "pre_mortem")
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving pre_mortem: {str(e)}"
+        )
+
+
+async def get_report_version_id(chat_history_id: str, db: Session) -> Optional[str]:
+    """Return the latest report_version_id for this chat, or None."""
+    try:
+        record = db.query(models.ReportVersions.report_version_id).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).order_by(models.ReportVersions.created_at.desc()).first()
+        return record[0] if record else None
+    except SQLAlchemyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error reading report_version_id: {str(e)}"
+        )
 
 
 # ============================================================
@@ -764,6 +830,20 @@ async def create_new_report_version(
         if parent_version_id is None and latest:
             parent_version_id = latest.report_version_id
 
+        # Carry forward the user's Deliverable Builder (A5) curation state when
+        # the report's section IDs are unchanged between versions. Polished
+        # overrides are always reset because their content is stale by definition.
+        carried_config = None
+        if latest and latest.deliverable_config:
+            try:
+                old_ids = {s.id for s in parse_sections(latest.report_content or "")}
+                new_ids = {s.id for s in parse_sections(report_content or "")}
+                if old_ids and old_ids == new_ids:
+                    carried_config = latest.deliverable_config
+            except Exception as e:
+                # Don't fail the regen path on a parser hiccup; just drop the config.
+                logger.warning(f"deliverable_config carry-forward skipped due to parse error: {e}")
+
         # Set all existing versions to is_default=False before creating new version
         # This ensures only the new version will have is_default=True
         db.query(models.ReportVersions).filter(
@@ -781,7 +861,10 @@ async def create_new_report_version(
             pending_changes=[],  # Clear pending changes for new version
             changes_applied=changes_applied,  # Store the changes that created this version
             changelog_summary=changelog_summary,  # Store the changelog summary
-            parent_version_id=parent_version_id  # Track version lineage
+            parent_version_id=parent_version_id,  # Track version lineage
+            deliverable_config=carried_config,  # A5: carried forward when section IDs match
+            deliverable_polished_sections=None,  # A5: always reset; polish content is stale
+            deliverable_updated_at=datetime.utcnow() if carried_config else None,
         )
 
         db.add(new_version)
@@ -805,6 +888,141 @@ async def create_new_report_version(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error creating new report version: {str(e)}"
+        )
+
+
+# ============================================================================
+# DELIVERABLE BUILDER (A5) — per-project curation state on report_version
+# ============================================================================
+
+def _get_default_report_version(chat_history_id: str, db: Session):
+    """Internal: fetch the is_default report_version row for this chat, or None."""
+    return (
+        db.query(models.ReportVersions)
+        .filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.is_default.is_(True),
+        )
+        .first()
+    )
+
+
+async def get_deliverable_state(chat_history_id: str, db: Session) -> Optional[dict]:
+    """Read the Deliverable Builder curation state for a project.
+
+    Returns the source markdown alongside the persisted config + polish so the
+    builder UI can render the section list and preview in one round trip.
+    Returns None if no report version exists yet for this chat.
+    """
+    row = _get_default_report_version(chat_history_id, db)
+    if not row:
+        return None
+    return {
+        "report_version_id": row.report_version_id,
+        "report_content": row.report_content,
+        "config": row.deliverable_config,
+        "polished_sections": row.deliverable_polished_sections or {},
+        "updated_at": row.deliverable_updated_at.isoformat() if row.deliverable_updated_at else None,
+    }
+
+
+async def update_deliverable_config(
+    chat_history_id: str,
+    config: dict,
+    db: Session,
+) -> dict:
+    """Replace the deliverable_config for the default report_version of this chat.
+
+    The caller is responsible for validating section IDs against the current
+    parsed sections (done in the PUT endpoint) — this helper does no validation
+    beyond shape coercion.
+    """
+    row = _get_default_report_version(chat_history_id, db)
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No report version found for this chat",
+        )
+    try:
+        row.deliverable_config = config
+        row.deliverable_updated_at = datetime.utcnow()
+        flag_modified(row, "deliverable_config")
+        db.commit()
+        db.refresh(row)
+        return {
+            "status": "success",
+            "report_version_id": row.report_version_id,
+            "updated_at": row.deliverable_updated_at.isoformat(),
+        }
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error updating deliverable config: {str(e)}",
+        )
+
+
+async def set_polished_section(
+    chat_history_id: str,
+    section_id: str,
+    polished_markdown: str,
+    db: Session,
+) -> dict:
+    """Persist a polished version of one section. Replaces any prior polish for that id."""
+    row = _get_default_report_version(chat_history_id, db)
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No report version found for this chat",
+        )
+    try:
+        polished = dict(row.deliverable_polished_sections or {})
+        polished[section_id] = {
+            "markdown": polished_markdown,
+            "polished_at": datetime.utcnow().isoformat(),
+        }
+        row.deliverable_polished_sections = polished
+        row.deliverable_updated_at = datetime.utcnow()
+        flag_modified(row, "deliverable_polished_sections")
+        db.commit()
+        return {
+            "status": "success",
+            "section_id": section_id,
+            "polished_at": polished[section_id]["polished_at"],
+        }
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error persisting polished section: {str(e)}",
+        )
+
+
+async def revert_polished_section(
+    chat_history_id: str,
+    section_id: str,
+    db: Session,
+) -> dict:
+    """Remove the polish override for a section so the source/edit markdown is used again."""
+    row = _get_default_report_version(chat_history_id, db)
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No report version found for this chat",
+        )
+    try:
+        polished = dict(row.deliverable_polished_sections or {})
+        polished.pop(section_id, None)
+        row.deliverable_polished_sections = polished or None
+        row.deliverable_updated_at = datetime.utcnow()
+        flag_modified(row, "deliverable_polished_sections")
+        db.commit()
+        return {"status": "success", "section_id": section_id}
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error reverting polished section: {str(e)}",
         )
 
 

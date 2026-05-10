@@ -1,0 +1,17 @@
+# Named technologies / vendors / products that polish_section MUST preserve.
+# One per line; case-insensitive substring match.
+PostgreSQL
+AWS
+RDS
+Aurora Serverless
+Redis
+ElastiCache
+S3
+KMS
+Auth0
+SAML
+Okta
+Datadog
+CloudWatch
+GitHub Actions
+Terraform

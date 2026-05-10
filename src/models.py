@@ -152,6 +152,10 @@ class ReportVersions(Base):
     changes_applied = Column(JSON, nullable=True, default=None)  # Pending changes that created this version
     changelog_summary = Column(Text, nullable=True)  # LLM-generated summary of what changed and why
     parent_version_id = Column(String, nullable=True)  # Reference to the version this was based on
+    pre_mortem = Column(JSON, nullable=True, default=None)  # Adversarial-persona objections (A6) — NULL until generated
+    deliverable_config = Column(JSON, nullable=True, default=None)  # Deliverable Builder (A5) curation state
+    deliverable_polished_sections = Column(JSON, nullable=True, default=None)  # Per-section LLM polish overrides
+    deliverable_updated_at = Column(TIMESTAMP(timezone=True), nullable=True, default=None)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=True, onupdate=text("now()"))
 

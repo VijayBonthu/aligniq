@@ -254,8 +254,8 @@ class ExtractText:
         elif file_extension == ".pdf":
             # return self.extract_pdf()
             return self.process_pdf_with_structure()
-        elif file_extension == ".txt":
-            return self.extract_txt()
+        elif file_extension in (".txt", ".md", ".markdown", ".mdx"):
+            return self._process_txt()
         elif file_extension == ".csv":
             return self.extract_csv()
         #removing .xlsx cause of parsing issue for now # too lazy to write parsing in service.py
@@ -264,7 +264,7 @@ class ExtractText:
         elif file_extension == ".pptx":
             return self._process_pptx()
         else:
-            return "unsupported file type. Please provide .docx .pdf .txt .pptx file"
+            return "unsupported file type. Please provide .pdf, .docx, .pptx, .txt, .md, .csv file"
 
 @asynccontextmanager
 async def open_pdf(document_path: str = None, stream: bytes = None, filetype: str = None):

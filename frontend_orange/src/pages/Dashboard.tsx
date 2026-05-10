@@ -940,7 +940,7 @@ const Dashboard: React.FC = () => {
                         type="file"
                         style={{ display: 'none' }}
                         onChange={handleFileChange}
-                        accept=".pdf,.ppt,.pptx,.docx,.txt,.csv"
+                        accept=".pdf,.docx,.pptx,.txt,.md,.markdown,.mdx,.csv"
                         multiple
                       />
                       <div style={{ fontSize: 32, marginBottom: 12 }}>📄</div>
@@ -948,7 +948,7 @@ const Dashboard: React.FC = () => {
                         Drag and drop your files here
                       </p>
                       <p style={{ fontSize: 13, color: 'var(--fg-muted)', margin: '0 0 16px' }}>or click to browse</p>
-                      <span className="badge badge-accent" style={{ fontSize: 10 }}>PDF · PPTX · DOCX · TXT · CSV</span>
+                      <span className="badge badge-accent" style={{ fontSize: 10 }}>PDF · DOCX · PPTX · TXT · MD · CSV</span>
                     </div>
                   ) : (
                     <div style={{ padding: 20 }}>

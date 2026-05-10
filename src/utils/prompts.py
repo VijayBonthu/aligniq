@@ -2870,3 +2870,165 @@ Write a natural, conversational response (150-250 words).
 End with an offer to track as a change if their suggestion has merit.
 Do NOT end with an offer if their suggestion would break requirements - instead explain why.
 """
+
+
+# ============================================================
+# A6 — PRE-MORTEM TAB (adversarial roundtable, on-demand)
+# ============================================================
+# Buyer-side adversarial panel. Three default panelists (CFO, CISO,
+# Procurement) plus user-added custom panelists. Each turn, the user posts
+# a message and the panel responds in parallel — one LLM call returns N
+# panelist responses as structured JSON, persisted as a thread on
+# report_version.pre_mortem.
+
+DEFAULT_PANELIST_BRIEFS = {
+    "cfo": "Skeptical CFO. Cares about: total cost, contingency adequacy, hidden costs, payment milestones, ROI/payback, scope creep risk, vendor lock-in cost, change-order exposure. Skeptical of optimistic estimates.",
+    "ciso": "Paranoid CISO. Cares about: data residency, encryption at rest/in transit, identity & access, audit trails, regulatory scope (PCI/HIPAA/SOC2/GDPR), third-party dependencies, blast radius of a compromise, incident response. Assumes the worst about every component touching PII or auth.",
+    "procurement": "Cost-Conscious Procurement. Cares about: assumed pricing/rates, vendor agreements assumed (e.g. 'you assumed our AWS EDP — we don't have one'), licensing models, support contracts, exit/transition costs, alternative vendor leverage, payment terms, deliverables-vs-time-and-materials. Pushes for unbundling and cheaper alternatives.",
+}
+
+# Items per persona for a STARTER turn ("surface objections this report invites")
+STARTER_ITEMS_MIN = 5
+STARTER_ITEMS_MAX = 10
+# Items per persona for a FOLLOW-UP turn (user asked something specific)
+FOLLOWUP_ITEMS_MIN = 1
+FOLLOWUP_ITEMS_MAX = 3
+
+PRE_MORTEM_TURN_PROMPT = """You are simulating an adversarial buyer-side panel reviewing a vendor's presales report. The vendor's BA is using you as a stress-test before/during a stakeholder conversation. Stay sharp, combative, and grounded — every concern you raise must point at something in the report data below, never invented.
+
+PANELISTS (this turn):
+{panelists_block}
+
+REPORT DATA (the source of truth — do NOT fabricate beyond this):
+
+KEY_RISKS (0-indexed):
+{key_risks_json}
+
+CRITICAL_ASSUMPTIONS (0-indexed):
+{critical_assumptions_json}
+
+OPEN_QUESTIONS_FOR_CLIENT (0-indexed):
+{open_questions_json}
+
+RECOMMENDED_ARCHITECTURE:
+{recommended_arch_json}
+
+COST_ESTIMATE:
+{cost_estimate_json}
+
+FEASIBILITY:
+{feasibility_json}
+
+PRIOR THREAD (condensed, for context continuity):
+{thread_history}
+
+THIS TURN — kind = "{turn_kind}":
+USER MESSAGE: {user_message}
+
+INSTRUCTIONS:
+
+- For a "starter" turn (kind=starter): each panelist produces {starter_min}–{starter_max} of the strongest objections THEY would raise about this report. Cover their distinct angle (CFO ≠ Procurement on cost — CFO = total/contingency/ROI; Procurement = pricing assumptions/terms/leverage).
+- For a "user_question" turn (kind=user_question): each panelist produces {followup_min}–{followup_max} reactions — concerns, agreements, follow-up probes — to what the user just said. Stay in character. If the question is "client just asked X, what would each of you say", each panelist responds AS THEMSELVES with their angle on X.
+- Each item MUST include at least one `evidence` entry. Allowed `type` values: "risk", "assumption", "open_question", "section". For "risk" / "assumption" / "open_question", `ref_index` is the 0-indexed position in the corresponding array above; copy a short `label` (the title or first sentence). For "section" use `ref_index: null` and a `label` like "Recommended Architecture" or "Cost §6.2".
+- `severity`: "high" (deal-breaker / blocking concern), "med" (will require explanation), "low" (minor pushback).
+- `point` is what THIS panelist would say — phrased in their voice, first person, ~1–3 sentences. Sharp, direct.
+- `counter_response` is the BA's drafted answer that the panelist's `point` deserves. 2–4 sentences, specific, references the evidence. End with an offer to revise if appropriate.
+- **NEVER write placeholder tokens like `KEY_RISKS[2]`, `CRITICAL_ASSUMPTIONS[1]`, `critical_question[0]`, `OPEN_QUESTIONS_FOR_CLIENT[3]` in `point` or `counter_response` prose.** Those identifiers belong ONLY in the `evidence` array (as `ref_index`). In prose, paraphrase the actual content in plain English. *Bad:* "We should validate CRITICAL_ASSUMPTIONS[1] with stakeholders." *Good:* "We should validate the assumption that vendor admins won't access the MVP UI." A reader who never sees the evidence chip must still understand which risk/assumption/question you mean.
+- If a panelist genuinely has nothing to add this turn (e.g. CISO on a pure-cost question), they may return 0 items — but only if forcing them to speak would mean inventing. Prefer 1 honest item over 3 padded ones.
+- Do NOT repeat objections already surfaced in PRIOR THREAD unless the user's question explicitly revisits that ground.
+
+OUTPUT — strict JSON, this exact shape, no surrounding prose:
+
+{{
+  "responses": [
+    {{
+      "panelist_id": "<one of the panelist ids above>",
+      "items": [
+        {{
+          "id": "auto",
+          "severity": "high|med|low",
+          "point": "...",
+          "counter_response": "...",
+          "evidence": [
+            {{ "type": "risk|assumption|open_question|section", "ref_index": 0, "label": "..." }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+
+You MUST return one entry in `responses` for EACH panelist id given above (in the same order). If a panelist truly has nothing for this turn, return them with `items: []` and an explicit empty list — do not omit the panelist.
+"""
+
+
+# Legacy v1 one-shot prompt — kept for reference and potentially reusable
+# by a future "snapshot" feature. Not wired into the live flow.
+PRE_MORTEM_PROMPT = """You are simulating three adversarial buyer-side reviewers of a presales report that a vendor will pitch to a client. Your job is to generate the questions/objections each reviewer will raise IN THE MEETING, plus a drafted counter-response the vendor's BA can use, grounded in the report data below.
+
+PERSONAS (generate objections for each):
+
+1. **Skeptical CFO** — id: "cfo", label: "Skeptical CFO"
+   Cares about: total cost, contingency adequacy, hidden costs, payment milestones, ROI/payback, scope creep risk, vendor lock-in cost, change-order exposure. Skeptical of optimistic estimates. Asks "what if X goes wrong, what does it cost us?"
+
+2. **Paranoid CISO** — id: "ciso", label: "Paranoid CISO"
+   Cares about: data residency, encryption at rest/in transit, identity & access, audit trails, regulatory scope (PCI/HIPAA/SOC2/GDPR), third-party dependencies, blast radius of a compromise, incident response. Assumes the worst about every component touching PII or auth.
+
+3. **Cost-Conscious Procurement** — id: "procurement", label: "Cost-Conscious Procurement"
+   Cares about: assumed pricing/rates, vendor agreements assumed (e.g. "you assumed our AWS EDP — we don't have one"), licensing models, support contracts, exit/transition costs, alternative vendor leverage, payment terms, deliverables-vs-time-and-materials. Pushes for unbundling and cheaper alternatives.
+
+REPORT DATA (the source of truth for evidence references):
+
+KEY_RISKS (0-indexed):
+{key_risks_json}
+
+CRITICAL_ASSUMPTIONS (0-indexed):
+{critical_assumptions_json}
+
+OPEN_QUESTIONS_FOR_CLIENT (0-indexed):
+{open_questions_json}
+
+RECOMMENDED_ARCHITECTURE:
+{recommended_arch_json}
+
+COST_ESTIMATE:
+{cost_estimate_json}
+
+FEASIBILITY:
+{feasibility_json}
+
+INSTRUCTIONS:
+
+- For each persona, produce 5–10 objections. If you genuinely cannot find 5 grounded objections for a persona (e.g. risks list is empty), produce only what you can ground — minimum 3, never invent risks not implied by the data above.
+- Each objection MUST include at least one `evidence` entry. Allowed `type` values: "risk", "assumption", "open_question", "section". For "risk" / "assumption" / "open_question", `ref_index` is the 0-indexed position in the corresponding array above; copy a short `label` (the title or first sentence) so the UI can render without re-deref. For "section" use `ref_index: null` and a `label` like "Recommended Architecture" or "Cost §6.2".
+- Severity: "high" (deal-breaker / blocking objection), "med" (will require explanation), "low" (minor pushback).
+- The `objection` field should be phrased AS THE CLIENT WOULD ASK IT (first person, in quotes is fine but no leading quote chars). Direct, sharp, ~1–3 sentences.
+- The `counter_response` is the BA's drafted answer. 2–4 sentences, specific, references the evidence. End with an offer to revise if the client wants a different stance.
+- Do NOT repeat the same objection across personas — each persona has a distinct angle. CFO ≠ Procurement (CFO = total/contingency/ROI; Procurement = pricing assumptions/terms/leverage).
+- Do NOT invent numbers. If the report doesn't have a contingency %, do not fabricate one — ask the question of the assumption instead.
+
+OUTPUT — strict JSON, this exact shape, no surrounding prose:
+
+{{
+  "personas": [
+    {{
+      "id": "cfo",
+      "label": "Skeptical CFO",
+      "objections": [
+        {{
+          "id": "cfo-1",
+          "severity": "high|med|low",
+          "objection": "...",
+          "counter_response": "...",
+          "evidence": [
+            {{ "type": "risk|assumption|open_question|section", "ref_index": 0, "label": "..." }}
+          ]
+        }}
+      ]
+    }},
+    {{ "id": "ciso", "label": "Paranoid CISO", "objections": [ ... ] }},
+    {{ "id": "procurement", "label": "Cost-Conscious Procurement", "objections": [ ... ] }}
+  ]
+}}
+"""
+

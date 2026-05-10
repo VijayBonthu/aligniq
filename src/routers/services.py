@@ -1,6 +1,7 @@
 from fastapi import File, UploadFile, Form, Depends, APIRouter, HTTPException, status, Request, Security, BackgroundTasks, Body
 from fastapi.responses import HTMLResponse
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 import os
 import json
 from utils.token_generation import token_validator
@@ -291,6 +292,13 @@ async def upload_file(
         file_uuid = str(uuid.uuid4())
         file_extension = content_document.filename.split(".")[-1]
         document_name = content_document.filename.split(".")[0]
+
+        SUPPORTED_EXTENSIONS = {"pdf", "docx", "pptx", "txt", "md", "markdown", "mdx", "csv"}
+        if file_extension.lower() not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported file type '.{file_extension}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+            )
         user_dir = f"{UPLOADS_DIR}/{current_token['regular_login_token']['id']}"
         os.makedirs(user_dir, exist_ok=True) 
         
@@ -4932,6 +4940,373 @@ async def compare_versions(
     except Exception as e:
         logger.error(f"Error computing diff: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error computing diff: {str(e)}")
+
+
+# ============================================================================
+# A6 — PRE-MORTEM TAB (v2: on-demand adversarial roundtable thread)
+# ============================================================================
+# Stored as a thread on report_version.pre_mortem. New report version =>
+# fresh empty thread (cache invalidation is free). LLM only fires when the
+# user posts a turn — $0 baseline. Per-item loop hooks let an objection
+# become an open question or a pending change against the report.
+
+async def _premortem_owner_chat(chat_history_id: str, current_user, db: Session):
+    user_id = current_user["regular_login_token"]["id"]
+    chat = await get_single_user_chat_history(
+        chat_history_id=chat_history_id, user_id=user_id, db=db
+    )
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Chat history not found"
+        )
+    return chat
+
+
+@router.get('/pre-mortem/{chat_history_id}')
+async def get_pre_mortem_thread(
+    chat_history_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    from database_scripts import get_pre_mortem, get_summary_report
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    report = await get_summary_report(chat_history_id, db)
+    if not report or not report.report_content or not report.summary_report:
+        return {"status": "report_not_ready", "thread": None}
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if thread and thread.get("turns"):
+        return {"status": "ready", "thread": thread}
+    return {"status": "empty", "thread": thread}
+
+
+@router.get('/pre-mortem/{chat_history_id}/sources')
+async def get_pre_mortem_sources(
+    chat_history_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the underlying source arrays the panel cites in its evidence chips.
+    Lets the UI render full source text for each evidence ref_index.
+    """
+    from database_scripts import get_summary_report
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    report = await get_summary_report(chat_history_id, db)
+    if not report or not report.summary_report:
+        return {
+            "key_risks": [],
+            "critical_assumptions": [],
+            "open_questions_for_client": [],
+        }
+    summary = report.summary_report if isinstance(report.summary_report, dict) else {}
+    return {
+        "key_risks": list(summary.get("key_risks") or []),
+        "critical_assumptions": list(summary.get("critical_assumptions") or []),
+        "open_questions_for_client": list(summary.get("open_questions_for_client") or []),
+    }
+
+
+@router.post('/pre-mortem/{chat_history_id}/turn')
+async def post_pre_mortem_turn(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    from database_scripts import get_pre_mortem, save_pre_mortem, get_report_version_id
+    from utils.pre_mortem import empty_thread, run_turn
+    from config import settings as cfg
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    user_message = (payload or {}).get("user_message")
+    kind = (payload or {}).get("kind", "user_question")
+    if not isinstance(user_message, str) or not user_message.strip():
+        raise HTTPException(status_code=400, detail="user_message is required")
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if not thread:
+        rv_id = await get_report_version_id(chat_history_id, db)
+        if not rv_id:
+            raise HTTPException(status_code=409, detail="Pre-mortem: report not ready")
+        model_name = cfg.GENERATING_REPORT_MODEL or "gpt-4o-mini"
+        thread = empty_thread(rv_id, model_name)
+
+    thread = await run_turn(chat_history_id, db, thread, user_message, kind)
+    await save_pre_mortem(chat_history_id, thread, db)
+    logger.info(f"Pre-mortem turn appended for chat {chat_history_id} (kind={kind})")
+    return {"thread": thread}
+
+
+@router.post('/pre-mortem/{chat_history_id}/panelist')
+async def add_pre_mortem_panelist(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    import uuid as _uuid
+    from database_scripts import get_pre_mortem, save_pre_mortem, get_report_version_id
+    from utils.pre_mortem import empty_thread
+    from config import settings as cfg
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    label = (payload or {}).get("label", "").strip()
+    concern = (payload or {}).get("concern", "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+    if len(label) > 80 or len(concern) > 400:
+        raise HTTPException(status_code=400, detail="label/concern too long")
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if not thread:
+        rv_id = await get_report_version_id(chat_history_id, db)
+        if not rv_id:
+            raise HTTPException(status_code=409, detail="Pre-mortem: report not ready")
+        model_name = cfg.GENERATING_REPORT_MODEL or "gpt-4o-mini"
+        thread = empty_thread(rv_id, model_name)
+
+    new_id = f"custom-{_uuid.uuid4().hex[:6]}"
+    thread.setdefault("panelists", []).append({
+        "id": new_id, "label": label, "kind": "custom", "concern": concern,
+    })
+    await save_pre_mortem(chat_history_id, thread, db)
+    return {"thread": thread, "panelist_id": new_id}
+
+
+@router.delete('/pre-mortem/{chat_history_id}/panelist/{panelist_id}')
+async def remove_pre_mortem_panelist(
+    chat_history_id: str,
+    panelist_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    from database_scripts import get_pre_mortem, save_pre_mortem
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if not thread:
+        raise HTTPException(status_code=404, detail="No pre-mortem thread")
+
+    panelists = thread.get("panelists", [])
+    target = next((p for p in panelists if p.get("id") == panelist_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Panelist not found")
+    if target.get("kind") == "default":
+        raise HTTPException(status_code=400, detail="Default panelists cannot be removed")
+
+    thread["panelists"] = [p for p in panelists if p.get("id") != panelist_id]
+    await save_pre_mortem(chat_history_id, thread, db)
+    return {"thread": thread}
+
+
+@router.post('/pre-mortem/{chat_history_id}/item-action')
+async def pre_mortem_item_action(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    from database_scripts import get_pre_mortem, save_pre_mortem
+    from utils.pre_mortem import (
+        find_item, panelist_label, add_to_client_questions, track_as_change,
+    )
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    turn_id = (payload or {}).get("turn_id")
+    panelist_id = (payload or {}).get("panelist_id")
+    item_id = (payload or {}).get("item_id")
+    action = (payload or {}).get("action")
+    if not all([turn_id, panelist_id, item_id, action]):
+        raise HTTPException(
+            status_code=400,
+            detail="turn_id, panelist_id, item_id, action are all required",
+        )
+    if action not in ("add_to_client_qs", "track_as_change"):
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if not thread:
+        raise HTTPException(status_code=404, detail="No pre-mortem thread")
+
+    item = find_item(thread, turn_id, panelist_id, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found in thread")
+
+    if item.get("status") and item["status"] != "open":
+        return {"thread": thread, "action_result": {"already_applied": True, "status": item["status"]}}
+
+    label = panelist_label(thread, panelist_id)
+    if action == "add_to_client_qs":
+        action_result = await add_to_client_questions(chat_history_id, item, label, db)
+        item["status"] = "added_to_client_qs"
+    else:
+        action_result = await track_as_change(chat_history_id, item, label, db)
+        item["status"] = "tracked_as_change"
+
+    await save_pre_mortem(chat_history_id, thread, db)
+    return {"thread": thread, "action_result": action_result}
+
+
+@router.delete('/pre-mortem/{chat_history_id}')
+async def reset_pre_mortem_thread(
+    chat_history_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    from database_scripts import save_pre_mortem, get_report_version_id
+    from utils.pre_mortem import empty_thread
+    from config import settings as cfg
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    rv_id = await get_report_version_id(chat_history_id, db)
+    if not rv_id:
+        raise HTTPException(status_code=409, detail="Pre-mortem: report not ready")
+    model_name = cfg.GENERATING_REPORT_MODEL or "gpt-4o-mini"
+    thread = empty_thread(rv_id, model_name)
+    await save_pre_mortem(chat_history_id, thread, db)
+    return {"thread": thread}
+
+
+# ============================================================================
+# A5 — DELIVERABLE BUILDER
+# ============================================================================
+# Section-level checklist UI for assembling a client-clean deliverable from a
+# generated report. The LLM assists per-section (Polish) on demand; the BA
+# decides what's included. State persists in report_version.deliverable_config.
+
+class DeliverablePolishRequest(BaseModel):
+    section_id: str
+
+
+class DeliverableConfigRequest(BaseModel):
+    included_section_ids: List[str] = []
+    excluded_section_ids: List[str] = []
+    section_edits: Dict[str, str] = {}
+    custom_sections: List[Dict[str, Any]] = []
+
+
+@router.get('/deliverable/{chat_history_id}/sections')
+async def get_deliverable_sections(
+    chat_history_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Return parsed sections + persisted curation state for the Deliverable Builder."""
+    from database_scripts import get_deliverable_state
+    from utils.report_sections import parse_sections, default_excluded_ids
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    state = await get_deliverable_state(chat_history_id, db)
+    if not state or not state.get("report_content"):
+        raise HTTPException(status_code=409, detail="Report not ready for this chat")
+
+    sections = parse_sections(state["report_content"])
+    return {
+        "sections": [s.to_dict() for s in sections],
+        "config": state.get("config"),
+        "polished_sections": state.get("polished_sections") or {},
+        "default_excluded_ids": default_excluded_ids(sections),
+        "report_version_id": state.get("report_version_id"),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+@router.put('/deliverable/{chat_history_id}/config')
+async def put_deliverable_config(
+    chat_history_id: str,
+    payload: DeliverableConfigRequest,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Persist the user's section curation choices for this project."""
+    from database_scripts import get_deliverable_state, update_deliverable_config
+    from utils.report_sections import parse_sections
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    state = await get_deliverable_state(chat_history_id, db)
+    if not state or not state.get("report_content"):
+        raise HTTPException(status_code=409, detail="Report not ready for this chat")
+
+    valid_ids = {s.id for s in parse_sections(state["report_content"])}
+    unknown = [sid for sid in (payload.included_section_ids + payload.excluded_section_ids
+                               + list(payload.section_edits.keys()))
+               if sid not in valid_ids]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown section IDs: {unknown[:5]}",
+        )
+    for cs in payload.custom_sections:
+        anchor = (cs.get("position") or {}).get("after_section_id")
+        if anchor and anchor not in valid_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Custom section anchor {anchor!r} is not a known section id",
+            )
+
+    return await update_deliverable_config(chat_history_id, payload.dict(), db)
+
+
+@router.post('/deliverable/{chat_history_id}/polish')
+async def post_deliverable_polish(
+    chat_history_id: str,
+    payload: DeliverablePolishRequest,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Run the per-section Polish pass and persist the rewritten markdown."""
+    from database_scripts import get_deliverable_state, set_polished_section
+    from utils.report_sections import parse_sections
+    from utils.deliverable_polish import polish_section
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    state = await get_deliverable_state(chat_history_id, db)
+    if not state or not state.get("report_content"):
+        raise HTTPException(status_code=409, detail="Report not ready for this chat")
+
+    section = next(
+        (s for s in parse_sections(state["report_content"]) if s.id == payload.section_id),
+        None,
+    )
+    if not section:
+        raise HTTPException(status_code=404, detail=f"Section {payload.section_id} not found")
+
+    edits = (state.get("config") or {}).get("section_edits") or {}
+    source_md = edits.get(section.id) or section.raw_markdown
+
+    polished_md = await polish_section(source_md)
+    await set_polished_section(chat_history_id, section.id, polished_md, db)
+    return {
+        "section_id": section.id,
+        "polished_markdown": polished_md,
+    }
+
+
+@router.delete('/deliverable/{chat_history_id}/polish/{section_id}')
+async def delete_deliverable_polish(
+    chat_history_id: str,
+    section_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Drop the polish override for a section so the source/edit markdown is used."""
+    from database_scripts import revert_polished_section
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+    return await revert_polished_section(chat_history_id, section_id, db)
 
 
 # ============================================================================
