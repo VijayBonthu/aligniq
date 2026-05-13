@@ -21,7 +21,7 @@ const LoginPage: React.FC = () => {
   }, [isAuthenticated, navigate]);
 
   const handleGoogleLogin = () => {
-    const API_BASE = import.meta.env.VITE_API_URL?.replace('/api/v1', '') || 'http://localhost:8080';
+    const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/api\/v1\/?$/, '') || 'http://localhost:8080';
     const popup = window.open(`${API_BASE}/api/v1/auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
     const handler = async (event: MessageEvent) => {
       if (event.data?.type !== 'google_auth_success') return;
