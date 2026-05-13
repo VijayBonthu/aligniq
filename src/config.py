@@ -4,6 +4,7 @@ load_dotenv()
 
 class Settings:
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
     GOOGLE_CLIENT_TOKEN =  os.getenv("GOOGLE_CLIENT_TOKEN")
     REDIRECT_URL = os.getenv("REDIRECT_URL")
     POSTGRES_USER = os.getenv("POSTGRES_USER")

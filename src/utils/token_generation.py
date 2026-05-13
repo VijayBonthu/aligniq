@@ -4,7 +4,6 @@ from config import settings
 from fastapi import status, HTTPException,Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
-import easyocr
 from typing import Dict
 import base64
 import json
@@ -136,15 +135,6 @@ def hash_passwords(password:str):
 
 def verify_password(password:str, hashed_password:str):
     return pwd_context.verify(password,hashed_password)
-
-#extact text from images
-def extract_text_from_image_easy(image_path) -> str:
-    #add languages in config file
-    reader = easyocr.Reader(settings.IMAGE_TEXT_LANGUAGE)
-    #details 0 gives the text directly if you give 1 it will provide you with CI of those values and probably the postion of the word 
-    results = reader.readtext(image_path, detail=0)
-    extracted_text = " ".join(results)
-    return extracted_text
 
 def validate_jira_token(token: str):
     """Validate Jira-specific JWT token"""

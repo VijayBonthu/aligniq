@@ -17,6 +17,10 @@ export interface PresalesQuestion {
   why_critical?: string;
   impact_if_unknown?: string;
   answer?: string | null;
+  answer_quality?: string | null;
+  description?: string;
+  area_or_category?: string;
+  impact_description?: string;
   status?: string;
 }
 
@@ -90,8 +94,6 @@ export default function QuestionsStep({
       setQuestions(initialQuestions);
       seedAnswersFromQuestions(initialQuestions);
       setLoading(false);
-      // If upload payload lacked question_id we'll still hydrate via getQuestions
-      // below so we have UUIDs available for any future per-question action.
       const needsHydrate = !initialQuestions.every((q) => Boolean(q.question_id));
       if (!needsHydrate) return;
     }
@@ -412,121 +414,160 @@ function QuestionGroup({
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
         {questions.map((q, idx) => {
           const answerKey = numberPrefix === 'P1' ? `p1_${idx}` : `question_${idx}`;
-          const value = answers[answerKey] || '';
-          const filled = Boolean(value.trim());
-          const hasAssumption = value.includes('[SYSTEM ASSUMPTION]');
-          const headline = q.blocker || q.question_text || q.question || 'Question';
-          const detail = q.blocker
-            ? q.question_text || q.question
-            : q.why_critical || q.why_it_matters;
           return (
-            <div
+            <QuestionCard
               key={q.question_id || `${numberPrefix}-${idx}`}
-              style={{
-                border: `1px solid ${borderColor}`,
-                borderRadius: 10,
-                background: softBg,
-                overflow: 'hidden',
-              }}
-            >
-              <div style={{ padding: '12px 14px 8px', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                <span
-                  style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 9,
-                    letterSpacing: '.08em',
-                    padding: '3px 7px',
-                    borderRadius: 5,
-                    background: 'var(--surface-2)',
-                    color: accent,
-                    border: `1px solid ${borderColor}`,
-                    flexShrink: 0,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {numberPrefix}-{startIndex + idx}
-                </span>
-                <div style={{ flex: 1 }}>
-                  <p
-                    style={{
-                      fontSize: 13,
-                      fontWeight: q.blocker ? 600 : 500,
-                      color: 'var(--fg)',
-                      marginBottom: detail ? 4 : 0,
-                      lineHeight: 1.4,
-                    }}
-                  >
-                    {headline}
-                  </p>
-                  {detail && (
-                    <p style={{ fontSize: 12, color: 'var(--fg-dim)', lineHeight: 1.5 }}>{detail}</p>
-                  )}
-                  <div style={{ display: 'flex', gap: 5, marginTop: 6, flexWrap: 'wrap' }}>
-                    {q.category && (
-                      <span
-                        style={{
-                          fontFamily: 'var(--font-mono)',
-                          fontSize: 9,
-                          letterSpacing: '.08em',
-                          padding: '3px 7px',
-                          borderRadius: 5,
-                          background: 'var(--surface-2)',
-                          color: 'var(--fg-muted)',
-                          border: '1px solid var(--border)',
-                          textTransform: 'uppercase',
-                        }}
-                      >
-                        {q.category}
-                      </span>
-                    )}
-                    {hasAssumption && (
-                      <span
-                        style={{
-                          fontFamily: 'var(--font-mono)',
-                          fontSize: 9,
-                          letterSpacing: '.08em',
-                          padding: '3px 7px',
-                          borderRadius: 5,
-                          background: 'rgba(255,194,87,.1)',
-                          color: 'var(--warn)',
-                          border: '1px solid rgba(255,194,87,.3)',
-                          textTransform: 'uppercase',
-                        }}
-                      >
-                        Assumption applied
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <div style={{ padding: '0 14px 12px' }}>
-                <textarea
-                  value={value}
-                  onChange={(e) =>
-                    setAnswers((p) => ({ ...p, [answerKey]: e.target.value }))
-                  }
-                  placeholder="Provide your answer here…"
-                  rows={2}
-                  style={{
-                    width: '100%',
-                    background: 'var(--surface-2)',
-                    border: `1px solid ${
-                      filled ? 'rgba(122,229,130,.3)' : 'var(--border)'
-                    }`,
-                    borderRadius: 7,
-                    padding: '9px 11px',
-                    color: 'var(--fg)',
-                    fontSize: 13,
-                    fontFamily: 'var(--font-sans)',
-                    resize: 'vertical',
-                    outline: 'none',
-                    transition: 'border-color .2s',
-                  }}
-                />
-              </div>
-            </div>
+              question={q}
+              answerKey={answerKey}
+              numberPrefix={numberPrefix}
+              displayNumber={startIndex + idx}
+              accent={accent}
+              softBg={softBg}
+              borderColor={borderColor}
+              answers={answers}
+              setAnswers={setAnswers}
+            />
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+interface QuestionCardProps {
+  question: PresalesQuestion;
+  answerKey: string;
+  numberPrefix: string;
+  displayNumber: number;
+  accent: string;
+  softBg: string;
+  borderColor: string;
+  answers: Record<string, string>;
+  setAnswers: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+}
+
+function QuestionCard({
+  question: q,
+  answerKey,
+  numberPrefix,
+  displayNumber,
+  accent,
+  softBg,
+  borderColor,
+  answers,
+  setAnswers,
+}: QuestionCardProps) {
+  const value = answers[answerKey] || '';
+  const filled = Boolean(value.trim());
+  const hasAssumption = value.includes('[SYSTEM ASSUMPTION]');
+  const headline = q.blocker || q.question_text || q.question || 'Question';
+  const detail = q.blocker
+    ? q.question_text || q.question
+    : q.why_critical || q.why_it_matters;
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${borderColor}`,
+        borderRadius: 10,
+        background: softBg,
+        overflow: 'hidden',
+      }}
+    >
+      <div style={{ padding: '12px 14px 8px', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <span
+          style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 9,
+            letterSpacing: '.08em',
+            padding: '3px 7px',
+            borderRadius: 5,
+            background: 'var(--surface-2)',
+            color: accent,
+            border: `1px solid ${borderColor}`,
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {numberPrefix}-{displayNumber}
+        </span>
+        <div style={{ flex: 1 }}>
+          <p
+            style={{
+              fontSize: 13,
+              fontWeight: q.blocker ? 600 : 500,
+              color: 'var(--fg)',
+              marginBottom: detail ? 4 : 0,
+              lineHeight: 1.4,
+            }}
+          >
+            {headline}
+          </p>
+          {detail && (
+            <p style={{ fontSize: 12, color: 'var(--fg-dim)', lineHeight: 1.5 }}>{detail}</p>
+          )}
+          <div style={{ display: 'flex', gap: 5, marginTop: 6, flexWrap: 'wrap' }}>
+            {q.category && (
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 9,
+                  letterSpacing: '.08em',
+                  padding: '3px 7px',
+                  borderRadius: 5,
+                  background: 'var(--surface-2)',
+                  color: 'var(--fg-muted)',
+                  border: '1px solid var(--border)',
+                  textTransform: 'uppercase',
+                }}
+              >
+                {q.category}
+              </span>
+            )}
+            {hasAssumption && (
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 9,
+                  letterSpacing: '.08em',
+                  padding: '3px 7px',
+                  borderRadius: 5,
+                  background: 'rgba(255,194,87,.1)',
+                  color: 'var(--warn)',
+                  border: '1px solid rgba(255,194,87,.3)',
+                  textTransform: 'uppercase',
+                }}
+              >
+                Assumption applied
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+      <div style={{ padding: '0 14px 12px' }}>
+        <textarea
+          value={value}
+          onChange={(e) =>
+            setAnswers((p) => ({ ...p, [answerKey]: e.target.value }))
+          }
+          placeholder="Provide your answer here…"
+          rows={2}
+          style={{
+            width: '100%',
+            background: 'var(--surface-2)',
+            border: `1px solid ${
+              filled ? 'rgba(122,229,130,.3)' : 'var(--border)'
+            }`,
+            borderRadius: 7,
+            padding: '9px 11px',
+            color: 'var(--fg)',
+            fontSize: 13,
+            fontFamily: 'var(--font-sans)',
+            resize: 'vertical',
+            outline: 'none',
+            transition: 'border-color .2s',
+          }}
+        />
       </div>
     </div>
   );

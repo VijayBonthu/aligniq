@@ -38,23 +38,17 @@ async def get_client_ip(request:Request) -> str:
     
 async def rate_limit_key(request:Request):
     try:
-        logger.info(f"request received in rate_limit_key: {request.headers}")
         payload = await validate_token_incoming_requests(request.headers.get('authorization').split(" ")[1])
-        logger.info(f"payload received by request in rate_limit_key: {payload}")
         user_id = payload.get('id')
-        logger.info(f"user_id frompayload received by request in rate_limit_key: {user_id}")
         if user_id:
             ip = await get_client_ip(request)
-            logger.info(f"Rate limiting based on user_id: {user_id}")
             return f"ip_{ip}_user_{user_id}"
     except Exception as e:
         logger.debug(f"No valid token, falling back to IP: {e}")
 
     ip = await get_client_ip(request)
     ua_hash = request.headers.get('user-agent', '')[:20]
-    key = f"ip_{ip}_ua{ua_hash}"
-    logger.info(f"Rate limiting with key: {key}")
-    return key
+    return f"ip_{ip}_ua{ua_hash}"
 
 
 async def rate_limit_exceeded_callback(request: Request, response: Response, peerid: str):

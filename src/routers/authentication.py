@@ -1,3 +1,5 @@
+import os
+
 from oauth import flow, auth_callback, JiraOAuth
 from fastapi import Depends, HTTPException, Request, APIRouter, status, Header
 from sqlalchemy.orm import Session
@@ -23,6 +25,11 @@ router = APIRouter()
 security = HTTPBearer()
 
 auth_states = {}
+
+# postMessage targetOrigin for OAuth callbacks. Browser drops the message if the
+# opener's origin doesn't match — prevents token theft via popup-jacking.
+# Set FRONTEND_URL via env (SSM in staging/prod).
+FRONTEND_ORIGIN = os.getenv("FRONTEND_URL", "http://localhost:5173")
 @router.get("/auth/login")
 async def login():
     result= flow.authorization_url(prompt="consent")
@@ -39,14 +46,11 @@ async def login():
 async def callback(request: Request, db:Session=Depends(get_db)):
     # Extract the state from query parameters
     state = request.query_params.get("state")
-    logger.info(f"State: {state}")
     if not state or state not in auth_states:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Link already expired, Try to login in again")
-    try: 
+    try:
         #Uses Google authentication to login
-        logger.info(f"Request URL: {request.url}")
-        response =auth_callback(url=request.url)
-        logger.info(f"Response: {response}")
+        response = auth_callback(url=request.url)
         if response.get("message") == "bad request":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Issue with your login, Please try again")
         user_data = response["user"]
@@ -71,7 +75,6 @@ async def callback(request: Request, db:Session=Depends(get_db)):
     }
     token = create_token(user_data=payload)
     refresh_token_val = create_refresh_token(user_id=user.user_id, db=db)
-    print(token)
 
     html_content = f"""
     <html>
@@ -88,7 +91,7 @@ async def callback(request: Request, db:Session=Depends(get_db)):
                         access_token: '{token}',
                         refresh_token: '{refresh_token_val}'
                     }},
-                    '*'
+                    '{FRONTEND_ORIGIN}'
                 );
 
                 setTimeout(() => window.close(), 3000);
@@ -137,7 +140,6 @@ async def create_account(user_details:Registration_login_password, db:Session=De
 
     token = create_token(user_data=payload)
     refresh_token_val = create_refresh_token(user_id=user.user_id, db=db)
-    print(token)
 
     return {"access_token": token, "refresh_token": refresh_token_val, "token_type": "bearer"}
 
@@ -160,7 +162,6 @@ def log_into_account(login_details:login_details, db:Session=Depends(get_db)):
         }
         token = create_token(user_data=payload)
         refresh_token_val = create_refresh_token(user_id=user_details[1], db=db)
-        print(token)
         return {"access_token": token, "refresh_token": refresh_token_val, "token_type": "bearer"}
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -192,8 +193,6 @@ async def jira_login(request: Request, current_user: dict = Depends(token_valida
     try:
         auth_url, state = await JiraOAuth().get_authorization_url()
         auth_states[state] = True
-        logger.info(f"Auth states updated: {auth_states}")
-        logger.info(f"authorization_url: {auth_url}")
         return {"url": auth_url}
     except Exception as e:
         logger.error(f"Error in jira_login: {str(e)}")
@@ -238,14 +237,12 @@ async def jira_callback(
         # Get access token
         jira = JiraOAuth()
         token_response = await jira.get_access_token(code)
-        logger.info(f"Token response: {token_response}")
-        
+
         access_token = token_response["access_token"]
         refresh_token = token_response.get("refresh_token")
 
         # Get Jira user info
         user_info = await get_jira_user_info(access_token)
-        logger.info(f"Jira user info: {user_info}")
         
         # Create payload without app_user_id for now
         payload = {
@@ -274,11 +271,11 @@ async def jira_callback(
                 // Send token back to opener window
                 if (window.opener) {{
                     window.opener.postMessage(
-                        {{ 
-                            type: 'jira_auth_success', 
+                        {{
+                            type: 'jira_auth_success',
                             access_token: '{jira_token}'
                         }},
-                        '*'  // In production, you should limit this to your app's origin
+                        '{FRONTEND_ORIGIN}'
                     );
                     
                     // Close this window after a delay
@@ -326,16 +323,11 @@ async def logout(request_body: RefreshTokenRequest, db: Session = Depends(get_db
 @router.get("/auth/jira/test")
 async def test_jira_auth():
     """Test endpoint to verify Jira auth flow"""
-    logger.info("Testing Jira auth flow")
     try:
         jira = JiraOAuth()
         auth_url, state = await jira.get_authorization_url()
         auth_states[state] = True
-        
-        logger.info(f"Test auth URL generated: {auth_url}")
-        logger.info(f"Test state generated: {state}")
-        logger.info(f"Current auth_states: {auth_states}")
-        
+
         return {
             "authorization_url": auth_url,
             "state": state,
@@ -355,7 +347,6 @@ async def decode_token(token:str):
 
 @router.post("/validate_token")
 async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    logger.info(f"inside validate_token: {credentials.credentials}")
     return await validate_app_user(credentials)
 
 

@@ -1,0 +1,46 @@
+# Lives on the EC2 at /opt/aligniq/docker-compose.yml.
+# Not for local dev — local dev still uses `python src/main.py` against your dev DB.
+#
+# The api image is pulled from ECR. entrypoint.sh inside the image fetches all
+# secrets from SSM Parameter Store at /aligniq/staging/* before launching uvicorn.
+
+services:
+  api:
+    image: ${ECR_REGISTRY}/aligniq-api:${IMAGE_TAG:-latest}
+    container_name: aligniq-api
+    restart: unless-stopped
+    ports:
+      - "80:8080"   # EC2 host :80 -> container :8080. Cloudflare proxies user :443 -> origin :80.
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SSM_PATH: /aligniq/staging/
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-group: /aligniq/staging/api
+        awslogs-create-group: "true"
+        awslogs-stream: api
+
+  redis:
+    image: redis:7-alpine
+    container_name: aligniq-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # rate-limit only; no persistence needed
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-group: /aligniq/staging/redis
+        awslogs-create-group: "true"
+        awslogs-stream: redis

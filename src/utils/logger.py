@@ -1,47 +1,38 @@
 import logging
+import os
 import sys
-from logging.handlers import RotatingFileHandler
 
-# Create a logger instance
-logger = logging.getLogger(__name__)
 
 def setup_logger():
-    # Get the root logger
-    logger = logging.getLogger()
+    """
+    Container-friendly logger setup.
+    - LOG_LEVEL env var controls verbosity (DEBUG locally, INFO in staging, WARNING in prod).
+    - stdout only — Docker awslogs driver ships stdout to CloudWatch.
+    - No file handler: container filesystems are ephemeral and disk I/O is wasted.
+    """
+    root = logging.getLogger()
+    root.handlers = []
 
-    # Clear any existing handlers
-    logger.handlers = []
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    root.setLevel(getattr(logging, level_name, logging.INFO))
 
-    # Set the logging level
-    logger.setLevel(logging.INFO)
-
-    # Suppress watchfiles logging to prevent infinite loop
-    # (watchfiles logs to root logger, which writes to app.log, triggering more changes)
+    # Noisy libraries we don't need at INFO
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
-    # Create formatter with file name, line number, and function name
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(levelname)s - %(message)s'
+        "%(asctime)s - [%(filename)s:%(lineno)d - %(funcName)s()] - %(levelname)s - %(message)s"
     )
 
-    # Create and configure console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
+    root.addHandler(console_handler)
 
-    # Create and configure file handler
-    file_handler = RotatingFileHandler(
-        'app.log',
-        maxBytes=10000000,
-        encoding='utf-8',  # 10MB
-        backupCount=5
-    )
-    file_handler.setFormatter(formatter)
+    root.propagate = False
+    return root
 
-    # Add handlers to logger
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
 
-    # Prevent propagation to avoid duplicate logs
-    logger.propagate = False
-
-    return logger 
+logger = logging.getLogger(__name__)

@@ -57,3 +57,21 @@ new_frontend
 design
 
 C:\aligniq\migrations
+
+# Terraform
+terraform/**/.terraform/
+terraform/**/.terraform.lock.hcl
+terraform/**/terraform.tfstate
+terraform/**/terraform.tfstate.*
+terraform/**/terraform.tfvars
+terraform/**/*.auto.tfvars
+terraform/**/tf.plan
+terraform/**/crash.log
+
+client_secret_g(1).json
+project.md
+.pytest_cache
+frontend_orange\.env.production
+frontend_orange/.env.production
+gen_secrets.py
+migrations

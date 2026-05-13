@@ -3,6 +3,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional, Callable
 from starlette.datastructures import MutableHeaders
 import secrets
+import os
 from utils.logger import logger
 from utils.rate_limit import lifespan, rate_limit_key, CustomRateLimiter
 from fastapi_limiter import FastAPILimiter
@@ -21,12 +22,16 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.csrf_token_cookie_name = csrf_token_cookie_name
         self.csrf_token_header_name = csrf_token_header_name
-    
+        # Cross-subdomain config: in staging/prod, frontend at staging.<domain>
+        # must be able to read the cookie set by api.staging.<domain>.
+        self.cookie_domain = os.getenv("COOKIE_DOMAIN") or None
+        self.cookie_secure = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
     async def dispatch(self, request: Request, call_next):
         # For GET requests and other "safe" methods, ensure a CSRF token exists
         if request.method.upper() in ["GET", "HEAD", "OPTIONS"]:
             response = await call_next(request)
-            
+
             # Generate and set a CSRF token if not already present
             if self.csrf_token_cookie_name not in request.cookies:
                 csrf_token = secrets.token_hex(32)
@@ -35,10 +40,12 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                     value=csrf_token,
                     httponly=False,  # Must be accessible from JavaScript
                     samesite="lax",
+                    secure=self.cookie_secure,
+                    domain=self.cookie_domain,
                     path="/"
                 )
-                logger.info(f"New CSRF token generated for request to {request.url.path}")
-            
+                logger.debug(f"New CSRF token generated for request to {request.url.path}")
+
             return response
         
         # For state-changing methods, validate CSRF token
@@ -80,10 +87,10 @@ def get_csrf_token(
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Skip rate limiting for preflight requests and health checks
-        if request.method.upper() == "OPTIONS" or request.url.path in ["/health", "/metrics"]:
+        if request.method.upper() == "OPTIONS" or request.url.path in ["/health", "/metrics", "/"]:
             return await call_next(request)
-        logger.info(f"request in ratelimitmiddleware: {request.headers}")
-        
+
+
         try:
             redis = await FastAPILimiter.redis
             key = await rate_limit_key(request)

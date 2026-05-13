@@ -1,0 +1,61 @@
+# VCS / IDE
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+*.swp
+
+# Python local
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+
+# Frontends — backend image must NEVER contain these
+frontend
+frontend_orange
+new_frontend
+node_modules
+
+# Local artifacts / dev junk
+uploads
+output
+tests
+design
+structure.tsx
+*.log
+*.sqlite
+*.db
+
+# Secrets & local config — never copy these in
+.env
+.env.*
+*.pem
+*.key
+*.crt
+client_secret*.json
+checking_json.json
+
+# Loose top-level files not needed in image
+README.md
+CLAUDE.md
+project.md
+project description.mdc
+package.json
+package-lock.json
+bird_2.jpg
+
+# Migrations folder — not used in staging (create_all builds schema)
+migrations
+
+# Docker meta
+Dockerfile
+.dockerignore
+docker-compose.yml

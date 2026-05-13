@@ -7,12 +7,22 @@ from urllib.parse import urlparse, parse_qs
 import logging
 
 logger = logging.getLogger(__name__)
-#remove this once you get HTTPS working 11 and 12 lines are testing only
 import os
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+# Only enable for local HTTP dev. In staging/prod the callback is HTTPS via
+# Cloudflare, so leave OAUTHLIB_INSECURE_TRANSPORT unset (the default).
+if os.getenv("OAUTH_ALLOW_INSECURE", "false").lower() == "true":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-flow = Flow.from_client_secrets_file(
-    client_secrets_file="../client_secret_g.json",
+flow = Flow.from_client_config(
+    client_config={
+        "web": {
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [settings.REDIRECT_URL],
+        }
+    },
     redirect_uri=settings.REDIRECT_URL,
     scopes=["https://www.googleapis.com/auth/userinfo.email",
             "https://www.googleapis.com/auth/userinfo.profile",
@@ -71,9 +81,6 @@ class JiraOAuth:
             query_params = parse_qs(parsed_url.query)
             state = query_params.get('state', [None])[0]
             
-            logger.info(f"Generated auth URL: {auth_url}")
-            logger.info(f"Generated state: {state}")
-            
             return auth_url, state
         except Exception as e:
             logger.error(f"Error generating authorization URL: {str(e)}")
@@ -98,10 +105,6 @@ class JiraOAuth:
                 'Accept': 'application/json'
             }
             
-            logger.info(f"Making token request to: {token_url}")
-            logger.info(f"With headers: {headers}")
-            logger.info(f"With body: {body}")
-            
             response = requests.post(
                 token_url,
                 json=body,  # Use json parameter instead of data
@@ -109,9 +112,9 @@ class JiraOAuth:
                 verify=True  # Ensure SSL verification is enabled
             )
             
-            logger.info(f"Token response status: {response.status_code}")
-            logger.info(f"Token response: {response.text}")
-            
+            logger.debug(f"Token response status: {response.status_code}")
+
+
             if response.status_code != 200:
                 error_detail = response.json() if response.text else "No error details provided"
                 raise Exception(f"Token request failed: {error_detail}")
