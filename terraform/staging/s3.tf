@@ -47,9 +47,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "docs" {
 # Frontend bucket — public-read static website behind Cloudflare. Cloudflare
 # is the CDN/WAF/TLS terminator; this bucket serves built Vite assets only
 # (public JS/CSS/HTML). User documents live in aws_s3_bucket.docs (private).
+# Bucket name MUST equal the public hostname. S3 static-website endpoints
+# route by Host header — when Cloudflare proxies "staging.grounded-iq.com",
+# S3 looks for a bucket named exactly that. Without this match: 404 NoSuchBucket.
 resource "aws_s3_bucket" "frontend" {
-  bucket = "${local.name_prefix}-frontend"
-  tags   = { Name = "${local.name_prefix}-frontend" }
+  bucket = var.frontend_subdomain
+  tags   = { Name = var.frontend_subdomain }
 }
 
 # S3 website hosting: serves index.html for unknown keys (SPA fallback for

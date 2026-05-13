@@ -76,7 +76,9 @@ jobs:
 
           # Poll until the command terminates so the workflow surfaces real
           # failures instead of going green when the pull/restart actually broke.
-          for i in $(seq 1 60); do
+          # 180 * 5s = 15 min. First-time pulls of the ~2.5GB image can take
+          # 5-10 min from a cold ECR cache; steady-state restarts are <30s.
+          for i in $(seq 1 180); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
               --query "Status" --output text 2>/dev/null || echo "Pending")
