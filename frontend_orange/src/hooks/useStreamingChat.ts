@@ -22,6 +22,11 @@ function clearAllAuthTokens() {
   delete (api.defaults.headers.common as Record<string, string>)['Authorization'];
 }
 
+function getCsrfToken(): string {
+  const match = document.cookie.match(new RegExp('(^| )csrf_token=([^;]+)'));
+  return match ? match[2] : '';
+}
+
 export type StreamEventType =
   | 'stream_start' | 'stream_end' | 'token' | 'content'
   | 'tool_start' | 'tool_result' | 'tool_error' | 'thinking' | 'error';
@@ -95,10 +100,12 @@ export function useStreamingChat(): UseStreamingChatReturn {
       const makeRequest = (activeToken: string) =>
         fetch(`${API_URL}chat-with-doc-stream`, {
           method: 'POST',
+          credentials: 'include',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${activeToken}`,
-            'Accept': 'text/event-stream'
+            'Accept': 'text/event-stream',
+            'X-CSRF-Token': getCsrfToken()
           },
           body: JSON.stringify({ chat_history_id: chatHistoryId, user_id: userId,
                                   message: messages, document_id: documentId, title }),
