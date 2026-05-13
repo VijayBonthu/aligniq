@@ -34,10 +34,15 @@ jobs:
       - run: npm ci
 
       # Vite inlines VITE_* vars at build time, so the API URL must be set here.
+      # Trim whitespace from the secret to defend against a trailing space/newline
+      # in the GitHub Secret value — Vite would otherwise bake it in and produce
+      # URLs like "https://.../api/v1%20/registration".
       - name: Build
         env:
-          VITE_API_URL: ${{ secrets.VITE_API_URL }}
-        run: npm run build
+          VITE_API_URL_RAW: ${{ secrets.VITE_API_URL }}
+        run: |
+          export VITE_API_URL="$(printf '%s' "$VITE_API_URL_RAW" | tr -d '[:space:]')"
+          npm run build
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -45,8 +50,20 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Pass the bucket name via env and trim any stray whitespace/newlines
+      # from the secret value before interpolating into the command. A trailing
+      # newline in the secret would otherwise split the command across two
+      # bash lines and cause "/: Is a directory" exit-126 failures.
       - name: Upload hashed assets to S3
-        run: aws s3 sync dist/ s3://${{ secrets.FRONTEND_BUCKET }}/ --delete --cache-control "public,max-age=31536000,immutable" --exclude "index.html"
+        env:
+          FRONTEND_BUCKET: ${{ secrets.FRONTEND_BUCKET }}
+        run: |
+          BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
+          aws s3 sync dist/ "s3://${BUCKET}/" --delete --cache-control "public,max-age=31536000,immutable" --exclude "index.html"
 
       - name: Upload index.html (no cache, correct content-type)
-        run: aws s3 cp dist/index.html s3://${{ secrets.FRONTEND_BUCKET }}/index.html --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"
+        env:
+          FRONTEND_BUCKET: ${{ secrets.FRONTEND_BUCKET }}
+        run: |
+          BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
+          aws s3 cp dist/index.html "s3://${BUCKET}/index.html" --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"

@@ -20,6 +20,8 @@ async def save_file(file_path:str, file_content:str)->None:
 async def upload_to_s3(file_path:str, file_uuid:str, document_name:str, file_extension:str, current_token_id:str, bucket_name:str, s3_folder:str) -> None:
     try:
         mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = "application/octet-stream"
         s3 = get_s3_client()
         response = ensure_bucket_exists(s3_client=s3, bucket_name=bucket_name)
         if response.get("bucket_status") == "exists":
