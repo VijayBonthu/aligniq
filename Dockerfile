@@ -76,4 +76,4 @@ ENTRYPOINT ["./entrypoint.sh"]
 # OAuth state lookup must hit the same worker that set it, so multi-worker
 # breaks login intermittently. asyncio still gives us concurrency for
 # I/O-bound work (pipeline awaits OpenAI ~90% of the time).
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]

@@ -47,7 +47,8 @@ def auth_callback(url:str=None):
         # Process and store user information in PostgreSQL
         return {"message": "Authentication successful", "user": user_info, "provider":"Google"}
     except Exception as e:
-        return {"message": "bad request", "error": e}
+        logger.exception(f"Google OAuth callback failed for url={url}: {e}")
+        return {"message": "bad request", "error": str(e)}
         
 
 class JiraOAuth:
