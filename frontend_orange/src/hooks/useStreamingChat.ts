@@ -56,7 +56,7 @@ export interface UseStreamingChatReturn extends StreamingState {
   resetState: () => void;
 }
 
-const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1').replace(/\/+$/, '');
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1/';
 
 const initialState: StreamingState = {
   isStreaming: false,
@@ -93,7 +93,7 @@ export function useStreamingChat(): UseStreamingChatReturn {
 
     try {
       const makeRequest = (activeToken: string) =>
-        fetch(`${API_URL}/chat-with-doc-stream`, {
+        fetch(`${API_URL}chat-with-doc-stream`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
