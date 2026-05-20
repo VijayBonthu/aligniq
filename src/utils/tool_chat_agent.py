@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Optional
 import json
 from config import settings
 from utils.chat_tools import get_all_tools, tool_context, TOOL_SYSTEM_PROMPT
+from utils.web_search_tool import reset_call_count as reset_web_search_count
 from utils.logger import logger
 from utils.llm_metrics import callback_for, hash_prompt
 
@@ -60,7 +61,6 @@ class ToolChatAgent:
             api_key=settings.OPENAI_CHATGPT
         ).bind_tools(self.tools)
 
-        logger.info(f"ToolChatAgent initialized with {len(self.tools)} tools for chat {chat_history_id}")
 
     async def chat(
         self,
@@ -88,6 +88,9 @@ class ToolChatAgent:
         """
         # Build initial messages
         messages = self._build_messages(user_message, conversation_history, report_context)
+
+        # Fresh Tavily call budget per chat request (web_search uses a module-level counter).
+        reset_web_search_count()
 
         # Track tool calls for response metadata
         tools_called = []
@@ -120,7 +123,6 @@ class ToolChatAgent:
             # Check for tool calls
             if not response.tool_calls:
                 # No more tool calls - return final response
-                logger.info(f"Chat completed in {iteration} iteration(s), {len(tools_called)} tool calls")
                 return {
                     "response": response.content or "I've processed your request.",
                     "tools_called": tools_called,
@@ -134,7 +136,6 @@ class ToolChatAgent:
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
 
-                logger.info(f"Executing tool: {tool_name} with args: {json.dumps(tool_args)[:200]}")
                 tools_called.append({"tool": tool_name, "args": tool_args})
 
                 # Execute tool

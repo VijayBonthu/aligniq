@@ -83,7 +83,7 @@ export default function NewProjectFlow() {
     (async () => {
       setHydrating(true);
       try {
-        const { data } = await api.get<ChatRecordResponse>(`/chat/${urlChatHistoryId}`);
+        const { data } = await api.get<ChatRecordResponse>(`chat/${urlChatHistoryId}`);
         const details = data.user_details;
         if (cancelled || !details) {
           throw new Error('Project not found');
@@ -116,7 +116,7 @@ export default function NewProjectFlow() {
         setChatHistoryIdState(details.chat_history_id);
 
         const [briefRes, questionsRes] = await Promise.allSettled([
-          api.get(`/presales/${documentId}`),
+          api.get(`presales/${documentId}`),
           presalesService.getQuestions(presalesId),
         ]);
 

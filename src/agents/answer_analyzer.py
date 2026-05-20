@@ -189,7 +189,6 @@ async def analyze_answers(
         ValueError: If analysis fails
         asyncio.TimeoutError: If analysis times out
     """
-    logger.info("Starting answer analysis")
     start_time = time.time()
 
     # Format questions for the prompt
@@ -198,7 +197,6 @@ async def analyze_answers(
     # Count answered vs total
     total_questions = len(questions)
     answered_questions = sum(1 for q in questions if q.get("answer"))
-    logger.info(f"Analyzing {answered_questions}/{total_questions} answered questions")
 
     try:
         prompt = ChatPromptTemplate.from_template(ANSWER_ANALYZER_PROMPT)
@@ -221,10 +219,6 @@ async def analyze_answers(
         processing_time_ms = int((time.time() - start_time) * 1000)
         response["processing_time_ms"] = processing_time_ms
 
-        logger.info(f"Answer analysis completed in {processing_time_ms}ms")
-        logger.info(f"Readiness score: {response.get('readiness', {}).get('score', 0)}")
-        logger.info(f"Contradictions found: {len(response.get('contradictions', []))}")
-        logger.info(f"Vague answers found: {len(response.get('vague_answers', []))}")
 
         return AnalysisResult(response)
 

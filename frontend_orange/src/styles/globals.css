@@ -899,6 +899,57 @@ button { font-family: inherit; }
 }
 
 /* ────────────────────────────────────────────────────────
+   Inline source citations — rendered from [basis:ID] tags in
+   report Markdown. See components/report/ReportContent.tsx
+   (injectCitations). Perplexity-style: small, low-visual-weight,
+   clickable when there's a real URL to point at. */
+
+.src-cite {
+  display: inline-block;
+  margin: 0 2px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  vertical-align: baseline;
+  text-decoration: none;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg-dim);
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+a.src-cite { cursor: pointer; }
+a.src-cite:hover { background: var(--surface); }
+
+.src-cite--web {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--surface);
+}
+.src-cite--web:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+  background: var(--accent-soft);
+}
+
+.src-cite--doc {
+  border-color: var(--ok);
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.src-cite--model,
+.src-cite--inferred {
+  border-color: var(--border);
+  color: var(--fg-muted);
+  background: transparent;
+  text-transform: lowercase;
+}
+
+/* ────────────────────────────────────────────────────────
    Report rendering — used by ReportContent (presales brief
    and full_report messages) and chat-message markdown. */
 

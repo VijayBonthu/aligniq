@@ -43,7 +43,7 @@ function parseStoredMessages(raw: unknown, projectTitle?: string | null): ChatMe
     arr = [];
   }
   return arr
-    .filter((m): m is { role: string; content: string; type?: string } =>
+    .filter((m): m is { role: string; content: string; type?: string; evidence_index?: unknown } =>
       Boolean(m && typeof m === 'object' && 'role' in m && 'content' in m),
     )
     .map((m, i) => ({
@@ -54,6 +54,10 @@ function parseStoredMessages(raw: unknown, projectTitle?: string | null): ChatMe
       selected: true,
       type: typeof m.type === 'string' ? m.type : undefined,
       reportTitle: projectTitle || undefined,
+      evidence_index:
+        m.evidence_index && typeof m.evidence_index === 'object'
+          ? (m.evidence_index as ChatMessage['evidence_index'])
+          : undefined,
     }));
 }
 
@@ -87,7 +91,7 @@ export default function ChatView() {
     (async () => {
       setLoading(true);
       try {
-        const res = await api.get<{ user_details?: ChatRecord }>(`/chat/${chatHistoryId}`);
+        const res = await api.get<{ user_details?: ChatRecord }>(`chat/${chatHistoryId}`);
         const details = res.data?.user_details;
         if (!details) throw new Error('Project not found');
 

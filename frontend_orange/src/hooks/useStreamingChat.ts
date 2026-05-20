@@ -5,7 +5,7 @@ async function attemptTokenRefresh(): Promise<string | null> {
   const refreshToken = localStorage.getItem('refresh_token');
   if (!refreshToken) return null;
   try {
-    const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
+    const { data } = await api.post('auth/refresh', { refresh_token: refreshToken });
     localStorage.setItem('access_token', data.access_token);
     localStorage.setItem('refresh_token', data.refresh_token);
     localStorage.setItem('regular_token', data.access_token);

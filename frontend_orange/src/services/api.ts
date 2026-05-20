@@ -60,7 +60,7 @@ api.interceptors.response.use(
     }
 
     const url: string = original.url || '';
-    if (url.includes('/auth/refresh') || url.includes('/login') || url.includes('/registration')) {
+    if (url.includes('auth/refresh') || url.includes('login') || url.includes('registration')) {
       return Promise.reject(error);
     }
 
@@ -84,7 +84,7 @@ api.interceptors.response.use(
     isRefreshing = true;
 
     try {
-      const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
+      const { data } = await api.post('auth/refresh', { refresh_token: refreshToken });
       localStorage.setItem('access_token', data.access_token);
       localStorage.setItem('refresh_token', data.refresh_token);
       localStorage.setItem('regular_token', data.access_token);

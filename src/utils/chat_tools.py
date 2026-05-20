@@ -10,6 +10,7 @@ from langchain_core.tools import tool
 from typing import List, Optional, Any
 import json
 from utils.logger import logger
+from utils.web_search_tool import web_search, reset_call_count
 
 
 # ============= CONTEXT HOLDER =============
@@ -1651,10 +1652,6 @@ async def regenerate_report(include_changes: bool = True) -> str:
                 "user_answers": regen_context.get("user_answers", {})
             }
 
-            logger.info(
-                f"Starting regeneration for chat_history_id: {chat_history_id} with "
-                f"{len(pending_changes)} changes, {len(presales_context.get('questions_and_answers', []))} Q&A pairs"
-            )
 
             result = await run_pipeline_with_constraints(
                 document=document_chunks,
@@ -1706,7 +1703,6 @@ async def regenerate_report(include_changes: bool = True) -> str:
                     previous_version=previous_version_number,
                     new_version=new_version_number
                 )
-                logger.info(f"Generated changelog summary for v{previous_version_number} -> v{new_version_number}")
             else:
                 changelog_summary = f"Version {new_version_number} created with {len(pending_changes)} change(s) applied."
         except Exception as e:
@@ -1743,14 +1739,12 @@ async def regenerate_report(include_changes: bool = True) -> str:
                 model=settings.EMBEDDING_MODEL,
                 chat_history_id=chat_history_id
             )
-            logger.info(f"Updated vector DB with {len(report_chunks)} chunks")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
         # Step 8: CLEAR PENDING CHANGES (non-fatal if fails)
         try:
             await clear_pending_changes(chat_history_id, db)
-            logger.info(f"Cleared {len(pending_changes)} pending changes after regeneration")
         except Exception as e:
             logger.warning(f"Failed to clear pending changes (non-fatal): {str(e)}")
 
@@ -1869,7 +1863,6 @@ async def rollback_report(version_number: int) -> str:
                     model=settings.EMBEDDING_MODEL,
                     chat_history_id=tool_context.chat_history_id
                 )
-                logger.info(f"Updated vector DB with {len(report_chunks)} chunks for rollback")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1961,7 +1954,6 @@ async def set_default_report(version_number: int) -> str:
                     model=settings.EMBEDDING_MODEL,
                     chat_history_id=tool_context.chat_history_id
                 )
-                logger.info(f"Updated vector DB for new default version {version_number}")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1995,6 +1987,8 @@ def get_all_tools() -> list:
         detect_conflicts,
         get_report_versions,
         compare_report_versions,
+        # External research
+        web_search,
         # Optimization & Analysis tools
         suggest_optimization,
         analyze_cost_reduction,
@@ -2076,6 +2070,9 @@ When answering ANY question, automatically include relevant:
 - **get_risks_and_mitigations()**: Get all identified risks with their mitigation strategies
 - **get_report_versions()**: View report version history with changelog summaries showing what changed
 - **compare_report_versions(version_a, version_b)**: Compare two versions to see detailed differences, changes applied, and implications
+
+### External Research Tool
+- **web_search(query, max_results)**: Search the public web (Tavily) for current information the report does not cover. Use this when the user asks about *present-day* external facts: current vendor pricing, services that exist today, recent product launches, vendor-side breaking changes, or alternatives to a service currently in the architecture. Do NOT use it for anything covered in the report — those live in `get_report_section` or `search_report_section`. When you use it, **cite the returned URLs verbatim** in your reply so the user can verify.
 
 ### Optimization & Analysis Tools
 - **suggest_optimization(constraint_type, details)**: Generate optimization suggestions based on user constraints (budget, timeline, resource, scope)

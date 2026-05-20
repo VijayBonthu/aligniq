@@ -2,6 +2,7 @@ import { useRef } from 'react';
 import MarkdownContent from './MarkdownContent';
 import ReportContent from '../report/ReportContent';
 import ReportToolbar from '../report/ReportToolbar';
+import type { EvidenceMap } from '../../types/report';
 
 export interface ChatMessage {
   id: string | number;
@@ -11,6 +12,7 @@ export interface ChatMessage {
   selected?: boolean;
   type?: string;
   reportTitle?: string;
+  evidence_index?: EvidenceMap;
 }
 
 interface Props {
@@ -103,7 +105,12 @@ export default function RichMessage({ msg, contextMode, onToggleSelect }: Props)
                 markdown={msg.content}
                 title={msg.reportTitle || 'Full report'}
               />
-              <ReportContent ref={reportRef} content={msg.content} variant="report" />
+              <ReportContent
+                ref={reportRef}
+                content={msg.content}
+                variant="report"
+                evidenceMap={msg.evidence_index}
+              />
             </>
           ) : (
             <MarkdownContent content={msg.content} />

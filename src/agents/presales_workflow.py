@@ -228,7 +228,6 @@ async def scanner_node(state: PresalesState) -> PresalesState:
     - Scope indicators
     - Obvious gaps
     """
-    logger.info("Starting presales scanner_node")
     start_time = time.time()
 
     try:
@@ -250,7 +249,6 @@ async def scanner_node(state: PresalesState) -> PresalesState:
         state["scanned_requirements"] = response
         state["processing_times"]["scanner"] = round(time.time() - start_time, 2)
 
-        logger.info(f"scanner_node completed in {state['processing_times']['scanner']}s")
         return state
 
     except Exception as e:
@@ -272,7 +270,6 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
     - Technology risks (from LLM knowledge)
     - Red flags
     """
-    logger.info("Starting presales blindspot_node")
     start_time = time.time()
 
     # Skip if previous node failed
@@ -312,8 +309,6 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
         state["red_flags"] = response.get("red_flags", [])
         state["processing_times"]["blindspot"] = round(time.time() - start_time, 2)
 
-        logger.info(f"blindspot_node completed in {state['processing_times']['blindspot']}s")
-        logger.info(f"Identified {len(state['p1_blockers'])} P1 blockers, {len(state['critical_unknowns'])} kickstart questions, {len(state['technology_risks'])} technology risks")
         return state
 
     except Exception as e:
@@ -337,7 +332,6 @@ async def brief_generator_node(state: PresalesState) -> PresalesState:
     - Red flags
     - Notes for SA and PM
     """
-    logger.info("Starting presales brief_generator_node")
     start_time = time.time()
 
     # Skip if previous node failed
@@ -372,7 +366,6 @@ async def brief_generator_node(state: PresalesState) -> PresalesState:
         state["presales_brief"] = response
         state["processing_times"]["brief_generator"] = round(time.time() - start_time, 2)
 
-        logger.info(f"brief_generator_node completed in {state['processing_times']['brief_generator']}s")
         return state
 
     except Exception as e:
@@ -458,8 +451,6 @@ async def run_presales_pipeline(
         else:
             print(result["presales_brief"])
     """
-    logger.info(f"Starting pre-sales pipeline with timeout={timeout}s")
-    logger.info(f"Document length: {len(document)} characters")
     total_start = time.time()
 
     initial_state: PresalesState = {
@@ -540,8 +531,6 @@ async def generate_report_with_assumptions(
     """
     from utils.presales_prompts import FULL_REPORT_WITH_ASSUMPTIONS_PROMPT
 
-    logger.info("Starting report generation with assumptions")
-    logger.info(f"Confirmed answers: {len(confirmed_answers)}, Assumptions: {len(assumptions_list)}")
     start_time = time.time()
     _report_phash = hash_prompt(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
 
@@ -611,7 +600,6 @@ async def generate_report_with_assumptions(
 ## Additional Context from Client/Team
 {additional_context.strip()}
 """
-            logger.info(f"Including additional context ({len(additional_context)} chars) in report")
 
         _report_config = callback_for(
             agent_name="presales_full_report_with_assumptions",
@@ -634,7 +622,6 @@ async def generate_report_with_assumptions(
         )
 
         processing_time = round(time.time() - start_time, 2)
-        logger.info(f"Report with assumptions generated in {processing_time}s")
 
         return {
             "report": response,

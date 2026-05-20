@@ -1,3 +1,5 @@
+import type { EvidenceMap } from './report';
+
 export interface Message {
   id?: string;
   role: 'user' | 'assistant';
@@ -5,6 +7,7 @@ export interface Message {
   timestamp: string;
   selected?: boolean;
   type?: string;
+  evidence_index?: EvidenceMap;
 }
 
 export interface ConversationMetadata {

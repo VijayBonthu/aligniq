@@ -9,7 +9,7 @@ import type {
 } from '../types/preMortem';
 
 export async function getThread(chatHistoryId: string): Promise<ThreadResponse> {
-  const { data } = await api.get<ThreadResponse>(`/pre-mortem/${chatHistoryId}`);
+  const { data } = await api.get<ThreadResponse>(`pre-mortem/${chatHistoryId}`);
   return data;
 }
 
@@ -18,7 +18,7 @@ export async function postTurn(
   body: { user_message: string; kind: TurnKind },
 ): Promise<{ thread: Thread }> {
   const { data } = await api.post<{ thread: Thread }>(
-    `/pre-mortem/${chatHistoryId}/turn`,
+    `pre-mortem/${chatHistoryId}/turn`,
     body,
   );
   return data;
@@ -29,7 +29,7 @@ export async function addPanelist(
   body: { label: string; concern?: string },
 ): Promise<{ thread: Thread; panelist_id: string }> {
   const { data } = await api.post<{ thread: Thread; panelist_id: string }>(
-    `/pre-mortem/${chatHistoryId}/panelist`,
+    `pre-mortem/${chatHistoryId}/panelist`,
     body,
   );
   return data;
@@ -40,7 +40,7 @@ export async function removePanelist(
   panelistId: string,
 ): Promise<{ thread: Thread }> {
   const { data } = await api.delete<{ thread: Thread }>(
-    `/pre-mortem/${chatHistoryId}/panelist/${panelistId}`,
+    `pre-mortem/${chatHistoryId}/panelist/${panelistId}`,
   );
   return data;
 }
@@ -50,18 +50,18 @@ export async function applyItemAction(
   body: { turn_id: string; panelist_id: string; item_id: string; action: ItemAction },
 ): Promise<{ thread: Thread; action_result: ItemActionResult }> {
   const { data } = await api.post<{ thread: Thread; action_result: ItemActionResult }>(
-    `/pre-mortem/${chatHistoryId}/item-action`,
+    `pre-mortem/${chatHistoryId}/item-action`,
     body,
   );
   return data;
 }
 
 export async function resetThread(chatHistoryId: string): Promise<{ thread: Thread }> {
-  const { data } = await api.delete<{ thread: Thread }>(`/pre-mortem/${chatHistoryId}`);
+  const { data } = await api.delete<{ thread: Thread }>(`pre-mortem/${chatHistoryId}`);
   return data;
 }
 
 export async function getSources(chatHistoryId: string): Promise<Sources> {
-  const { data } = await api.get<Sources>(`/pre-mortem/${chatHistoryId}/sources`);
+  const { data } = await api.get<Sources>(`pre-mortem/${chatHistoryId}/sources`);
   return data;
 }

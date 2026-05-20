@@ -31,6 +31,17 @@ def setup_logger():
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
 
+    # Opt-in file handler for local debugging on Windows where stdout capture
+    # can be unreliable. Set LOG_TO_FILE=true in .env to enable.
+    if os.getenv("LOG_TO_FILE", "false").lower() == "true":
+        try:
+            os.makedirs("logs", exist_ok=True)
+            file_handler = logging.FileHandler("logs/app.log", encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+        except OSError:
+            pass
+
     root.propagate = False
     return root
 

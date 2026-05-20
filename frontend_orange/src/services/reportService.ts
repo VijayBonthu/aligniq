@@ -38,31 +38,31 @@ export interface PendingChangesResponse {
 }
 
 export async function getVersions(chatHistoryId: string): Promise<{ total_versions: number; versions: ReportVersionMeta[] }> {
-  const { data } = await api.get(`/report-versions/${chatHistoryId}`);
+  const { data } = await api.get(`report-versions/${chatHistoryId}`);
   return data;
 }
 
 export async function getVersion(chatHistoryId: string, versionNumber: number): Promise<ReportVersionFull> {
-  const { data } = await api.get(`/report-versions/${chatHistoryId}/${versionNumber}`);
+  const { data } = await api.get(`report-versions/${chatHistoryId}/${versionNumber}`);
   return data;
 }
 
 export async function rollbackVersion(chatHistoryId: string, versionNumber: number) {
-  const { data } = await api.post(`/report-versions/${chatHistoryId}/rollback/${versionNumber}`);
+  const { data } = await api.post(`report-versions/${chatHistoryId}/rollback/${versionNumber}`);
   return data;
 }
 
 export async function getPendingChanges(chatHistoryId: string): Promise<PendingChangesResponse> {
-  const { data } = await api.get(`/pending-changes/${chatHistoryId}`);
+  const { data } = await api.get(`pending-changes/${chatHistoryId}`);
   return data;
 }
 
 export async function removePendingChange(chatHistoryId: string, changeId: string) {
-  const { data } = await api.delete(`/pending-changes/${chatHistoryId}/${changeId}`);
+  const { data } = await api.delete(`pending-changes/${chatHistoryId}/${changeId}`);
   return data;
 }
 
 export async function clearPendingChanges(chatHistoryId: string) {
-  const { data } = await api.delete(`/pending-changes/${chatHistoryId}`);
+  const { data } = await api.delete(`pending-changes/${chatHistoryId}`);
   return data;
 }

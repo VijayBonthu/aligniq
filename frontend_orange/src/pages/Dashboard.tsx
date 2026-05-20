@@ -365,7 +365,7 @@ const Dashboard: React.FC = () => {
   const handleSelectConversation = useCallback(async (chatHistoryId: string) => {
     setIsLoadingConversation(true);
     try {
-      const response = await api.get(`/chat/${chatHistoryId}`);
+      const response = await api.get(`chat/${chatHistoryId}`);
       const details = response.data?.user_details;
       if (!details) return;
 
@@ -390,7 +390,7 @@ const Dashboard: React.FC = () => {
       if (conv.analysis_mode === 'presales' && conv.presales_id && conv.document_id) {
         try {
           const [briefResp, questionsResp] = await Promise.all([
-            api.get(`/presales/${conv.document_id}`),
+            api.get(`presales/${conv.document_id}`),
             presalesService.getQuestions(conv.presales_id),
           ]);
           const brief = briefResp.data;
@@ -494,7 +494,7 @@ const Dashboard: React.FC = () => {
       const formData = new FormData();
       files.forEach(f => formData.append('file', f));
 
-      const resp = await api.post('/upload', formData, {
+      const resp = await api.post('upload', formData, {
         onUploadProgress: (pe) => setTotalProgress(Math.round((pe.loaded * 100) / (pe.total || 1))),
       });
 
@@ -613,7 +613,7 @@ const Dashboard: React.FC = () => {
         const chatHistoryId = activeConversation.chat_history_id;
         const allMsgs = [...(activeConversation.messages || []), userMsg];
 
-        const resp = await api.post('/chat-with-doc-v3', {
+        const resp = await api.post('chat-with-doc-v3', {
           chat_history_id: chatHistoryId,
           user_id: userId,
           message: allMsgs,
@@ -645,7 +645,7 @@ const Dashboard: React.FC = () => {
     setIsPresalesChatting(true);
 
     try {
-      const resp = await api.post('/chat-with-doc-v3', {
+      const resp = await api.post('chat-with-doc-v3', {
         chat_history_id: activeConversation.chat_history_id,
         user_id: localStorage.getItem('user_id') || '',
         message: [...(activeConversation.messages || []), userMsg],

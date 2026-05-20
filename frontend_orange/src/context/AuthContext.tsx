@@ -77,7 +77,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const decodeAndStoreUserData = async (token: string) => {
     try {
-      const response = await api.get(`/decode_token/${token}`);
+      const response = await api.get(`decode_token/${token}`);
       const userData: UserData = response.data;
       setUser(userData);
       setIsAuthenticated(true);
@@ -145,7 +145,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setSubscription(null);
 
     if (refreshToken) {
-      api.post('/auth/logout', { refresh_token: refreshToken }).catch(() => {});
+      api.post('auth/logout', { refresh_token: refreshToken }).catch(() => {});
     }
   };
 

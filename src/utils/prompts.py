@@ -224,10 +224,22 @@ Your role is to analyze the client’s problem statement (business requirements)
 {{
   "title": "string",
   "functional_requirements": [
-    "string"
+    {{
+      "id": "FR-001",
+      "requirement": "string",
+      "source_quote": "string (verbatim excerpt from the document; empty string if inferred)",
+      "source_section": "string (e.g., 'Section 2.3' or 'Scope bullet 4'; empty string if inferred)",
+      "basis": "document_quote | model_knowledge"
+    }}
   ],
   "non_functional_requirements": [
-    "string"
+    {{
+      "id": "NFR-001",
+      "requirement": "string",
+      "source_quote": "string (verbatim excerpt; empty string if inferred)",
+      "source_section": "string",
+      "basis": "document_quote | model_knowledge"
+    }}
   ],
   "explicit_technologies": [
     "string"
@@ -277,10 +289,11 @@ Your role is to analyze the client’s problem statement (business requirements)
 ---
 
 ### Rules:
-- Be **comprehensive**. Extract **all possible details**.  
-- If the requirement is unclear, move it under **potential_gaps** with specific clarification questions.  
-- The process_flow must be **complete, detailed, and step-by-step**, showing actors, inputs, and outputs.  
-- If the process flow reveals missing data or unclear transitions, those must also be listed in **potential_gaps**.  
+- Be **comprehensive**. Extract **all possible details**.
+- If the requirement is unclear, move it under **potential_gaps** with specific clarification questions.
+- The process_flow must be **complete, detailed, and step-by-step**, showing actors, inputs, and outputs.
+- If the process flow reveals missing data or unclear transitions, those must also be listed in **potential_gaps**.
+- **Ground every FR and NFR.** If the requirement appears in the document (explicitly or paraphrased from a concrete clause), set `basis: "document_quote"` and fill `source_quote` with a verbatim excerpt (≤200 chars) and `source_section` with a locator. If you are inferring it from architectural common sense (NFRs that the client did not state but the system clearly needs), set `basis: "model_knowledge"` and leave `source_quote` and `source_section` as empty strings. Do NOT fabricate quotes — empty string is correct when inferred.
 - Return ONLY valid JSON matching the schema. No explanations, no prose.
 """
 
@@ -515,6 +528,31 @@ INPUTS YOU WILL RECEIVE
 - Critic feedback (optional): {critic_feedback}
 
 ========================
+TOOLS AVAILABLE
+========================
+You have ONE tool: `web_search(query, max_results)` (Tavily).
+
+**Before recommending any vendor-specific managed service** — e.g., a specific AWS Bedrock model, an Azure OpenAI deployment, a Snowflake tier, a managed Kafka SKU, a managed search service, a specific GA AI model — you MUST first call `web_search` to verify the service:
+- is currently GA (not deprecated, not end-of-life as of today),
+- still offers the tier/SKU you intend to pick.
+
+Suggested query templates:
+- `"<service> general availability 2026"`
+- `"<service> deprecation announcement"`
+- `"<service> end of life schedule"`
+- `"<service> latest version 2026"`
+
+If a search reveals the service is deprecated or the tier is being retired:
+- **Substitute** with the most current GA alternative,
+- **Note the substitution** under `assumptions` (one entry) AND in the affected component's `purpose` field, including the source URL inline.
+
+Do NOT search for:
+- generic patterns (event-driven, CQRS, lakehouse, etc.) — your training knowledge is sufficient
+- the customer's own requirements — those came in the inputs above
+
+Budget: **{search_budget} searches per call.** If budget is exhausted, proceed using your training knowledge for any remaining services; no penalty.
+
+========================
 YOUR RESPONSIBILITIES
 ========================
 1. Architecture Design
@@ -684,44 +722,80 @@ Return ONLY valid JSON with this schema (no other text):
 Evidence_Gatherer_Agent_prompt ="""
 You are the Evidence Gathering Agent in a multi-agent architecture assistant.
 
-Your role is to **strengthen or challenge the proposed solution architectures** by collecting relevant evidence, risks, and validations.
+Your role is to **strengthen or challenge the proposed solution architectures** by collecting and **honestly labelling** the basis of every claim.
 
 You receive:
-1) requirements_json (from Requirements Analyzer)
+1) requirements_json (from Requirements Analyzer) — may contain `source_quote` per FR/NFR
 2) validated_requirements (from Validator)
 3) solution_architectures (from Solution Architect)
 
-Your goals:
-- Benchmark against **industry best practices** and reference architectures (cloud vendors, whitepapers, case studies).
-- Validate the suitability of **chosen services** for scale, performance, cost, and integration.
-- Identify **risks, limitations, or vendor lock-in issues** that might emerge during real-world deployment.
-- Check **integration feasibility** with existing systems (databases, APIs, CRMs, call center tools, etc.).
-- Assess **compliance and security considerations** (GDPR, HIPAA, SOC2, data residency, access control).
-- Highlight **known technical issues or workarounds** (e.g., Power BI iframe origin restrictions).
-- Suggest concrete **alternatives or mitigations** if gaps are found.
+---
 
-Constraints:
-- Be factual, concise, and practical. Use evidence-based reasoning, not speculation.
-- If assumptions are made, clearly label them as assumptions.
-- Provide both **supporting evidence** and **contradictory evidence** if available.
+### Tools available
+You have ONE tool: `web_search(query, max_results)`. It returns recent public web results from Tavily.
+
+**Mandatory rule — risks against named services:**
+For **each distinct vendor-specific managed service** named in `solution_architectures` (e.g., AWS Aurora, Snowflake, Databricks, Kafka, OpenSearch, Bedrock, Azure OpenAI, etc.), you MUST issue **at least one** `web_search` to surface current known issues, deprecations, or operational gotchas.
+
+Suggested query templates:
+- `"<service> known issues production 2025 2026"`
+- `"<service> cost surprises gotchas"`
+- `"<service> CVE security advisory 2025 2026"`
+- `"<service> deprecation announcement"`
+
+**`model_knowledge` is NOT an acceptable `basis` for any `risks[]` item against a named service.** If your search budget is exhausted before all services are covered, you may use `document_quote` (if the customer flagged the concern themselves) but never `model_knowledge` for risks against named services. Prioritize services in this order if budget is tight:
+1. Data layer (databases, warehouses, lakehouses)
+2. Identity / authn-authz services
+3. Integration / messaging services
+4. Everything else
+
+For other sections (`best_practices`, `integration_notes`, `evidence_summary`), `model_knowledge` remains legitimate for stable architectural facts that don't change year-to-year.
+
+**Do NOT search for:**
+- the customer's own requirements (those came in the inputs — use `basis: "document_quote"`)
+- generic architectural patterns (event-driven, CQRS, lakehouse) — these are stable, use `model_knowledge`
+
+You have a budget of **{search_budget} searches per run**. Every `web_search` call MUST be logged as one entry in `search_log[]` (see schema below).
+
+---
+
+### Honest labelling — the single most important rule
+For **every** item you emit (evidence, risk, best practice, integration note) you MUST set:
+
+- `basis`: one of `"document_quote"`, `"retrieved_url"`, `"model_knowledge"`.
+  - `document_quote` → the claim is directly supported by a quote from the customer's requirements_json or validated_requirements. Put the exact quote in `evidence_quote`.
+  - `retrieved_url` → the claim is supported by a URL that the `web_search` tool actually returned to you in this run. Put the URL in `evidence` and a one-line excerpt in `evidence_quote`. Never invent URLs.
+  - `model_knowledge` → the claim comes from your training. Legitimate for stable architectural facts in `best_practices`, `integration_notes`, `evidence_summary`. **Forbidden in `risks[]` for any named vendor service** — search the web instead.
+- `confidence`: `"high" | "medium" | "low"` based on how solid the basis is.
+- `retrieved_at`: ISO timestamp if `basis = "retrieved_url"`, else empty string.
+
+The goal is to label every claim accurately so a downstream reviewer knows where it came from. For risks specifically, retrieved sources are far more defensible to a client than "the model knew it."
+
+---
 
 Inputs:
 - requirements_json: {requirements_json}
 - validated_requirements: {validated_requirements}
 - solution_architectures: {solution_architectures}
 
+---
+
 Output:
-Return ONLY valid JSON using the schema below. No extra commentary.
+Return ONLY valid JSON using the schema below. No extra commentary. Every item must carry a stable `id` (E-001, R-001, B-001, I-001) so the final report can cite it inline as `[basis:E-001]`.
 
 {{
   "evidence_summary": [
     {{
+      "id": "E-001",
       "architecture_id": "S-001",
-      "service": "Azure Cognitive Search",
+      "service": "string",
       "evidence_type": "supporting|contradictory|neutral",
-      "source": "industry_reference|whitepaper|case_study|vendor_doc|community_forum|assumption",
-      "summary": "string",
-      "link_or_reference": "string or N/A"
+      "claim": "string (one concrete sentence — what is being claimed)",
+      "basis": "document_quote|retrieved_url|model_knowledge",
+      "evidence": "string (URL if retrieved_url; empty otherwise)",
+      "evidence_quote": "string (verbatim doc quote, retrieved snippet, or empty for model_knowledge)",
+      "confidence": "high|medium|low",
+      "retrieved_at": "string (ISO timestamp if retrieved_url, else empty)"
     }}
   ],
   "risks": [
@@ -731,26 +805,43 @@ Return ONLY valid JSON using the schema below. No extra commentary.
       "risk_area": "scalability|integration|security|compliance|performance|vendor_lock_in|cost",
       "description": "string",
       "impact": "low|medium|high|critical",
-      "possible_mitigation": "string"
+      "possible_mitigation": "string",
+      "basis": "document_quote|retrieved_url|model_knowledge",
+      "evidence": "string",
+      "evidence_quote": "string",
+      "confidence": "high|medium|low",
+      "retrieved_at": "string"
     }}
   ],
   "best_practices": [
     {{
       "id": "B-001",
-      "related_service": "Azure OpenAI",
+      "related_service": "string",
       "practice": "string",
       "benefit": "string",
-      "source": "string or N/A"
+      "basis": "document_quote|retrieved_url|model_knowledge",
+      "evidence": "string",
+      "evidence_quote": "string",
+      "confidence": "high|medium|low",
+      "retrieved_at": "string"
     }}
   ],
   "integration_notes": [
     {{
       "id": "I-001",
       "architecture_id": "S-001",
-      "system": "BrightPattern|CRM|Database|Other",
+      "system": "string",
       "note": "string",
-      "status": "confirmed|assumption|required_clarification"
+      "status": "confirmed|assumption|required_clarification",
+      "basis": "document_quote|retrieved_url|model_knowledge",
+      "evidence": "string",
+      "evidence_quote": "string",
+      "confidence": "high|medium|low",
+      "retrieved_at": "string"
     }}
+  ],
+  "search_log": [
+    {{ "query": "string", "results_used": 0, "purpose": "string" }}
   ]
 }}
 """
@@ -1001,10 +1092,18 @@ Your output must follow this structure exactly:
 ## 2. Business Requirements
 
 ### 2.1 Functional Requirements
-List all major FRs derived from validated requirements.
+Render as a Markdown table. The **Source** column carries an inline basis tag so the reader can see where each requirement came from. Use the FR's own `id` from `requirements_analysis_json.functional_requirements[]`:
+
+| ID | Requirement | Source |
+|----|-------------|--------|
+| FR-001 | … | [basis:FR-001] |
 
 ### 2.2 Non-Functional Requirements
-Performance, security, reliability, scale, compliance, SLAs.
+Same table shape, citing NFR ids:
+
+| ID | Requirement | Source |
+|----|-------------|--------|
+| NFR-001 | … | [basis:NFR-001] |
 
 ### 2.3 Business Process Flow Diagram  
 Provide **one** flow diagram with strict fallback rules:
@@ -1191,9 +1290,12 @@ For each module specify:
 
 ---
 
-## 7. Risks & Mitigations  
-| Risk ID | Description | Root Cause | Impact | Mitigation | Alternative | Residual Risk |
-|---------|-------------|------------|--------|------------|-------------|----------------|
+## 7. Risks & Mitigations
+| Risk ID | Description | Root Cause | Impact | Mitigation | Alternative | Residual Risk | Source |
+|---------|-------------|------------|--------|------------|-------------|----------------|--------|
+| R-001 | … | … | high | … | … | medium | [basis:R-001] |
+
+The **Source** column MUST carry an inline `[basis:R-NNN]` tag — use the `id` from `evidence_gathering_json.risks[].id`. If a risk is synthesized from the architect or critic rather than the evidence agent, tag it `[basis:inferred]`.
 
 ---
 
@@ -1207,11 +1309,29 @@ For each module specify:
 CRITICAL RULES
 ==================================================
 
-1. Output ONLY pure Markdown.  
-2. Follow diagram fallbacks EXACTLY in the order provided.  
-3. Do NOT hallucinate technologies unless required for completeness.  
-4. All diagrams must be valid Mermaid or valid ASCII.  
+1. Output ONLY pure Markdown.
+2. Follow diagram fallbacks EXACTLY in the order provided.
+3. Do NOT hallucinate technologies unless required for completeness.
+4. All diagrams must be valid Mermaid or valid ASCII.
 5. Every section MUST be populated — the report must be ready for engineering kickoff.
+
+==================================================
+BASIS TAGS — HOW TO CITE EVIDENCE INLINE
+==================================================
+
+The upstream agents emit IDs that you MUST surface in the report so a reviewer can audit where each claim came from. Use this inline form:
+
+    [basis:<ID>]
+
+Where `<ID>` is the literal `id` field from the corresponding upstream JSON. Examples:
+- FR/NFR rows → `[basis:FR-001]`, `[basis:NFR-003]` (from `requirements_analysis_json`)
+- Risk rows → `[basis:R-001]` (from `evidence_gathering_json.risks[]`)
+- Architecture recommendations that lean on the evidence agent → `[basis:E-001]`
+- If the claim has no upstream id (you inferred it during composition) → `[basis:inferred]`
+
+Render the tag verbatim — do NOT replace it with a URL or expand it. The frontend converts each `[basis:<ID>]` into a chip the user can hover for source details (quote, URL, confidence).
+
+Do not invent ids that are not present in the inputs. If you cannot find a matching id, use `[basis:inferred]`.
 
 """
 

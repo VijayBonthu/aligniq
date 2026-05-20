@@ -37,8 +37,6 @@ class ProjectScopingAgent:
         """Process parsed data to extract key requirements"""
         try:
             input_str = parsed_data["document"]
-            logger.info(f"input_str: {input_str}")
-            logger.info(f"type: {type(input_str)}")
             prompt = ChatPromptTemplate.from_template(Initial_phase)
             # prompt = ChatPromptTemplate.from_template("""
             # Analyze the project document and provide a comprehensive technical breakdown and the Teams and roles responsible for the project completion. 
@@ -113,7 +111,6 @@ class ProjectScopingAgent:
             chain = prompt | llm.with_structured_output(ProjectDefinition)
             response= await chain.ainvoke({"document": input_str})
             # response = await self._safe_json_parse(response)
-            print(f"response: {response}")
             return response.to_markdown()
             # print(f"type: {type(response)}")
             # self.requirements.append(response)
@@ -133,7 +130,6 @@ class ProjectScopingAgent:
         
         chain = prompt | llm | StrOutputParser()
         response = chain.invoke({"input": json.dumps(self.requirements)}) 
-        print("RAW Ambiguity response:", response)
         self.ambiguities = self._safe_json_parse(response)
         return self.ambiguities
 
@@ -166,7 +162,6 @@ class ProjectScopingAgent:
         
         chain = prompt | llm | StrOutputParser()
         response = chain.invoke({"input": json.dumps(self.requirements)})
-        print("generate_tech_recommendations:", response)
         self.tech_stack = self._safe_json_parse(response)
         return self.tech_stack
     
@@ -179,8 +174,6 @@ class ProjectScopingAgent:
             cleaned = json_str.replace('```json', '').replace('```', '').strip()
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
-            print(f"Failed to parse JSON: {json_str}")
-            print(f"Error: {e}")
             return {"error": "Invalid JSON response from LLM"}
         
     def generate_pdf_report(self, filename: str):
@@ -407,7 +400,6 @@ class ProjectScopingAgent:
 
         # Send request to GPT-4 Vision
         response = llm.invoke(message)
-        logger.info(f"response from summarize_image: {response}")
             
         return response.content
     
@@ -416,8 +408,5 @@ class ProjectScopingAgent:
         prompt = ChatPromptTemplate.from_template(chat_with_context)
         user_latest_chat = context[-1]['content']
         chain = prompt | llm.with_structured_output(Chat_with_context)
-        logger.info(f"chat_context: {context}")
-        logger.info(f"type of context: {type(context)}")
-        logger.info(f"type of context[0]: {chain}")
         response = await chain.ainvoke({"chat_context": context[:-1], "user_chat": user_latest_chat})
         return {"message": response.to_markdown()}

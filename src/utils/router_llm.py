@@ -123,7 +123,6 @@ async def generate_action_response(
             input_dict,
             config=_cb("generate_action_response", _HASHES["ACTION_RESPONSE_PROMPT"]),
         )
-        logger.info(f"Generated response for action: {action}")
         return response
     except Exception as e:
         logger.error(f"Error generating action response: {str(e)}")
@@ -172,7 +171,6 @@ async def generate_change_acknowledgment(
             input_dict,
             config=_cb("generate_change_acknowledgment", _HASHES["CHANGE_ACKNOWLEDGMENT_PROMPT"]),
         )
-        logger.info(f"Generated change acknowledgment for {change_id}")
         return response
     except Exception as e:
         logger.error(f"Error generating change acknowledgment: {str(e)}")
@@ -207,7 +205,6 @@ async def generate_conflict_resolution(
             input_dict,
             config=_cb("generate_conflict_resolution", _HASHES["CONFLICT_RESOLUTION_PROMPT"]),
         )
-        logger.info(f"Generated conflict resolution prompt for {len(conflicts)} conflicts")
         return response
     except Exception as e:
         logger.error(f"Error generating conflict resolution: {str(e)}")
@@ -245,7 +242,6 @@ async def generate_regeneration_plan(
             input_dict,
             config=_cb("generate_regeneration_plan", _HASHES["REGENERATE_WITH_CHANGES_PROMPT"]),
         )
-        logger.info(f"Generated regeneration plan for {len(pending_changes)} changes")
         return response
     except Exception as e:
         logger.error(f"Error generating regeneration plan: {str(e)}")
@@ -448,7 +444,6 @@ async def build_hybrid_context(conversation: list[dict]) -> dict:
         # Summarize older messages
         try:
             older_summary = await conversation_summary_llm(older_messages)
-            logger.info(f"Summarized {len(older_messages)} older messages ({older_token_count} tokens)")
         except Exception as e:
             logger.warning(f"Failed to summarize older messages: {str(e)}")
             # Fall back to keeping older messages as-is
@@ -528,7 +523,6 @@ async def classify_hybrid_intent(
             input_dict,
             config=_cb("classify_hybrid_intent", _HASHES["HYBRID_INTENT_CLASSIFIER"]),
         )
-        logger.info(f"Hybrid intent classification: is_hybrid={response.get('is_hybrid', False)}")
         return response
 
     except Exception as e:
@@ -595,7 +589,6 @@ async def generate_hybrid_response(
             input_dict,
             config=_cb("generate_hybrid_response", _HASHES["HYBRID_RESPONSE_PROMPT"]),
         )
-        logger.info(f"Generated hybrid response for question + suggestion")
         return response
 
     except Exception as e:
@@ -777,7 +770,6 @@ async def classify_multi_intent(
         # Log the classification result
         primary_intent = response.get("primary_intent", "unknown")
         has_pending = response.get("has_pending_action", False)
-        logger.info(f"Multi-intent classification: primary={primary_intent}, has_pending={has_pending}, intents={len(response.get('intents', []))}")
 
         return response
 
@@ -973,9 +965,6 @@ async def classify_unified_intent(
             "pending_actions_provided": len(pending_actions)
         }
 
-        logger.info(f"Unified classification: primary={enriched_response.get('primary_intent')}, "
-                   f"is_hybrid={is_hybrid}, has_confirmation={has_confirmation}, "
-                   f"intents={len(intents)}, pending_to_confirm={len(pending_actions_to_confirm)}")
 
         return enriched_response
 
@@ -1248,9 +1237,6 @@ async def classify_semantic_intent(
         # Add user_message to response for handlers
         response["user_message"] = user_message
 
-        logger.info(f"Semantic classification: primary={response.get('primary_intent')}, "
-                   f"strategy={response.get('primary_response_strategy')}, "
-                   f"defense={response.get('requires_architecture_defense')}")
 
         return response
 
@@ -1324,7 +1310,6 @@ async def generate_architecture_defense(
             input_dict,
             config=_cb("generate_architecture_defense", _HASHES["ARCHITECTURE_DEFENSE_PROMPT"]),
         )
-        logger.info(f"Generated architecture defense for: {challenge_topic}")
         return response
 
     except Exception as e:

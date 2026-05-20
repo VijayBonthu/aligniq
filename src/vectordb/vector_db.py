@@ -23,11 +23,9 @@ async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> 
   try:
     existing = collection.get(where={"chat_history_id": chat_history_id})
     if not existing or len(existing) == 0:
-      logger.info(f"No existing embeddings found for the chat_hisotry_id: {chat_history_id}")
+      pass
     else:
-      logger.info(f"Existing embedding found for chat_history_id: {chat_history_id}")
       collection.delete(where={"chat_history_id": chat_history_id})
-      logger.info(f"Deleting existing embeddings for chat_history_Id: {chat_history_id}")
   except Exception as e:
     logger.error(f"Error checking/deleting existing embedding for chat_history_id: {chat_history_id}, error: {e}")
     raise RuntimeError(f"failed to check/delete exisitng embeddings: {e}")
@@ -49,7 +47,6 @@ async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> 
       client_oa.embeddings.create(input=text,model=model).data[0].embedding for text in texts 
     ]
     # resp = client_oa.embeddings.create(input=text, model=model)
-    logger.info(f"created embedding for chat_history_id: {chat_history_id}")
   except Exception as e:
      logger.error(f'Error creating embedding for chat_history_id: {chat_history_id}, error: {e}')
      raise RuntimeError(f"Failed to create embeddings: {e}")
@@ -76,7 +73,6 @@ async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> 
       documents=texts,
       metadatas=metadata
     )
-    logger.info(f"added Embeddings to collection for chat_histotry_id: {chat_history_id}")
     return f"embeddings created and added to collections successfully"
   except Exception as e:
      logger.error(f"Error adding embeddings to collection for chat_history_id: {chat_history_id}, error: {e}")

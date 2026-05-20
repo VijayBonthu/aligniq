@@ -66,5 +66,15 @@ class Settings:
     USE_STREAMING_CHAT = os.getenv("USE_STREAMING_CHAT", "false").lower() == "true"
     STREAMING_TIMEOUT = int(os.getenv("STREAMING_TIMEOUT", "300"))  # 5 minutes default for streaming
 
+    #Third-party API keys
+    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+    # Bet 1: Grounded evidence (Tavily web search)
+    ENABLE_GROUNDED_EVIDENCE = os.getenv("ENABLE_GROUNDED_EVIDENCE", "false").lower() == "true"
+    EVIDENCE_SEARCH_MAX_CALLS = int(os.getenv("EVIDENCE_SEARCH_MAX_CALLS", "5"))
+    EVIDENCE_SEARCH_TIMEOUT = int(os.getenv("EVIDENCE_SEARCH_TIMEOUT", "15"))
+    ARCHITECT_SEARCH_MAX_CALLS = int(os.getenv("ARCHITECT_SEARCH_MAX_CALLS", "3"))
+
+
 
 settings = Settings()

@@ -2,7 +2,7 @@ import api from './api';
 import { GroupedConversations, ConversationMetadata, Message } from '../types';
 
 export const fetchConversations = async (): Promise<GroupedConversations> => {
-  const response = await api.get(`/chat?_t=${Date.now()}`);
+  const response = await api.get(`chat?_t=${Date.now()}`);
   const grouped: GroupedConversations = { today: [], yesterday: [], lastWeek: [], older: [] };
 
   if (response.data?.user_details && Array.isArray(response.data.user_details)) {
@@ -30,7 +30,7 @@ export const fetchConversations = async (): Promise<GroupedConversations> => {
 };
 
 export const getConversation = async (chatHistoryId: string) => {
-  const response = await api.get(`/chat/${chatHistoryId}`);
+  const response = await api.get(`chat/${chatHistoryId}`);
   const details = response.data?.user_details;
   if (!details) return response.data;
 
@@ -54,7 +54,7 @@ export const getConversation = async (chatHistoryId: string) => {
 
 export const deleteConversation = async (chatId: string): Promise<void> => {
   try {
-    await api.delete(`/chat/${chatId}`);
+    await api.delete(`chat/${chatId}`);
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'response' in err) {
       const axErr = err as { response?: { status?: number } };

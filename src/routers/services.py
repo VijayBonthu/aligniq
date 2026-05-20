@@ -157,18 +157,15 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
         }
         
         # Step 1: Extract text from document
-        logger.info(f"file_path: {file_path}, user_id: {user_id}, document_id: {document_id}, task_id: {task_id}")
         task_status[task_id]["step_progress"] = 50
         document_data = await ExtractText(document_path=file_path, user_id=user_id, document_id=document_id).parse_document()
         task_status[task_id]["step_progress"] = 100
-        logger.info(f"document_reading is complete")
         
         # Step 2: Process and combine document data
         
         task_status[task_id]["current_step"] = 1
         task_status[task_id]["step_progress"] = 0
         task_status[task_id]["message"] = "Processing content"
-        logger.info(f"Processing the document started: {task_status[task_id]['message']}")
         
         full_data = []
         for i in range(len(document_data)):
@@ -178,13 +175,11 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
             str(item["data"]) if isinstance(item, dict) else str(item) for item in full_data
         )
         task_status[task_id]["step_progress"] = 100
-        logger.info(f"Processing the document complete: {task_status[task_id]['message']}")
         
         # Step 3: Initialize ProjectScopingAgent and analyze requirements
         task_status[task_id]["current_step"] = 2
         task_status[task_id]["step_progress"] = 0
         task_status[task_id]["message"] = "Analyzing requirements"
-        logger.info(f"Processing the analysing input started: {task_status[task_id]['message']}")
         raw_data = {
                 "input": {
                     raw_requirements
@@ -193,34 +188,28 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
         agent = ProjectScopingAgent()
         requirements = agent.analyze_input(raw_data["input"])
         task_status[task_id]["step_progress"] = 100
-        logger.info(f"Processing the analysing input complete: {task_status[task_id]['message']}")
         
         # Step 4: Identify ambiguities 
         task_status[task_id]["current_step"] = 3 
         task_status[task_id]["step_progress"] = 0
         task_status[task_id]["message"] = "Identifying potential issues"
-        logger.info(f"Processing the potential issues started: {task_status[task_id]['message']}")
         
         ambiguities = agent.identify_ambiguities()
         task_status[task_id]["step_progress"] = 100
-        logger.info(f"Processing the potential issues complete: {task_status[task_id]['message']}")
 
         
         # Step 5: Generate tech recommendations
         task_status[task_id]["current_step"] = 4
         task_status[task_id]["step_progress"] = 0
         task_status[task_id]["message"] = "Generating technical recommendations"
-        logger.info(f"Processing the tech recommendations started: {task_status[task_id]['message']}")
         
         tech_stack = agent.generate_tech_recommendations()
         task_status[task_id]["step_progress"] = 50
         
         # Generate PDF report
         pdf_filename = f"project_scoping_report_{document_id}.pdf"
-        logger.info(f"final document is getting created: {pdf_filename}")
         agent.generate_pdf_report(pdf_filename)
         task_status[task_id]["step_progress"] = 100
-        logger.info(f"Processing the tech recommendations started: {task_status[task_id]['message']}")
         
         # Set task as completed with comprehensive result
         task_status[task_id]["status"] = "completed"
@@ -238,8 +227,6 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
             }
         }
         
-        logger.info(f"Task {task_id} completed successfully")
-        logger.info(f"task_status[task_id]['result']")
         
     except Exception as e:
         logger.error(f"Error processing document: {str(e)}")
@@ -278,16 +265,13 @@ async def upload_file(
         try:
             while chunk := await content_document.read(1024*1024):
                 file_content += chunk
-            logger.info(f"reading the file content")
             if len(file_content) > eval(settings.FILE_SIZE):
                 raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File size exceed 10MB limit")
-            logger.info("complete the file size check and reading < 50 MB")
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"file processing failed: {str(e)}")
         if not file_content:
             logger.warning(f"uploaded file is empty")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
-        logger.info(f"completed reading the file")
 
         file_uuid = str(uuid.uuid4())
         file_extension = content_document.filename.split(".")[-1]
@@ -333,14 +317,11 @@ async def upload_file(
                 "user_id": current_token["regular_login_token"]["id"],
                 "document_path": f"{UPLOADS_DIR}/{current_token['regular_login_token']['id']}/{document_name}_{file_uuid}.{file_extension}"
             }
-            logger.info(f"user doc dict: {user_doc}")
             response = await user_documents(doc_data=user_doc, db=db)
-            logger.info(f"completed the document upload")
             document_data = await ExtractText(document_path=response["document_path"],user_id=response["user_id"],document_id=response["document_id"]).parse_document()
             entire_doc_details.append(document_data)
         except Exception as e:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error occured please try again {str(e)}")
-    logger.info(f"entire_doc_details: {entire_doc_details}")
 
     full_data = []
     for content_data in entire_doc_details:
@@ -364,7 +345,6 @@ async def upload_file(
         )
 
     # Otherwise run full analysis pipeline
-    logger.info(f"Starting full agent pipeline for document_id: {response['document_id']}")
 
     try:
         # Run the full agent pipeline
@@ -403,7 +383,6 @@ async def upload_file(
         except Exception as title_error:
             logger.warning(f"Could not extract title from pipeline result: {str(title_error)}, using default")
 
-        logger.info(f"Report generated with title: {document_title}")
 
         # Create initial chat history with assistant response
         initial_chat_data = {
@@ -421,9 +400,7 @@ async def upload_file(
         }
 
         # Save to chat history and get chat_history_id
-        logger.info(f"Saving initial chat history for document_id: {response['document_id']}")
         save_chat = await save_chat_history(chat=initial_chat_data, db=db)
-        logger.info(f"Chat history created with chat_history_id: {save_chat['chat_history_id']}")
 
         if not save_chat:
             logger.error(f"Failed to save chat history for user: {current_token['regular_login_token']['id']} due to no response in save chat")
@@ -432,7 +409,6 @@ async def upload_file(
         # Chunk the report for vector DB storage
         try:
             final_report_chunks = await chunking.chunk_text(text=agent_response_message)
-            logger.info(f"Chunking complete for chat_history_id: {save_chat['chat_history_id']}, total chunks: {len(final_report_chunks)}")
         except Exception as e:
             logger.error(f"Error during chunking for chat_history_id: {save_chat['chat_history_id']}, error: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Chunking failed: {e}")
@@ -444,7 +420,6 @@ async def upload_file(
                 model=settings.EMBEDDING_MODEL,
                 chat_history_id=save_chat["chat_history_id"]
             )
-            logger.info(f"Successfully created embedding and added to vector DB for chat_history_id: {save_chat['chat_history_id']}")
         except Exception as e:
             logger.error(f"Error during embedding creation for chat_history_id: {save_chat['chat_history_id']}, error: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Embedding creation failed: {e}")
@@ -458,11 +433,9 @@ async def upload_file(
                 "report_content": agent_response_message,
                 "summary_report": summary_report
             }
-            logger.info(f"Successfully created the summary report for chat_history_id: {save_chat['chat_history_id']}")
 
             # Save report version
             await save_report_version(summary_report_details=summary_detail_report, db=db)
-            logger.info(f"Successfully saved the summary report for chat_history_id: {save_chat['chat_history_id']}")
         except Exception as e:
             logger.error(f"Error during summary report creation and saving for chat_history_id: {save_chat['chat_history_id']}, error: {str(e)}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error occurred on creating and saving the summary report: {str(e)}")
@@ -542,7 +515,6 @@ async def _run_presales_analysis(
     Returns:
         dict with presales_brief, technology_risks, and metadata
     """
-    logger.info(f"Starting pre-sales analysis for document_id: {document_id}")
 
     try:
         # Pre-generate presales_id so initial-scan LLM rows can be tagged with it
@@ -583,7 +555,6 @@ async def _run_presales_analysis(
 
         presales_record = await save_presales_analysis(presales_data=presales_data, db=db)
         presales_id = presales_record["presales_id"]
-        logger.info(f"Saved pre-sales analysis with presales_id: {presales_id}")
 
         # Save technology risks for passive capture
         if result.get("technology_risks"):
@@ -595,7 +566,6 @@ async def _run_presales_analysis(
                 model_used=settings.GENERATING_REPORT_MODEL,
                 db=db
             )
-            logger.info(f"Saved {len(result['technology_risks'])} technology risks")
 
         # Generate a meaningful title from the presales analysis
         scanned_reqs = result.get("scanned_requirements", {})
@@ -625,7 +595,6 @@ async def _run_presales_analysis(
         }
         chat_record = await save_chat_history(chat=chat_data, db=db)
         chat_history_id = chat_record["chat_history_id"]
-        logger.info(f"Created chat history for presales: {chat_history_id}")
 
         # Create analysis link with chat_history_id for unified tracking
         await create_analysis_link(
@@ -635,7 +604,6 @@ async def _run_presales_analysis(
             chat_history_id=chat_history_id,
             db=db
         )
-        logger.info(f"Created analysis link for presales_id: {presales_id} with chat_history_id: {chat_history_id}")
 
         # Create question records for tracking
         questions_result = await create_presales_questions(
@@ -645,7 +613,6 @@ async def _run_presales_analysis(
             kickstart_questions=result.get("critical_unknowns", []),
             db=db
         )
-        logger.info(f"Created {questions_result['total_count']} questions for presales_id: {presales_id}")
 
         # Build response compatible with frontend
         response_data = {
@@ -670,7 +637,6 @@ async def _run_presales_analysis(
             "chat_history_id": chat_history_id
         }
 
-        logger.info(f"Pre-sales analysis completed. Brief length: {len(result.get('presales_brief', '') or '')} chars")
         return response_data
 
     except PresalesTimeoutError as e:
@@ -720,7 +686,6 @@ async def generate_presales_report(
     """
     user_id = current_token["regular_login_token"]["id"]
     check_regen_limit(user_id, db)
-    logger.info(f"Generating presales brief for presales_id: {presales_id}")
 
     try:
         presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
@@ -1179,7 +1144,6 @@ async def submit_kickstart_answers(
             db=db
         )
 
-        logger.info(f"Saved answers for presales_id: {presales_id}")
 
         return {
             "presales_id": presales_id,
@@ -1236,7 +1200,6 @@ async def submit_risk_feedback(
                 detail=f"Technology risk not found: {risk_id}"
             )
 
-        logger.info(f"Marked risk {risk_id} as relevant={was_relevant}")
 
         return {
             "risk_id": risk_id,
@@ -1288,7 +1251,6 @@ async def presales_chat(
     import re
 
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Presales chat for presales_id: {presales_id}, message: {message[:100]}...")
 
     try:
         # Get the presales analysis
@@ -1367,7 +1329,6 @@ async def presales_chat(
             if p1_blockers and 0 < p1_num <= len(p1_blockers):
                 referenced_item = f"P1-{p1_num}"
                 referenced_item_content = json.dumps(p1_blockers[p1_num - 1], indent=2)
-                logger.info(f"Detected P1 blocker reference: {referenced_item}")
 
         # Check for kickstart question references
         q_match = re.search(r'(?:Q|question\s*)(\d+)', message, re.IGNORECASE)
@@ -1376,7 +1337,6 @@ async def presales_chat(
             if kickstart_questions and 0 < q_num <= len(kickstart_questions):
                 referenced_item = f"Q{q_num}"
                 referenced_item_content = json.dumps(kickstart_questions[q_num - 1], indent=2)
-                logger.info(f"Detected kickstart question reference: {referenced_item}")
 
         # Detect if user is providing an answer
         answer_detected = None
@@ -1397,7 +1357,6 @@ async def presales_chat(
                         answer_detected = {"reference": f"P1-{q_ref}", "answer": answer_content}
                     else:
                         answer_detected = {"reference": f"Q{q_ref}", "answer": answer_content}
-                    logger.info(f"Detected answer: {answer_detected}")
                     break
 
         # Save detected answer to database
@@ -1414,7 +1373,6 @@ async def presales_chat(
                             db=db
                         )
                         answer_saved = True
-                        logger.info(f"Saved answer for {ref}")
                         break
             except Exception as e:
                 logger.warning(f"Could not save answer: {str(e)}")
@@ -1456,7 +1414,6 @@ async def presales_chat(
         if answer_saved and answer_detected:
             response_content += f"\n\n✅ **Answer recorded** for {answer_detected['reference']}: \"{answer_detected['answer'][:100]}{'...' if len(answer_detected['answer']) > 100 else ''}\""
 
-        logger.info(f"Presales chat response generated, length: {len(response_content)}")
 
         # Save conversation to chat history
         if chat_history_id:
@@ -1505,7 +1462,6 @@ async def presales_chat(
                     },
                     db=db
                 )
-                logger.info(f"Saved conversation to chat_history_id: {chat_history_id}")
                 # Count this user turn against the per-chat message ceiling.
                 # Atomic UPDATE...RETURNING; one increment per turn (matches /chat-with-doc).
                 increment_message_count(chat_history_id, user_id, db)
@@ -1557,7 +1513,6 @@ async def get_presales_questions_endpoint(
         List of questions with their current state
     """
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Getting questions for presales: {presales_id}")
 
     questions = await get_presales_questions(presales_id, user_id, db, include_invalid)
 
@@ -1600,14 +1555,11 @@ async def save_question_answers(
     import json as json_module
 
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Saving answers for presales: {presales_id}")
 
     # Parse answers if it's a string
     if isinstance(answers, str):
         answers = json_module.loads(answers)
 
-    logger.info(f"Received answers for {len(answers)} questions")
-    logger.info(f"Received answer keys: {list(answers.keys())}")
 
     # Get all questions for this presales to map frontend keys to question_ids
     questions = await get_presales_questions(presales_id, user_id, db)
@@ -1637,7 +1589,6 @@ async def save_question_answers(
                 idx = int(key.split("_")[1])
                 if idx < len(p1_questions):
                     question_id = p1_questions[idx]["question_id"]
-                    logger.info(f"Mapped {key} -> P1 question {p1_questions[idx]['question_number']} ({question_id})")
             except (ValueError, IndexError) as e:
                 logger.warning(f"Failed to parse P1 key {key}: {e}")
 
@@ -1647,19 +1598,16 @@ async def save_question_answers(
                 idx = int(key.split("_")[1])
                 if idx < len(kickstart_questions):
                     question_id = kickstart_questions[idx]["question_id"]
-                    logger.info(f"Mapped {key} -> kickstart question {kickstart_questions[idx]['question_number']} ({question_id})")
             except (ValueError, IndexError) as e:
                 logger.warning(f"Failed to parse kickstart key {key}: {e}")
 
         else:
             # Assume it's already a question_id (UUID)
             question_id = key
-            logger.info(f"Using key as question_id: {key}")
 
         if question_id and answer:  # Only save non-empty answers
             mapped_answers[question_id] = answer
 
-    logger.info(f"Mapped {len(mapped_answers)} answers to question_ids")
 
     if not mapped_answers:
         return {
@@ -1701,7 +1649,6 @@ async def analyze_presales_answers(
     from agents.answer_analyzer import analyze_answers, analyze_answers_quick
 
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Analyzing answers for presales: {presales_id}")
 
     try:
         # Get presales data
@@ -1784,7 +1731,6 @@ async def analyze_presales_answers(
             db=db
         )
 
-        logger.info(f"Analysis complete for {presales_id}: score={analysis_result.readiness_score}")
 
         # Get updated questions
         updated_questions = await get_presales_questions(presales_id, user_id, db)
@@ -1835,7 +1781,6 @@ async def restore_presales_question(
         Dict with restored question status
     """
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Restoring question {question_id} for presales: {presales_id}")
 
     result = await restore_question(question_id, user_id, db)
 
@@ -1857,7 +1802,6 @@ async def get_presales_full(
     Returns complete state for frontend display.
     """
     user_id = current_token["regular_login_token"]["id"]
-    logger.info(f"Getting full presales data for: {presales_id}")
 
     data = await get_presales_with_questions(presales_id, user_id, db)
 
@@ -1876,8 +1820,6 @@ async def get_task_status(
     current_token: dict = Depends(token_validator)
 ):
     """Get the status of a processing task"""
-    logger.info(f"Checking status for task_id: {task_id}")
-    logger.info(f"Available task IDs: {list(task_status.keys())}")
     
     if task_id not in task_status:
         # Check if the task was completed and has a result
@@ -1886,7 +1828,6 @@ async def get_task_status(
                                  t.get("result", {}).get("document_id") == task_id), None)
         
         if completed_task:
-            logger.info(f"Found completed task with matching document_id: {task_id}")
             return completed_task
             
         # If we still can't find it, return a more helpful error
@@ -1896,7 +1837,6 @@ async def get_task_status(
             detail=f"Task not found. Available tasks: {len(task_status)}"
         )
     
-    logger.info(f"Returning status for task_id: {task_id}")
     return task_status[task_id]
 
 @router.post("/jira/get_user")
@@ -1918,7 +1858,6 @@ async def get_user_details(
         # Validate Jira token
         jira_token = auth_header.split("Bearer ")[1]
         jira_payload = token_validator(request=jira_token)
-        print(f"jira_payload: {jira_payload}")
         
         # Use the access token stored in the Jira JWT
         user_info = await get_jira_user_info(jira_payload["jira_access_token"])
@@ -2019,7 +1958,6 @@ async def add_chat_history(request: ChatHistoryDetails, current_user: dict = Dep
         chat = request.model_dump()
         user_id = chat['user_id']
         check_chat_limit(user_id, db)
-        logger.info(f"got the details in api ,saving the chat history for user: {user_id}")
         save_chat = await save_chat_history(chat=chat, db=db)
         return {"status":save_chat["status"], "chat_history_id":save_chat["chat_history_id"], "user_id":save_chat["user_id"],"message":save_chat["message"]}
     except Exception as e:
@@ -2094,7 +2032,6 @@ async def chat_delete(chat_id:str,db:Session=Depends(get_db),current_user:dict=D
     try:
         
         deleted_details = await delete_chat_history(user_id = current_user["regular_login_token"]["id"], chat_history_id=chat_id, db=db)
-        logger.info(f"deleted the chat history for user: {current_user['regular_login_token']['id']}, chat_id: {chat_id}")
         return {"status":deleted_details["status"]}
     except Exception as e:
         logger.error(f"error occured while deleting the chat history for user: {current_user['regular_login_token']['id']}, error: {str(e)}")
@@ -2416,7 +2353,6 @@ async def execute_intents_parallel(
                     "undo_change": "undo_last_change",
                 }
                 normalized_action = ACTION_NORMALIZATION.get(action, action)
-                logger.info(f"Executing command: {action} -> normalized: {normalized_action}")
 
                 try:
                     # Execute the command based on action
@@ -2702,8 +2638,6 @@ async def conversation_with_doc_v2(
             raise HTTPException(status_code=400, detail="User ID mismatch")
 
         chat_context = request.model_dump()
-        logger.info(f"Processing chat-with-docs-v2 for user: {request.user_id}, chat_history_id: {request.chat_history_id}")
-        logger.info(f"Total messages received: {len(chat_context['message'])}")
 
         # Plan enforcement: check + increment at the top because this handler has
         # ~6 save_chat_history exit branches and a per-branch increment would
@@ -2714,7 +2648,6 @@ async def conversation_with_doc_v2(
 
         # 2. Extract ONLY selected messages for processing
         selected_messages = [msg for msg in chat_context["message"] if msg.get("selected", True)]
-        logger.info(f"Selected messages for processing: {len(selected_messages)}")
 
         if len(selected_messages) == 0:
             raise HTTPException(status_code=400, detail="No selected messages to process")
@@ -2724,15 +2657,12 @@ async def conversation_with_doc_v2(
 
         try:
             hybrid_context = await build_hybrid_context(messages_for_processing)
-            logger.info(f"Built hybrid context: type={hybrid_context['context_type']}, recent_msgs={len(hybrid_context['recent_messages'])}")
-            logger.info(f"hybrid_context details: {hybrid_context}")
             # For backward compatibility, also set conversation_context
             conversation_context = hybrid_context["recent_messages"] if hybrid_context["older_summary"] is None else {
                 "older_summary": hybrid_context["older_summary"],
                 "recent_messages": hybrid_context["recent_messages"]
             }
 
-            logger.info(f"conversation for LLM: {conversation_context}")
         except Exception as e:
             logger.error(f"Error building hybrid context: {str(e)}")
             # Fall back to original behavior
@@ -2742,7 +2672,6 @@ async def conversation_with_doc_v2(
         # 4. Retrieve report summary from DB
         try:
             report_summary = await get_summary_report(chat_history_id=chat_context["chat_history_id"], db=db)
-            logger.info(f"Retrieved report summary for chat_history_id: {chat_context['chat_history_id']} and report_summary details: {report_summary}")
         except Exception as e:
             logger.error(f"Error retrieving report summary: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error retrieving report summary: {str(e)}")
@@ -2759,7 +2688,6 @@ async def conversation_with_doc_v2(
         # ============================================================
         # This MUST happen before classification so we can detect confirmations
         pending_actions = extract_pending_actions(chat_context["message"][-10:])
-        logger.info(f"Extracted {len(pending_actions)} pending actions before classification")
 
         # ============================================================
         # STEP 2: UNIFIED INTENT CLASSIFICATION
@@ -2782,10 +2710,6 @@ async def conversation_with_doc_v2(
                 pending_actions=pending_actions,  # ALWAYS pass this!
                 last_assistant_message=get_last_assistant_message(chat_context)
             )
-            logger.info(f"Unified classification: primary_intent={classification_result.get('primary_intent')}, "
-                       f"is_hybrid={classification_result.get('is_hybrid')}, "
-                       f"has_confirmation={classification_result.get('has_confirmation')}, "
-                       f"intents={len(classification_result.get('intents', []))}")
 
             # For backward compatibility, also set hybrid_intent
             hybrid_intent = classification_result
@@ -2812,7 +2736,6 @@ async def conversation_with_doc_v2(
 
         if classification_result.get("has_confirmation", False) and pending_actions:
             pending_to_confirm = classification_result.get("pending_actions_to_confirm", pending_actions[:1])
-            logger.info(f"Processing confirmation for {len(pending_to_confirm)} pending actions")
 
             if primary_intent == "confirmation":
                 # Track all confirmed pending actions
@@ -2912,7 +2835,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
                     chat_context["message"].append(new_assistant_message)
                     await save_chat_history(chat=chat_context, db=db)
 
-                    logger.info(f"Confirmed and tracked {len(tracked_changes)} changes")
                     return {
                         "message": llm_response,
                         "action": "confirm_suggestion",
@@ -2921,7 +2843,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
                     }
 
             elif primary_intent == "decline":
-                logger.info("User declined pending suggestion(s)")
                 llm_response = "Understood, we'll leave that as is. What else would you like to discuss about the architecture?"
 
                 new_assistant_message = {
@@ -2964,9 +2885,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
         implicit_suggestions = [i for i in intents if i.get("type") == "implicit_suggestion"]
         question_intents = [i for i in intents if i.get("type") == "question"]
 
-        logger.info(f"Intent breakdown: {len(question_intents)} questions, "
-                   f"{len(explicit_suggestions)} explicit suggestions, "
-                   f"{len(implicit_suggestions)} implicit suggestions")
 
         # If we have any intents to process (question, suggestions, or hybrid)
         if has_question or has_suggestion or len(intents) > 0:
@@ -2998,7 +2916,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
                             "content": suggestion_content,
                             "category": suggestion_action
                         })
-                        logger.info(f"Auto-tracked explicit suggestion: {add_result.get('change_id')}")
                     except Exception as e:
                         logger.error(f"Failed to track explicit suggestion: {str(e)}")
 
@@ -3015,7 +2932,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
                     )
                     if vector_results and "documents" in vector_results and vector_results["documents"]:
                         retrieved_context = "\n\n".join(vector_results["documents"][0])
-                        logger.info(f"Retrieved {len(vector_results['documents'][0])} chunks for question")
                 except Exception as e:
                     logger.warning(f"Vector retrieval for question failed: {str(e)}")
 
@@ -3098,7 +3014,6 @@ That brings us to {pending_count} pending change{'s' if pending_count > 1 else '
                     clarification_count += 1
 
             if clarification_count < 2:
-                logger.info(f"Message needs clarification (attempt {clarification_count + 1}/2)")
 
                 clarification_question = get_clarification_question(user_message)
                 llm_response = f"""**Clarification Needed**
@@ -3125,7 +3040,7 @@ Your message: "{user_message}"
                     "action_reason": "Message was too vague, requesting clarification"
                 }
             else:
-                logger.info("Max clarifications reached, proceeding with best interpretation")
+                pass
 
         # ============================================================
         # STEP 6: ROUTER FALLBACK (for commands and other actions)
@@ -3143,7 +3058,6 @@ Your message: "{user_message}"
             )
             action = router_response.get("action", "general_discussion")
             action_reason = router_response.get("reason", "")
-            logger.info(f"Router classified action: {action}, reason: {action_reason}")
         except Exception as e:
             logger.error(f"Error in router LLM: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error in router LLM: {str(e)}")
@@ -3174,11 +3088,9 @@ Your message: "{user_message}"
                             if is_affirmative:
                                 action = "rollback_to_version"
                                 action_reason = "User confirmed pending rollback"
-                                logger.info(f"Safety net: overriding to rollback_to_version")
                             else:
                                 action = "undo_last_change"
                                 action_reason = "User cancelled pending rollback"
-                                logger.info(f"Safety net: overriding to undo_last_change")
                             break
 
                         # Check for clear all changes confirmation
@@ -3186,7 +3098,6 @@ Your message: "{user_message}"
                             if is_affirmative:
                                 action = "clear_all_changes"
                                 action_reason = "User confirmed clearing all changes"
-                                logger.info(f"Safety net: overriding to clear_all_changes")
                             break
 
         # 6. Handle action-specific processing
@@ -3200,11 +3111,9 @@ Your message: "{user_message}"
 
         # Check if this is a change tracking action (modify_*, correct_*)
         if is_change_tracking_action(action):
-            logger.info(f"Action {action} requires change tracking")
 
             # Get existing pending changes
             existing_changes = await get_pending_changes(chat_context["chat_history_id"], db)
-            logger.info(f"Existing pending changes: {len(existing_changes)}")
 
             # Get affected sections for this change type
             affected_sections = get_affected_sections(action)
@@ -3226,7 +3135,6 @@ Your message: "{user_message}"
                     db=db
                 )
                 change_id = add_result["change_id"]
-                logger.info(f"Added pending change: {change_id}")
             except Exception as e:
                 logger.error(f"Error adding pending change: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Error tracking change: {str(e)}")
@@ -3236,7 +3144,6 @@ Your message: "{user_message}"
             conflicts = detect_conflicts(all_changes)
 
             if conflicts:
-                logger.info(f"Detected {len(conflicts)} conflicts in pending changes")
                 # Generate conflict resolution prompt
                 try:
                     llm_response = await generate_conflict_resolution(
@@ -3274,7 +3181,6 @@ Your message: "{user_message}"
 
         # Handle undo_last_change action
         elif action == "undo_last_change":
-            logger.info("Processing undo_last_change action")
             try:
                 result = await remove_last_pending_change(chat_context["chat_history_id"], db)
 
@@ -3297,14 +3203,12 @@ Your message: "{user_message}"
                     "has_conflicts": False,
                     "undone_change": result.get("removed_change")
                 }
-                logger.info(f"Undid last change, remaining: {result['remaining_count']}")
             except Exception as e:
                 logger.error(f"Error undoing last change: {str(e)}")
                 llm_response = f"I encountered an error while trying to undo the last change: {str(e)}"
 
         # Handle undo_specific_change action
         elif action == "undo_specific_change":
-            logger.info("Processing undo_specific_change action")
             # Extract change ID from user message (e.g., CHG-001, CHG-002)
             import re
             change_id_match = re.search(r'CHG-(\d+)', user_message, re.IGNORECASE)
@@ -3326,7 +3230,6 @@ Your message: "{user_message}"
                         "has_conflicts": False,
                         "removed_change_id": change_id
                     }
-                    logger.info(f"Removed specific change {change_id}")
                 except HTTPException as he:
                     if he.status_code == 404:
                         llm_response = f"**Change Not Found**\n\nI couldn't find a pending change with ID **{change_id}**. Use **'show pending changes'** to see all available changes."
@@ -3351,7 +3254,6 @@ Please specify a change ID (e.g., "remove CHG-001").
 
         # Handle clear_all_changes action
         elif action == "clear_all_changes":
-            logger.info("Processing clear_all_changes action")
             try:
                 # First get current changes for logging
                 current_changes = await get_pending_changes(chat_context["chat_history_id"], db)
@@ -3374,14 +3276,12 @@ Feel free to start fresh with new modification requests."""
                     "has_conflicts": False,
                     "cleared_count": cleared_count
                 }
-                logger.info(f"Cleared all pending changes, count: {cleared_count}")
             except Exception as e:
                 logger.error(f"Error clearing pending changes: {str(e)}")
                 llm_response = f"I encountered an error while trying to clear all changes: {str(e)}"
 
         # Handle show_pending_changes action
         elif action == "show_pending_changes":
-            logger.info("Processing show_pending_changes action")
             try:
                 pending_changes = await get_pending_changes(chat_context["chat_history_id"], db)
 
@@ -3433,7 +3333,6 @@ To make changes, you can:
                     "has_conflicts": len(detect_conflicts(pending_changes)) > 0 if pending_changes else False,
                     "changes": pending_changes
                 }
-                logger.info(f"Showed {len(pending_changes)} pending changes")
             except Exception as e:
                 logger.error(f"Error getting pending changes: {str(e)}")
                 llm_response = f"I encountered an error while retrieving pending changes: {str(e)}"
@@ -3444,7 +3343,6 @@ To make changes, you can:
 
         # Handle show_version_history action
         elif action == "show_version_history":
-            logger.info("Processing show_version_history action")
             try:
                 versions = await get_all_report_versions_enhanced(
                     chat_context["chat_history_id"],
@@ -3511,7 +3409,6 @@ This is your only version. Future versions are created when you:
 
         # Handle view_specific_version action
         elif action == "view_specific_version":
-            logger.info("Processing view_specific_version action")
             import re
             version_match = re.search(r'version\s*(\d+)|v(\d+)', user_message, re.IGNORECASE)
 
@@ -3566,7 +3463,6 @@ Please specify, e.g., "Show me version 2"
 
         # Handle rollback_to_version action (Two-Step Confirmation)
         elif action == "rollback_to_version":
-            logger.info("Processing rollback_to_version action")
             import re
 
             version_match = re.search(r'version\s*(\d+)|v(\d+)', user_message, re.IGNORECASE)
@@ -3674,7 +3570,6 @@ Use "show version history" to see available versions.
 
         # Handle compare_versions action
         elif action == "compare_versions":
-            logger.info("Processing compare_versions action")
             import re
 
             version_matches = re.findall(r'(\d+)', user_message)
@@ -3731,7 +3626,6 @@ Please specify two version numbers, e.g.:
 
         # Handle show_section action
         elif action == "show_section":
-            logger.info("Processing show_section action")
 
             # Map common section names to report sections and markdown headers
             SECTION_MAPPING = {
@@ -3819,7 +3713,6 @@ Please specify two version numbers, e.g.:
                                 section_content = report_content[start_pos:start_pos + 5000].strip()
 
                             source = "report_content"
-                            logger.info(f"Extracted section '{target_section}' from report_content using header matching")
                             break
 
                 # Strategy 2: Try summary if no content from report
@@ -3845,7 +3738,6 @@ Please specify two version numbers, e.g.:
                         if vector_results and vector_results.get("documents") and vector_results["documents"][0]:
                             section_content = "\n\n".join(vector_results["documents"][0])
                             source = "vector_retrieval"
-                            logger.info(f"Retrieved section '{target_section}' via vector search")
                     except Exception as e:
                         logger.error(f"Vector retrieval failed: {str(e)}")
 
@@ -3892,7 +3784,6 @@ Just say something like "Show me the architecture" or "What are the risks?"
 
         # Handle show_presales_context action
         elif action == "show_presales_context":
-            logger.info("Processing show_presales_context action")
 
             try:
                 # Get analysis link to find presales_id
@@ -3974,7 +3865,6 @@ The report was likely generated directly from a document upload.
 
         # Handle help_capabilities action
         elif action == "help_capabilities":
-            logger.info("Processing help_capabilities action")
 
             try:
                 pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
@@ -4041,7 +3931,6 @@ Just ask me anything about your report!
 
         # Handle export_report action
         elif action == "export_report":
-            logger.info("Processing export_report action")
 
             try:
                 # Get the default/current report
@@ -4178,7 +4067,6 @@ The report content is displayed below. You can:
         # ============================================================
 
         elif action == "show_full_report":
-            logger.info("Processing show_full_report action")
             try:
                 # Get the default/current report
                 default_report = await get_default_report(
@@ -4251,7 +4139,6 @@ Or if you're in a presales workflow, complete the analysis first.
         # ============================================================
 
         elif action == "set_default_version":
-            logger.info("Processing set_default_version action")
             import re as regex_module
 
             version_match = regex_module.search(r'version\s*(\d+)|v(\d+)', user_message, regex_module.IGNORECASE)
@@ -4281,7 +4168,6 @@ Or if you're in a presales workflow, complete the analysis first.
                                 model=settings.EMBEDDING_MODEL,
                                 chat_history_id=chat_context["chat_history_id"]
                             )
-                            logger.info(f"Updated vector DB embeddings for default version {target_version}")
                     except Exception as vec_error:
                         logger.warning(f"Failed to update vector DB embeddings: {str(vec_error)}")
 
@@ -4349,7 +4235,6 @@ Please specify, e.g., "Set version 2 as default"
 
         # Handle improve_existing_report action - track as pending change
         elif action == "improve_existing_report":
-            logger.info("Processing improve_existing_report action")
 
             # Detect which section to improve
             section_keywords = {
@@ -4431,7 +4316,6 @@ You can also:
 
         # Handle regenerate_full_report action
         elif action == "regenerate_full_report":
-            logger.info("Processing regenerate_full_report action")
 
             # Get all pending changes
             pending_changes = await get_pending_changes(chat_context["chat_history_id"], db)
@@ -4478,7 +4362,6 @@ If you'd like to make modifications, just let me know what you'd like to change 
                             pending_changes=pending_changes,
                             conversation_context=conversation_context
                         )
-                        logger.info(f"Generated regeneration plan: {regen_plan}")
 
                         sections_to_update = regen_plan.get("sections_to_regenerate", [])
 
@@ -4490,7 +4373,6 @@ If you'd like to make modifications, just let me know what you'd like to change 
                             if not original_report_content:
                                 raise ValueError("Original report content not found")
 
-                            logger.info(f"Starting section regeneration for chat_history_id: {chat_context['chat_history_id']}")
 
                             # Bind a recorder so regen + summary calls land in llm_call_log.
                             from utils.llm_metrics import LLMCallRecorder, use_recorder
@@ -4510,7 +4392,6 @@ If you'd like to make modifications, just let me know what you'd like to change 
                                     pending_changes=pending_changes
                                 )
 
-                                logger.info(f"Section regeneration completed, new report length: {len(regenerated_report)} chars")
 
                                 # Calculate new version number before creating summary
                                 current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
@@ -4518,7 +4399,6 @@ If you'd like to make modifications, just let me know what you'd like to change 
 
                                 # Create summary for the new report with correct version number
                                 new_summary = await main_report_summary(main_report=regenerated_report, version_number=new_version_number)
-                            logger.info(f"Generated summary for regenerated report (version {new_version_number})")
 
                             # Create new version
                             new_version_result = await create_new_report_version(
@@ -4530,11 +4410,9 @@ If you'd like to make modifications, just let me know what you'd like to change 
                                 db=db
                             )
 
-                            logger.info(f"Created new report version: {new_version_result['version_number']}")
 
                             # Clear pending changes after successful regeneration
                             await clear_pending_changes(chat_context["chat_history_id"], db)
-                            logger.info(f"Cleared pending changes for chat_history_id: {chat_context['chat_history_id']}")
 
                             # Update vector DB with new report content
                             try:
@@ -4544,7 +4422,6 @@ If you'd like to make modifications, just let me know what you'd like to change 
                                     model=settings.EMBEDDING_MODEL,
                                     chat_history_id=chat_context["chat_history_id"]
                                 )
-                                logger.info(f"Updated vector DB with regenerated report")
                             except Exception as vec_error:
                                 logger.warning(f"Failed to update vector DB: {str(vec_error)}")
 
@@ -4620,7 +4497,6 @@ Your changes have been saved. Please try again or contact support if the issue p
                 # Extract documents from results
                 if vector_results and "documents" in vector_results:
                     retrieved_context = "\n\n".join(vector_results["documents"][0]) if vector_results["documents"] else "No relevant content found"
-                logger.info(f"Retrieved {len(vector_results.get('documents', [[]])[0])} chunks from vector DB")
             except Exception as e:
                 logger.warning(f"Vector DB retrieval failed: {str(e)}, proceeding without retrieved context")
                 retrieved_context = "Vector retrieval unavailable"
@@ -4686,7 +4562,6 @@ Your changes have been saved. Please try again or contact support if the issue p
                         action_reason=action_reason,
                         retrieved_context=retrieved_context
                     )
-                    logger.info(f"Generated response for action: {action}")
                 except Exception as e:
                     logger.error(f"Error generating response: {str(e)}")
                     raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
@@ -4705,7 +4580,6 @@ Your changes have been saved. Please try again or contact support if the issue p
         # 9. Save full conversation to chat_history
         try:
             await save_chat_history(chat=chat_context, db=db)
-            logger.info(f"Saved full conversation to chat_history")
         except Exception as e:
             logger.error(f"Error saving chat history: {str(e)}")
             # Don't fail the request if save fails, just log it
@@ -4720,7 +4594,6 @@ Your changes have been saved. Please try again or contact support if the issue p
                 "title": chat_context.get("title")
             }
             await save_chat_with_doc(chat_context=selected_only_data, db=db)
-            logger.info(f"Saved selected messages to selected_chat ({len(selected_only_data['message'])} messages)")
         except Exception as e:
             logger.error(f"Error saving selected chat: {str(e)}")
             # Don't fail the request if save fails, just log it
@@ -4788,7 +4661,6 @@ async def remove_pending_change_endpoint(
     """
     try:
         result = await remove_pending_change(chat_history_id, change_id, db)
-        logger.info(f"Removed pending change {change_id} for chat_history_id: {chat_history_id}")
         return result
     except HTTPException:
         raise
@@ -4809,7 +4681,6 @@ async def clear_all_pending_changes_endpoint(
     """
     try:
         result = await clear_pending_changes(chat_history_id, db)
-        logger.info(f"Cleared all pending changes for chat_history_id: {chat_history_id}")
         return result
     except HTTPException:
         raise
@@ -4835,7 +4706,6 @@ async def get_version_history(
     """
     try:
         versions = await get_all_report_versions(chat_history_id, db)
-        logger.info(f"Retrieved {len(versions)} versions for chat_history_id: {chat_history_id}")
         return {
             "chat_history_id": chat_history_id,
             "total_versions": len(versions),
@@ -4862,7 +4732,6 @@ async def get_specific_version(
     """
     try:
         version = await get_report_version_by_number(chat_history_id, version_number, db)
-        logger.info(f"Retrieved version {version_number} for chat_history_id: {chat_history_id}")
         return version
     except HTTPException:
         raise
@@ -4891,7 +4760,6 @@ async def rollback_to_previous_version(
             target_version_number=version_number,
             db=db
         )
-        logger.info(f"Rolled back to version {version_number} for chat_history_id: {chat_history_id}")
 
         # Update vector DB with rolled back content
         try:
@@ -4902,7 +4770,6 @@ async def rollback_to_previous_version(
                 model=settings.EMBEDDING_MODEL,
                 chat_history_id=chat_history_id
             )
-            logger.info(f"Updated vector DB after rollback")
         except Exception as vec_error:
             logger.warning(f"Failed to update vector DB after rollback: {str(vec_error)}")
 
@@ -4933,7 +4800,6 @@ async def compare_versions(
     """
     try:
         diff = await get_report_diff(chat_history_id, version_a, version_b, db)
-        logger.info(f"Computed diff between versions {version_a} and {version_b} for chat_history_id: {chat_history_id}")
         return diff
     except HTTPException:
         raise
@@ -5039,7 +4905,6 @@ async def post_pre_mortem_turn(
 
     thread = await run_turn(chat_history_id, db, thread, user_message, kind)
     await save_pre_mortem(chat_history_id, thread, db)
-    logger.info(f"Pre-mortem turn appended for chat {chat_history_id} (kind={kind})")
     return {"thread": thread}
 
 
@@ -5360,8 +5225,6 @@ async def conversation_with_doc_v3(
         chat_history_id = chat_context["chat_history_id"]
         user_id = current_user["regular_login_token"]["id"]
         check_message_limit(chat_history_id, user_id, db)
-        logger.info(f"Processing chat-with-doc-v3 for chat_history_id: {chat_history_id}")
-        logger.info("using this api for the frontend /chaat with doc endpoint")
 
         from database_scripts import get_presales_id_for_chat
         _chat_recorder_ctx = use_recorder(
@@ -5379,13 +5242,10 @@ async def conversation_with_doc_v3(
             raise HTTPException(status_code=400, detail="No messages to process")
 
         user_message = chat_context["message"][-1]["content"]
-        logger.info(f"User message: {user_message[:100]}...")
 
         # FEATURE FLAG: Use new tool-based chat if enabled
         # Debug: Log the actual value to diagnose issues
-        logger.info(f"DEBUG: USE_TOOL_BASED_CHAT = {settings.USE_TOOL_BASED_CHAT} (type: {type(settings.USE_TOOL_BASED_CHAT).__name__})")
         if settings.USE_TOOL_BASED_CHAT:
-            logger.info("Using tool-based chat (v2) via feature flag")
 
             # Get conversation history for context
             conversation_history = [
@@ -5442,7 +5302,6 @@ async def conversation_with_doc_v3(
         # This replaces fragile string-based pending action extraction
         conversation_state = await load_conversation_state(chat_history_id, db)
         pending_actions = conversation_state.get_pending_actions_for_classifier()
-        logger.info(f"Loaded {len(pending_actions)} pending actions from state")
 
         # 3. BUILD REPORT CONTEXT
         try:
@@ -5461,8 +5320,6 @@ async def conversation_with_doc_v3(
         )
         recent_messages = context_result["recent_messages"]
         conversation_summary = context_result.get("conversation_summary")
-        logger.info(f"Context built: type={context_result['context_type']}, "
-                   f"included={context_result['total_included']}, filtered={context_result['filtered_count']}")
 
         # 4. SEMANTIC INTENT CLASSIFICATION
         # Single LLM call that understands meaning, not keywords
@@ -5475,8 +5332,6 @@ async def conversation_with_doc_v3(
             )
             # Ensure user_message is always in classification for handler use
             classification["user_message"] = user_message
-            logger.info(f"Semantic classification: strategy={classification.get('primary_response_strategy')}, "
-                       f"defense={classification.get('requires_architecture_defense')}")
         except Exception as e:
             logger.error(f"Semantic classification failed: {str(e)}")
             # Fallback to simple question handling
@@ -5637,7 +5492,6 @@ async def conversation_with_doc_stream(
     chat_history_id = chat_context["chat_history_id"]
     user_id = request.user_id
 
-    logger.info(f"Processing streaming chat for chat_history_id: {chat_history_id}")
 
     # Get latest user message
     if not chat_context["message"]:
@@ -5714,7 +5568,6 @@ async def conversation_with_doc_stream(
                 chat_context["message"].append(new_assistant_message)
                 await save_chat_history(chat=chat_context, db=db)
                 increment_message_count(chat_history_id, user_id, db)
-                logger.info(f"Streaming chat saved for {chat_history_id}")
 
         except Exception as e:
             logger.error(f"Streaming error for {chat_history_id}: {str(e)}")

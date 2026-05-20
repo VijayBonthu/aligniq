@@ -260,7 +260,6 @@ async def add_pending_change(chat_history_id: str, change: dict, db: Session) ->
                 existing_request = existing.get("user_request", "").lower().strip()
                 if existing_request == new_request:
                     # Exact duplicate - return existing without adding
-                    logger.info(f"Skipping duplicate change: {new_request[:50]}...")
                     return {
                         "status": "duplicate",
                         "pending_changes": current_changes,
@@ -275,7 +274,6 @@ async def add_pending_change(chat_history_id: str, change: dict, db: Session) ->
                     union = len(new_words | existing_words)
                     similarity = intersection / union if union > 0 else 0
                     if similarity > 0.8:
-                        logger.info(f"Skipping highly similar change (similarity={similarity:.2f}): {new_request[:50]}...")
                         return {
                             "status": "similar",
                             "pending_changes": current_changes,
@@ -871,7 +869,6 @@ async def create_new_report_version(
         db.commit()
         db.refresh(new_version)
 
-        logger.info(f"Created new report version {new_version_number} for chat_history_id: {chat_history_id} with changelog")
 
         return {
             "status": "success",
@@ -1094,7 +1091,6 @@ async def rollback_to_version(
         db.commit()
         db.refresh(rollback_version)
 
-        logger.info(f"Rolled back to version {target_version_number} as new version {new_version_number} for chat_history_id: {chat_history_id}")
 
         return {
             "status": "success",
@@ -1284,7 +1280,6 @@ async def set_default_version(chat_history_id: str, user_id: str, version_number
         db.commit()
         db.refresh(target_version)
 
-        logger.info(f"Set version {version_number} as default for chat_history_id: {chat_history_id}")
 
         return {
             "status": "success",
@@ -1451,7 +1446,6 @@ async def save_presales_analysis(presales_data: dict, db: Session) -> dict:
         db.commit()
         db.refresh(presales)
 
-        logger.info(f"Saved presales analysis: {presales.presales_id} for document: {presales.document_id}")
 
         return {
             "presales_id": presales.presales_id,
@@ -1516,7 +1510,6 @@ async def save_technology_risks(
             saved_count += 1
 
         db.commit()
-        logger.info(f"Saved {saved_count} technology risks for presales: {presales_id}")
 
         return {"saved_count": saved_count}
 
@@ -1713,7 +1706,6 @@ async def create_analysis_link(
         db.commit()
         db.refresh(link)
 
-        logger.info(f"Created analysis link: {link.link_id} for document: {document_id}, chat_history: {chat_history_id}")
 
         return {"link_id": link.link_id, "chat_history_id": chat_history_id}
 
@@ -1907,7 +1899,6 @@ async def update_analysis_link_with_full_report(
         db.commit()
         db.refresh(link)
 
-        logger.info(f"Updated analysis link with full report for presales: {presales_id}")
 
         return {
             "link_id": link.link_id,
@@ -1961,7 +1952,6 @@ async def save_user_answers(
         db.commit()
         db.refresh(link)
 
-        logger.info(f"Saved user answers for presales: {presales_id}")
 
         return {
             "status": "success",
@@ -2019,7 +2009,6 @@ async def mark_risk_relevance(
         db.commit()
         db.refresh(risk)
 
-        logger.info(f"Marked risk {risk_id} relevance: {was_relevant}")
 
         return {
             "status": "success",
@@ -2150,7 +2139,6 @@ async def create_presales_questions(
 
         db.commit()
 
-        logger.info(f"Created {len(questions_created)} questions for presales: {presales_id}")
 
         return {
             "p1_count": len(p1_blockers or []),
@@ -2288,7 +2276,6 @@ async def update_question_answers(
 
         db.commit()
 
-        logger.info(f"Updated {updated_count} question answers for presales: {presales_id}")
 
         return {
             "updated_count": updated_count,
@@ -2353,7 +2340,6 @@ async def save_question_answer(
 
         db.commit()
 
-        logger.info(f"Saved answer for question {question_id} via chat")
 
         return {
             "success": True,
@@ -2414,7 +2400,6 @@ async def update_question_status(
         db.commit()
         db.refresh(question)
 
-        logger.info(f"Updated question {question_id} status to: {status_value}")
 
         return {
             "question_id": question_id,
@@ -2477,7 +2462,6 @@ async def restore_question(
         db.commit()
         db.refresh(question)
 
-        logger.info(f"Restored question {question_id} to status: {question.status}")
 
         return {
             "question_id": question_id,
@@ -2545,7 +2529,6 @@ async def update_presales_readiness(
         db.commit()
         db.refresh(presales)
 
-        logger.info(f"Updated presales readiness for {presales_id}: score={readiness_score}, status={readiness_status}")
 
         return {
             "presales_id": presales_id,
@@ -2615,7 +2598,6 @@ async def save_analysis_history(
         db.commit()
         db.refresh(history)
 
-        logger.info(f"Saved analysis history for presales {presales_id}, iteration {iteration}")
 
         return {
             "analysis_history_id": history.analysis_history_id,
@@ -2764,7 +2746,6 @@ async def save_pending_action(
         db.commit()
         db.refresh(pending_action)
 
-        logger.info(f"Saved pending action {action_id} for chat {chat_history_id}")
 
         return {
             "action_id": pending_action.id,
@@ -2821,7 +2802,6 @@ async def resolve_pending_action(
 
         db.commit()
 
-        logger.info(f"Resolved pending action {action_id} as {resolution}")
 
         return {
             "status": "resolved",
@@ -2928,7 +2908,6 @@ async def clear_pending_actions(chat_history_id: str, db: Session) -> int:
         })
 
         db.commit()
-        logger.info(f"Cleared {count} pending actions for chat {chat_history_id}")
         return count
 
     except SQLAlchemyError as e:
@@ -3007,7 +2986,6 @@ async def find_duplicate_changes(changes: list, threshold: float = 0.6) -> list:
             })
             processed.add(change1_id)
 
-    logger.info(f"Found {len(duplicates)} duplicate groups from {len(changes)} changes")
     return duplicates
 
 
@@ -3109,7 +3087,6 @@ async def merge_pending_changes(
         flag_modified(record, "pending_changes")
         db.commit()
 
-        logger.info(f"Merged changes {change_ids} into {new_id}")
 
         return {
             "status": "success",
@@ -3184,7 +3161,6 @@ async def remove_pending_change(
         flag_modified(record, "pending_changes")
         db.commit()
 
-        logger.info(f"Removed pending change {change_id}")
 
         return {
             "status": "success",
@@ -3254,7 +3230,6 @@ async def record_transaction(
         db.commit()
         db.refresh(transaction)
 
-        logger.info(f"Recorded transaction {transaction.id}: {action_type} - {description}")
 
         return {
             "status": "success",
@@ -3358,7 +3333,6 @@ async def undo_last_transaction(chat_history_id: str, db: Session) -> dict:
         transaction.undone_at = datetime.now()
         db.commit()
 
-        logger.info(f"Undone transaction {transaction.id}: {transaction.action_description}")
 
         return {
             "status": "success",
@@ -3416,7 +3390,6 @@ async def undo_specific_transaction(chat_history_id: str, change_id: str, db: Se
         target_tx.undone_at = datetime.now()
         db.commit()
 
-        logger.info(f"Undone specific transaction for {change_id}")
 
         return {
             "status": "success",
@@ -3462,7 +3435,6 @@ async def redo_last_transaction(chat_history_id: str, db: Session) -> dict:
         transaction.redone_at = datetime.now()
         db.commit()
 
-        logger.info(f"Redone transaction {transaction.id}: {transaction.action_description}")
 
         return {
             "status": "success",
@@ -3649,11 +3621,6 @@ async def get_regeneration_context(
         # Extract additional_context from user_answers if present
         additional_context = user_answers.get("additional_context", "") if user_answers else ""
 
-        logger.info(
-            f"Regeneration context retrieved for chat_history_id: {chat_history_id}, "
-            f"presales_id: {presales_id}, questions: {len(questions_and_answers)}, "
-            f"pending_changes: {len(pending_changes)}"
-        )
 
         return {
             "presales_id": presales_id,

@@ -10,7 +10,7 @@ export async function getSections(
   chatHistoryId: string,
 ): Promise<DeliverableSectionsResponse> {
   const { data } = await api.get<DeliverableSectionsResponse>(
-    `/deliverable/${chatHistoryId}/sections`,
+    `deliverable/${chatHistoryId}/sections`,
   );
   return data;
 }
@@ -20,7 +20,7 @@ export async function updateConfig(
   config: DeliverableConfig,
 ): Promise<ConfigUpdateResponse> {
   const { data } = await api.put<ConfigUpdateResponse>(
-    `/deliverable/${chatHistoryId}/config`,
+    `deliverable/${chatHistoryId}/config`,
     config,
   );
   return data;
@@ -31,7 +31,7 @@ export async function polishSection(
   sectionId: string,
 ): Promise<PolishResponse> {
   const { data } = await api.post<PolishResponse>(
-    `/deliverable/${chatHistoryId}/polish`,
+    `deliverable/${chatHistoryId}/polish`,
     { section_id: sectionId },
   );
   return data;
@@ -42,7 +42,7 @@ export async function revertPolish(
   sectionId: string,
 ): Promise<{ status: string; section_id: string }> {
   const { data } = await api.delete<{ status: string; section_id: string }>(
-    `/deliverable/${chatHistoryId}/polish/${sectionId}`,
+    `deliverable/${chatHistoryId}/polish/${sectionId}`,
   );
   return data;
 }

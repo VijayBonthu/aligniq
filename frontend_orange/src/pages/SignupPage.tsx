@@ -44,8 +44,8 @@ const SignupPage: React.FC = () => {
   const strength = passwordStrength(password);
 
   const handleGoogleLogin = () => {
-    const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/api\/v1\/?$/, '') || 'http://localhost:8080';
-    const popup = window.open(`${API_BASE}/api/v1/auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
+    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1/';
+    const popup = window.open(`${API_URL}auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
     const handler = async (event: MessageEvent) => {
       if (event.data?.type !== 'google_auth_success') return;
       window.removeEventListener('message', handler);
@@ -80,7 +80,7 @@ const SignupPage: React.FC = () => {
     const [given_name, ...rest] = fullName.trim().split(/\s+/);
     const family_name = rest.join(' ') || '-';
     try {
-      const res = await api.post('/registration', {
+      const res = await api.post('registration', {
         email: email.trim(),
         given_name,
         family_name,

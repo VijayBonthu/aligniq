@@ -21,8 +21,8 @@ const LoginPage: React.FC = () => {
   }, [isAuthenticated, navigate]);
 
   const handleGoogleLogin = () => {
-    const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/api\/v1\/?$/, '') || 'http://localhost:8080';
-    const popup = window.open(`${API_BASE}/api/v1/auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
+    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1/';
+    const popup = window.open(`${API_URL}auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
     const handler = async (event: MessageEvent) => {
       if (event.data?.type !== 'google_auth_success') return;
       window.removeEventListener('message', handler);
@@ -43,7 +43,7 @@ const LoginPage: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const res = await api.post('/login', { email_address: email.trim(), password });
+      const res = await api.post('login', { email_address: email.trim(), password });
       const success = await login(res.data.access_token, res.data.refresh_token);
       if (success) navigate('/projects');
       else setError('Login failed.');

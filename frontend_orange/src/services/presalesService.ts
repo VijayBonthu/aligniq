@@ -1,7 +1,7 @@
 import api from './api';
 
 export async function getQuestions(presalesId: string) {
-  const { data } = await api.get(`/presales/${presalesId}/questions`);
+  const { data } = await api.get(`presales/${presalesId}/questions`);
   return data;
 }
 
@@ -9,7 +9,7 @@ export async function saveAnswers(presalesId: string, answers: Record<string, st
   const form = new FormData();
   form.append('answers', JSON.stringify(answers));
   const { data } = await api.post(
-    `/presales/${presalesId}/questions/answers`,
+    `presales/${presalesId}/questions/answers`,
     form,
     { headers: { 'Content-Type': 'multipart/form-data' } },
   );
@@ -17,22 +17,22 @@ export async function saveAnswers(presalesId: string, answers: Record<string, st
 }
 
 export async function analyze(presalesId: string) {
-  const { data } = await api.post(`/presales/${presalesId}/analyze`);
+  const { data } = await api.post(`presales/${presalesId}/analyze`);
   return data;
 }
 
 export async function restoreQuestion(presalesId: string, questionId: string) {
-  const { data } = await api.post(`/presales/${presalesId}/questions/${questionId}/restore`);
+  const { data } = await api.post(`presales/${presalesId}/questions/${questionId}/restore`);
   return data;
 }
 
 export async function presalesChat(presalesId: string, payload: unknown) {
-  const { data } = await api.post(`/presales/${presalesId}/chat`, payload);
+  const { data } = await api.post(`presales/${presalesId}/chat`, payload);
   return data;
 }
 
 export async function getFullPresales(presalesId: string) {
-  const { data } = await api.get(`/presales/${presalesId}/full`);
+  const { data } = await api.get(`presales/${presalesId}/full`);
   return data;
 }
 
@@ -52,7 +52,7 @@ export async function generatePresalesReport(
   if (userAnswers) form.append('user_answers', userAnswers);
   if (assumptions) form.append('assumptions', assumptions);
   if (additionalContext) form.append('additional_context', additionalContext);
-  const { data } = await api.post('/generate-presales-report/', form, {
+  const { data } = await api.post('generate-presales-report/', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
   });
   return data as {
@@ -71,7 +71,7 @@ export async function generatePresalesReport(
  * full pipeline.
  */
 export async function updateReport(chatHistoryId: string, content: string) {
-  const { data } = await api.patch(`/presales-report/${chatHistoryId}`, { content });
+  const { data } = await api.patch(`presales-report/${chatHistoryId}`, { content });
   return data as {
     chat_history_id: string;
     status: string;

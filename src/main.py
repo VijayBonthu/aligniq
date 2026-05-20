@@ -29,6 +29,7 @@ _default_local_origins = [
     "http://localhost:3001",
     "http://localhost:5173",
     "https://staging.grounded-iq.com",
+    "http://192.168.2.26:3001",
 ]
 _env_origins = os.getenv("CORS_ORIGINS", "")
 origins = (

@@ -141,7 +141,6 @@ class ConfirmationHandler(IntentHandler):
                             "content": pending_action.content,
                             "category": pending_action.category
                         })
-                        logger.info(f"Tracked confirmed suggestion as {add_result.get('change_id')}")
                     except Exception as e:
                         logger.error(f"Failed to track confirmed suggestion: {str(e)}")
 
@@ -328,7 +327,6 @@ class ConfirmationHandler(IntentHandler):
                 merged_content=merged_content,
                 db=db
             )
-            logger.info(f"Executed merge: {result}")
             return result
         except Exception as e:
             logger.error(f"Error executing merge: {str(e)}")
@@ -369,7 +367,6 @@ class ConfirmationHandler(IntentHandler):
                 logger.error(f"Error removing change {change_id}: {str(e)}")
 
         if removed_ids:
-            logger.info(f"Removed changes: {removed_ids}")
             return {"status": "success", "removed_ids": removed_ids}
         else:
             return {"status": "error", "message": "Failed to remove changes"}
@@ -407,7 +404,6 @@ class ConfirmationHandler(IntentHandler):
             result = await clear_pending_changes(state.chat_history_id, db)
 
             if result.get("status") == "success":
-                logger.info(f"Cleared {cleared_count} pending changes for {state.chat_history_id}")
                 return {
                     "status": "success",
                     "cleared_count": cleared_count
@@ -516,7 +512,6 @@ class ArchitectureChallengeHandler(IntentHandler):
                     context=f"User challenged: {defense_topic}",
                     category="modify_architecture"
                 )
-                logger.info(f"Created pending action {action_id} for architecture challenge: {suggestion_content}")
 
                 # Return with pending suggestion for the response
                 return {
@@ -964,10 +959,6 @@ class CommandHandler(IntentHandler):
                 "user_answers": regen_context.get("user_answers", {})
             }
 
-            logger.info(
-                f"Starting regeneration for chat_history_id: {chat_history_id} with "
-                f"{len(pending_changes)} changes, {len(presales_context.get('questions_and_answers', []))} Q&A pairs"
-            )
 
             result = await run_pipeline_with_constraints(
                 document=document_chunks,
@@ -1028,7 +1019,6 @@ class CommandHandler(IntentHandler):
                 model=settings.EMBEDDING_MODEL,
                 chat_history_id=chat_history_id
             )
-            logger.info(f"Updated vector DB with {len(report_chunks)} chunks for chat_history_id: {chat_history_id}")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
             # This is non-fatal - the report is still saved
@@ -1036,7 +1026,6 @@ class CommandHandler(IntentHandler):
         # Step 8: Clear pending changes (they've been applied)
         try:
             await clear_pending_changes(chat_history_id, db)
-            logger.info(f"Cleared {len(pending_changes)} pending changes after regeneration")
         except Exception as e:
             logger.warning(f"Failed to clear pending changes (non-fatal): {str(e)}")
             # This is non-fatal - changes are applied in new version anyway
@@ -1594,7 +1583,6 @@ class PendingChangeManagementHandler(IntentHandler):
 
         # If no specific IDs provided, fall back to identifying duplicates
         if not change_ids or len(change_ids) < 2:
-            logger.info("No specific change IDs for merge - falling back to duplicate identification")
             return await self._handle_identify_duplicates(classification, state, context, db, change_ids)
 
         changes = await get_pending_changes(state.chat_history_id, db)

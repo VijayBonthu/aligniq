@@ -109,11 +109,9 @@ class AgentState(TypedDict):
 
 async def req_analyse_node(state: AgentState) -> AgentState:
     """Requirements analysis node - first step in pipeline."""
-    logger.info("Starting req_analyse_node")
     try:
         response = await requirements_analyzer(state['document'])
         update_or_append(state, "requirements_analyzer", response)
-        logger.info("req_analyse_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -124,7 +122,6 @@ async def req_analyse_node(state: AgentState) -> AgentState:
 
 async def amb_resolve_node(state: AgentState) -> AgentState:
     """Ambiguity resolution node - identifies and resolves ambiguities."""
-    logger.info("Starting amb_resolve_node")
     try:
         req_analyze_json = get_agent_output(state, "requirements_analyzer", required=True)
         raw_document = state["document"]
@@ -139,7 +136,6 @@ async def amb_resolve_node(state: AgentState) -> AgentState:
         )
 
         update_or_append(state, "ambiguity_resolver", response)
-        logger.info("amb_resolve_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -150,7 +146,6 @@ async def amb_resolve_node(state: AgentState) -> AgentState:
 
 async def validator_node(state: AgentState) -> AgentState:
     """Validator node - validates requirements for consistency."""
-    logger.info("Starting validator_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         assumptions = get_agent_output(state, "ambiguity_resolver", required=True)
@@ -158,7 +153,6 @@ async def validator_node(state: AgentState) -> AgentState:
         response = await validator_agent(req_analyzer_json=requirements, amb_resolver_json=assumptions)
 
         update_or_append(state, "validator_agent", response)
-        logger.info("validator_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -169,7 +163,6 @@ async def validator_node(state: AgentState) -> AgentState:
 
 async def midway_report_node(state: AgentState) -> AgentState:
     """Midway report node - generates intermediate progress report."""
-    logger.info("Starting midway_report_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         assumptions = get_agent_output(state, "ambiguity_resolver", required=True)
@@ -182,7 +175,6 @@ async def midway_report_node(state: AgentState) -> AgentState:
         )
 
         state['message'].append(AIMessage(content=response))
-        logger.info("midway_report_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -193,7 +185,6 @@ async def midway_report_node(state: AgentState) -> AgentState:
 
 async def solution_architectures_node(state: AgentState) -> AgentState:
     """Solution architecture node - designs technical solution."""
-    logger.info("Starting solution_architectures_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         amb_resolver_json = get_agent_output(state, "ambiguity_resolver", required=True)
@@ -209,7 +200,6 @@ async def solution_architectures_node(state: AgentState) -> AgentState:
         )
 
         update_or_append(state, "solution_architectures", response)
-        logger.info("solution_architectures_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -220,7 +210,6 @@ async def solution_architectures_node(state: AgentState) -> AgentState:
 
 async def evidence_gather_node(state: AgentState) -> AgentState:
     """Evidence gathering node - collects supporting evidence and best practices."""
-    logger.info("Starting evidence_gather_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         validators = get_agent_output(state, "validator_agent", required=True)
@@ -233,7 +222,6 @@ async def evidence_gather_node(state: AgentState) -> AgentState:
         )
 
         update_or_append(state, "evidence_gather_agent", response)
-        logger.info("evidence_gather_node completed successfully")
         return state
     except PipelineError:
         raise
@@ -244,7 +232,6 @@ async def evidence_gather_node(state: AgentState) -> AgentState:
 
 async def critic_node(state: AgentState) -> AgentState:
     """Critic node - critiques solution and identifies issues."""
-    logger.info("Starting critic_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         validators = get_agent_output(state, "validator_agent", required=True)
@@ -262,7 +249,6 @@ async def critic_node(state: AgentState) -> AgentState:
         update_or_append(state, "critic_agent", response)
 
         state["loop_count"] = state.get("loop_count", 0) + 1
-        logger.info(f"critic_node completed successfully, loop_count={state['loop_count']}")
         return state
     except PipelineError:
         raise
@@ -286,13 +272,12 @@ def critic_to_alternative_loop(state: AgentState) -> str:
         current_loop = state.get("loop_count", 0)
 
         if loop_back_required and current_loop < 3:
-            logger.info(f"Critic found major blockers, looping back (loop {current_loop}/3)")
             return "continue_loop"
         else:
             if current_loop >= 3:
-                logger.info(f"Max loop count reached ({current_loop}), proceeding to evidence gathering")
+                pass
             else:
-                logger.info("No major blockers found, proceeding to evidence gathering")
+                pass
             state["loop_count"] = 0
             return "end_loop"
     except Exception as e:
@@ -302,7 +287,6 @@ def critic_to_alternative_loop(state: AgentState) -> str:
 
 async def feasibility_estimator_node(state: AgentState) -> AgentState:
     """Feasibility estimator node - estimates timeline and resources."""
-    logger.info("Starting feasibility_estimator_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         validators = get_agent_output(state, "validator_agent", required=True)
@@ -317,7 +301,6 @@ async def feasibility_estimator_node(state: AgentState) -> AgentState:
         )
 
         update_or_append(state, "feasibility_estimator", response)
-        logger.info("feasibility_estimator_node completed successfully")
 
         # Debug output - only in debug mode
         if settings.DEBUG_MODE:
@@ -337,7 +320,6 @@ async def feasibility_estimator_node(state: AgentState) -> AgentState:
 
 async def ba_final_report_node(state: AgentState) -> AgentState:
     """Final report node - generates comprehensive BA report."""
-    logger.info("Starting ba_final_report_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
         validators = get_agent_output(state, "validator_agent", required=True)
@@ -358,7 +340,6 @@ async def ba_final_report_node(state: AgentState) -> AgentState:
         )
 
         state['message'].append(AIMessage(content=response))
-        logger.info("ba_final_report_node completed successfully")
 
         # Debug output - only in debug mode
         if settings.DEBUG_MODE:
@@ -474,8 +455,6 @@ async def run_agent_pipeline(
         "message": []
     }
 
-    logger.info(f"Starting agent pipeline with timeout={timeout}s")
-    logger.info(f"Document length: {sum(len(d) for d in document)} characters")
 
     try:
         result = await asyncio.wait_for(

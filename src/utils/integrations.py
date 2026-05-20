@@ -88,7 +88,6 @@ class Integrations:
         )
         search_response.raise_for_status()
 
-        logger.info(f"search_response: {search_response.json()}")
 
         
         # Prepare download directory
@@ -115,7 +114,6 @@ class Integrations:
             
             # Validate attachments
             if not attachments:
-                print(f"No matching attachments found for issue {issue_key}")
                 return None
 
             
@@ -148,10 +146,9 @@ class Integrations:
                         'attachment_id': attachment['id']
                     })
                     
-                    print(f"Downloaded: {issue['key']} - {filename}")
                 
                 except Exception as e:
-                    print(f"Error downloading {filename}: {e}")
+                    pass
         
         return downloaded_files
     
@@ -164,7 +161,6 @@ class Integrations:
             JIRA_API_URL = f"https://api.atlassian.com/ex/jira/{user_id}/rest/api/3"   
             headers = self.headers
 
-            logger.info(f"inside get single issues: {JIRA_API_URL, issue_key}")
 
             if issue_key:
                 jql = f'issue={issue_key}'
@@ -176,7 +172,6 @@ class Integrations:
         }
 
             response  = requests.get(f"{JIRA_API_URL}/issue/{issue_key}", headers=headers, params=search_params)
-            logger.info(f"response inside get single issues: {response.json()}")
             
             if response.status_code == 200:
                 return response.json()  # Parse JSON response

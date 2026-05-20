@@ -1,6 +1,7 @@
 venv
 __pycache__
 uploads
+bet1_traces/
 .env
 client_secret_g.json
 src/llm_test.py

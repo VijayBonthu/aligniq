@@ -2,6 +2,6 @@ import api from './api';
 import type { OverviewResponse } from '../types/overview';
 
 export async function fetchOverview(): Promise<OverviewResponse> {
-  const response = await api.get<OverviewResponse>('/projects/overview');
+  const response = await api.get<OverviewResponse>('projects/overview');
   return response.data;
 }

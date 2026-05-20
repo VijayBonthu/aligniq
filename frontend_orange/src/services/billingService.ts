@@ -20,16 +20,16 @@ export interface SubscriptionData {
 }
 
 export async function getSubscription(): Promise<SubscriptionData> {
-  const res = await api.get<SubscriptionData>('/billing/subscription');
+  const res = await api.get<SubscriptionData>('billing/subscription');
   return res.data;
 }
 
 export async function createCheckoutSession(tier: 'basic' | 'plus'): Promise<{ checkout_url: string }> {
-  const res = await api.post<{ checkout_url: string }>(`/billing/checkout-session?tier=${tier}`);
+  const res = await api.post<{ checkout_url: string }>(`billing/checkout-session?tier=${tier}`);
   return res.data;
 }
 
 export async function getPortalUrl(): Promise<{ portal_url: string }> {
-  const res = await api.get<{ portal_url: string }>('/billing/portal');
+  const res = await api.get<{ portal_url: string }>('billing/portal');
   return res.data;
 }

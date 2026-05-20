@@ -30,7 +30,7 @@ export interface PipelineRunSnapshot {
 export async function startFullPipeline(chatHistoryId: string) {
   const form = new FormData();
   form.append('chat_history_id', chatHistoryId);
-  const { data } = await api.post('/full-pipeline/start', form, {
+  const { data } = await api.post('full-pipeline/start', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
   });
   return data as {
@@ -46,7 +46,7 @@ export async function startFullPipeline(chatHistoryId: string) {
 export async function getFullPipelineStatus(
   chatHistoryId: string,
 ): Promise<PipelineRunSnapshot> {
-  const { data } = await api.get(`/full-pipeline/status/${chatHistoryId}`);
+  const { data } = await api.get(`full-pipeline/status/${chatHistoryId}`);
   // Backend returns { status: 'idle', chat_history_id } when no run exists;
   // normalize to the full snapshot shape so consumers can rely on the fields.
   return {

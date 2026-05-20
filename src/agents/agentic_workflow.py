@@ -1,8 +1,10 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain.output_parsers import OutputFixingParser
 from config import settings
+from utils.web_search_tool import web_search, reset_call_count, get_call_count, get_retrieved_urls
 from utils.prompts import Requirements_analyzer_prompt, Ambiguity_Resolver_Prompt, Validator_agent_prompt, midway_ba_report_prompt, Solution_Architect_Agent_Prompt, Critic_Agent_Prompt,Evidence_Gatherer_Agent_prompt, feasibility_estimator_prompt, Report_Generator_Prompt, SUMMARIZE_CHATCONVERSATION_PROMPT, SUMMARIAZE_MAIN_REPORT_PROMPT, SECTION_REGENERATION_PROMPT, CHANGELOG_SUMMARY_PROMPT
 from utils.logger import logger
 from utils.llm_metrics import callback_for, hash_prompt
@@ -153,7 +155,6 @@ async def requirements_analyzer(docs: list) -> dict:
     Returns:
         dict: Structured requirements analysis
     """
-    logger.info("Starting requirements_analyzer")
     req_analyzer_prompt = ChatPromptTemplate.from_template(Requirements_analyzer_prompt)
     chain = req_analyzer_prompt | llm | fixed_parser
     input_dict = {"requirements_text": docs}
@@ -163,7 +164,6 @@ async def requirements_analyzer(docs: list) -> dict:
         agent_name="requirements_analyzer",
         prompt_hash=_HASHES["requirements_analyzer"],
     )
-    logger.info("Completed requirements_analyzer")
     return validate_response(response, "requirements_analyzer")
 
 
@@ -180,7 +180,6 @@ async def ambiguity_resolver(req_analyzer_json, raw_document, process_flow, org_
     Returns:
         dict: Ambiguity analysis and resolutions
     """
-    logger.info("Starting ambiguity_resolver")
     amb_resolver_prompt = ChatPromptTemplate.from_template(Ambiguity_Resolver_Prompt)
     parser = JsonOutputParser()
     chain = amb_resolver_prompt | llm | parser
@@ -196,7 +195,6 @@ async def ambiguity_resolver(req_analyzer_json, raw_document, process_flow, org_
         agent_name="ambiguity_resolver",
         prompt_hash=_HASHES["ambiguity_resolver"],
     )
-    logger.info("Completed ambiguity_resolver")
     return validate_response(response, "ambiguity_resolver")
 
 
@@ -211,7 +209,6 @@ async def validator_agent(req_analyzer_json: dict, amb_resolver_json: dict) -> d
     Returns:
         dict: Validation results
     """
-    logger.info("Starting validator_agent")
     valid_agent_prompt = ChatPromptTemplate.from_template(Validator_agent_prompt)
     chain = valid_agent_prompt | llm | fixed_parser
     input_dict = {
@@ -224,7 +221,6 @@ async def validator_agent(req_analyzer_json: dict, amb_resolver_json: dict) -> d
         agent_name="validator_agent",
         prompt_hash=_HASHES["validator_agent"],
     )
-    logger.info("Completed validator_agent")
     return validate_response(response, "validator_agent")
 
 
@@ -240,7 +236,6 @@ async def midway_report(req_analyzer_json: dict, amb_resolver_json: dict, valida
     Returns:
         str: Midway report content
     """
-    logger.info("Starting midway_report generation")
     mid_way_report_prompt = ChatPromptTemplate.from_template(midway_ba_report_prompt)
     parser = StrOutputParser()
     chain = mid_way_report_prompt | llm | parser
@@ -255,13 +250,18 @@ async def midway_report(req_analyzer_json: dict, amb_resolver_json: dict, valida
         agent_name="midway_report",
         prompt_hash=_HASHES["midway_report"],
     )
-    logger.info("Completed midway_report generation")
     return validate_response(response, "midway_report")
 
 
 async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, validator_json: dict, critic_feedback: dict) -> dict:
     """
     Design solution architecture based on validated requirements.
+
+    When ENABLE_GROUNDED_EVIDENCE is true and TAVILY_API_KEY is set, the architect
+    has access to a web_search tool (Tavily) for verifying that recommended
+    vendor-specific managed services are currently GA. Closes UC-1.2 from the
+    Bet 1 design: the architect substitutes deprecated services before they
+    reach the report.
 
     Args:
         req_analyzer_json: Output from requirements analyzer
@@ -272,53 +272,354 @@ async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, v
     Returns:
         dict: Solution architecture design
     """
-    logger.info("Starting solution_architect")
-    sol_architecture_prompt = ChatPromptTemplate.from_template(Solution_Architect_Agent_Prompt)
-    chain = sol_architecture_prompt | llm | fixed_parser
-    input_dict = {
-        "requirements_json": json.dumps(req_analyzer_json),
-        "clarified_assumptions": json.dumps(amb_resolver_json),
-        "validated_requirements": json.dumps(validator_json),
-        "critic_feedback": json.dumps(critic_feedback)
+    from datetime import datetime, timezone
+
+    grounded = bool(settings.ENABLE_GROUNDED_EVIDENCE and settings.TAVILY_API_KEY)
+    search_budget = settings.ARCHITECT_SEARCH_MAX_CALLS if grounded else 0
+
+    logger.warning(
+        f"[bet1] solution_architect gate: "
+        f"ENABLE_GROUNDED_EVIDENCE={settings.ENABLE_GROUNDED_EVIDENCE} "
+        f"TAVILY_API_KEY={'set' if settings.TAVILY_API_KEY else 'MISSING'} "
+        f"grounded_path_taken={grounded} budget={search_budget}"
+    )
+
+    trace = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "agent": "solution_architect",
+        "gate": {
+            "ENABLE_GROUNDED_EVIDENCE": bool(settings.ENABLE_GROUNDED_EVIDENCE),
+            "TAVILY_API_KEY_present": bool(settings.TAVILY_API_KEY),
+            "grounded_path_taken": grounded,
+        },
+        "loop": {
+            "iterations": 0,
+            "tool_calls_attempted": 0,
+            "queries": [],
+            "search_budget": search_budget,
+        },
+        "result": {"components": 0, "assumptions": 0},
+        "error": None,
     }
 
-    response = await invoke_with_timeout(
-        chain, input_dict,
+    config = callback_for(
         agent_name="solution_architect",
+        model=settings.GENERATING_REPORT_MODEL,
         prompt_hash=_HASHES["solution_architect"],
     )
-    logger.info("Completed solution_architect")
+
+    response = None
+    try:
+        if grounded:
+            reset_call_count()
+            rendered_prompt = Solution_Architect_Agent_Prompt.format(
+                requirements_json=json.dumps(req_analyzer_json),
+                clarified_assumptions=json.dumps(amb_resolver_json),
+                validated_requirements=json.dumps(validator_json),
+                critic_feedback=json.dumps(critic_feedback),
+                search_budget=search_budget,
+            )
+
+            llm_with_tools = llm.bind_tools([web_search])
+            messages = [HumanMessage(content=rendered_prompt)]
+            raw_content = None
+
+            for _ in range(search_budget + 2):
+                trace["loop"]["iterations"] += 1
+                try:
+                    ai_msg = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(messages, config=config) if config else llm_with_tools.ainvoke(messages),
+                        timeout=settings.LLM_CALL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("solution_architect tool-loop timed out")
+                    raise LLMTimeoutError("solution_architect timed out")
+
+                messages.append(ai_msg)
+                tool_calls = getattr(ai_msg, "tool_calls", None) or []
+                if not tool_calls:
+                    raw_content = ai_msg.content
+                    break
+
+                for tc in tool_calls:
+                    tc_args = tc.get("args", {}) or {}
+                    query = tc_args.get("query", "")
+                    trace["loop"]["tool_calls_attempted"] += 1
+                    logger.warning(f"[bet1] web_search called (architect): query={query!r}")
+                    tool_result = await web_search.ainvoke(tc_args)
+                    try:
+                        parsed = json.loads(tool_result) if isinstance(tool_result, str) else {}
+                        status = parsed.get("status", "unknown")
+                        n_results = len(parsed.get("results", []) or [])
+                    except Exception:
+                        status = "unparseable"
+                        n_results = 0
+                    trace["loop"]["queries"].append({
+                        "query": query,
+                        "status": status,
+                        "results": n_results,
+                    })
+                    logger.warning(f"[bet1] web_search result (architect): status={status} results={n_results}")
+                    messages.append(ToolMessage(content=tool_result, tool_call_id=tc.get("id", "")))
+
+                if get_call_count() >= search_budget:
+                    messages.append(HumanMessage(
+                        content="Search budget exhausted. Emit the final architecture JSON now using your training knowledge for any remaining services."
+                    ))
+            else:
+                raw_content = (messages[-1].content if messages else "") or ""
+
+            try:
+                response = await fixed_parser.ainvoke(raw_content)
+            except Exception as e:
+                logger.error(f"solution_architect JSON parse failed: {e}; raw len={len(raw_content or '')}")
+                trace["error"] = f"parse_failed: {e}"
+                raise
+        else:
+            sol_architecture_prompt = ChatPromptTemplate.from_template(Solution_Architect_Agent_Prompt)
+            chain = sol_architecture_prompt | llm | fixed_parser
+            input_dict = {
+                "requirements_json": json.dumps(req_analyzer_json),
+                "clarified_assumptions": json.dumps(amb_resolver_json),
+                "validated_requirements": json.dumps(validator_json),
+                "critic_feedback": json.dumps(critic_feedback),
+                "search_budget": 0,
+            }
+            response = await invoke_with_timeout(
+                chain, input_dict,
+                agent_name="solution_architect",
+                prompt_hash=_HASHES["solution_architect"],
+            )
+
+        if isinstance(response, dict):
+            trace["result"]["components"] = len(response.get("components") or [])
+            trace["result"]["assumptions"] = len(response.get("assumptions") or [])
+    except Exception as e:
+        if not trace["error"]:
+            trace["error"] = f"{type(e).__name__}: {e}"
+        _write_bet1_trace(trace, suffix="architect")
+        raise
+
+    trace_path = _write_bet1_trace(trace, suffix="architect")
+    logger.warning(
+        f"[bet1] Completed solution_architect grounded={grounded} "
+        f"tool_calls={trace['loop']['tool_calls_attempted']} "
+        f"components={trace['result']['components']} "
+        f"trace={trace_path}"
+    )
     return validate_response(response, "solution_architect")
 
 
 async def evidence_gather_agent(recommendations_json: dict, validated_requirements_json: dict, solution_architectures: dict) -> dict:
     """
-    Gather evidence and best practices for proposed solution.
+    Gather evidence with basis/confidence tags. When ENABLE_GROUNDED_EVIDENCE is true,
+    the LLM has access to a web_search tool (Tavily) for currency-sensitive facts.
 
-    Args:
-        recommendations_json: Requirements recommendations
-        validated_requirements_json: Validated requirements
-        solution_architectures: Proposed solution architecture
-
-    Returns:
-        dict: Evidence and best practices
+    Every claim emitted is tagged with basis ∈ {document_quote, retrieved_url, model_knowledge}.
     """
-    logger.info("Starting evidence_gather_agent")
-    evi_gather_prompt = ChatPromptTemplate.from_template(Evidence_Gatherer_Agent_prompt)
-    chain = evi_gather_prompt | llm | fixed_parser
-    input_dict = {
-        "requirements_json": json.dumps(recommendations_json),
-        "validated_requirements": json.dumps(validated_requirements_json),
-        "solution_architectures": json.dumps(solution_architectures)
+
+    from datetime import datetime, timezone
+
+    grounded = bool(settings.ENABLE_GROUNDED_EVIDENCE and settings.TAVILY_API_KEY)
+    search_budget = settings.EVIDENCE_SEARCH_MAX_CALLS if grounded else 0
+
+    logger.warning(
+        f"[bet1] evidence_gather_agent gate: "
+        f"ENABLE_GROUNDED_EVIDENCE={settings.ENABLE_GROUNDED_EVIDENCE} "
+        f"TAVILY_API_KEY={'set' if settings.TAVILY_API_KEY else 'MISSING'} "
+        f"grounded_path_taken={grounded} budget={search_budget}"
+    )
+
+    trace = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "gate": {
+            "ENABLE_GROUNDED_EVIDENCE": bool(settings.ENABLE_GROUNDED_EVIDENCE),
+            "TAVILY_API_KEY_present": bool(settings.TAVILY_API_KEY),
+            "grounded_path_taken": grounded,
+        },
+        "loop": {
+            "iterations": 0,
+            "tool_calls_attempted": 0,
+            "queries": [],
+            "search_budget": search_budget,
+        },
+        "result": {"evidence_items": 0, "by_basis": {}, "demoted_urls": 0},
+        "error": None,
     }
 
-    response = await invoke_with_timeout(
-        chain, input_dict,
+    if grounded:
+        reset_call_count()
+
+    rendered_prompt = Evidence_Gatherer_Agent_prompt.format(
+        requirements_json=json.dumps(recommendations_json),
+        validated_requirements=json.dumps(validated_requirements_json),
+        solution_architectures=json.dumps(solution_architectures),
+        search_budget=search_budget,
+    )
+
+    config = callback_for(
         agent_name="evidence_gather_agent",
+        model=settings.GENERATING_REPORT_MODEL,
         prompt_hash=_HASHES["evidence_gather_agent"],
     )
-    logger.info("Completed evidence_gather_agent")
+
+    response = None
+    try:
+        raw_content = None
+        if grounded:
+            llm_with_tools = llm.bind_tools([web_search])
+            messages = [HumanMessage(content=rendered_prompt)]
+
+            for _ in range(settings.EVIDENCE_SEARCH_MAX_CALLS + 2):
+                trace["loop"]["iterations"] += 1
+                try:
+                    ai_msg = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(messages, config=config) if config else llm_with_tools.ainvoke(messages),
+                        timeout=settings.LLM_CALL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("evidence_gather_agent tool-loop timed out")
+                    raise LLMTimeoutError("evidence_gather_agent timed out")
+
+                messages.append(ai_msg)
+                tool_calls = getattr(ai_msg, "tool_calls", None) or []
+                if not tool_calls:
+                    raw_content = ai_msg.content
+                    break
+
+                for tc in tool_calls:
+                    tc_args = tc.get("args", {}) or {}
+                    query = tc_args.get("query", "")
+                    trace["loop"]["tool_calls_attempted"] += 1
+                    logger.warning(f"[bet1] web_search called: query={query!r}")
+                    tool_result = await web_search.ainvoke(tc_args)
+                    try:
+                        parsed = json.loads(tool_result) if isinstance(tool_result, str) else {}
+                        status = parsed.get("status", "unknown")
+                        n_results = len(parsed.get("results", []) or [])
+                    except Exception:
+                        status = "unparseable"
+                        n_results = 0
+                    trace["loop"]["queries"].append({
+                        "query": query,
+                        "status": status,
+                        "results": n_results,
+                    })
+                    logger.warning(f"[bet1] web_search result: status={status} results={n_results}")
+                    messages.append(ToolMessage(content=tool_result, tool_call_id=tc.get("id", "")))
+
+                if get_call_count() >= settings.EVIDENCE_SEARCH_MAX_CALLS:
+                    messages.append(HumanMessage(
+                        content="Search budget exhausted. Emit the final JSON now. "
+                                "Label all remaining un-retrieved claims as basis='model_knowledge'."
+                    ))
+            else:
+                raw_content = (messages[-1].content if messages else "") or ""
+
+            try:
+                response = await fixed_parser.ainvoke(raw_content)
+            except Exception as e:
+                logger.error(f"evidence_gather_agent JSON parse failed: {e}; raw len={len(raw_content or '')}")
+                trace["error"] = f"parse_failed: {e}"
+                raise
+        else:
+            chain = ChatPromptTemplate.from_template(Evidence_Gatherer_Agent_prompt) | llm | fixed_parser
+            input_dict = {
+                "requirements_json": json.dumps(recommendations_json),
+                "validated_requirements": json.dumps(validated_requirements_json),
+                "solution_architectures": json.dumps(solution_architectures),
+                "search_budget": 0,
+            }
+            response = await invoke_with_timeout(
+                chain, input_dict,
+                agent_name="evidence_gather_agent",
+                prompt_hash=_HASHES["evidence_gather_agent"],
+            )
+
+        if grounded and isinstance(response, dict):
+            before = sum(
+                1 for sec in ("evidence_summary", "risks", "best_practices", "integration_notes")
+                for item in (response.get(sec) or []) if isinstance(item, dict) and item.get("basis") == "retrieved_url"
+            )
+            response = _validate_retrieved_urls(response)
+            after = sum(
+                1 for sec in ("evidence_summary", "risks", "best_practices", "integration_notes")
+                for item in (response.get(sec) or []) if isinstance(item, dict) and item.get("basis") == "retrieved_url"
+            )
+            trace["result"]["demoted_urls"] = max(0, before - after)
+
+        if isinstance(response, dict):
+            by_basis: dict = {}
+            total = 0
+            for sec in ("evidence_summary", "risks", "best_practices", "integration_notes"):
+                for item in (response.get(sec) or []):
+                    if not isinstance(item, dict):
+                        continue
+                    total += 1
+                    b = item.get("basis", "unknown")
+                    by_basis[b] = by_basis.get(b, 0) + 1
+            trace["result"]["evidence_items"] = total
+            trace["result"]["by_basis"] = by_basis
+    except Exception as e:
+        if not trace["error"]:
+            trace["error"] = f"{type(e).__name__}: {e}"
+        _write_bet1_trace(trace)
+        raise
+
+    trace_path = _write_bet1_trace(trace)
+    logger.warning(
+        f"[bet1] Completed evidence_gather_agent grounded={grounded} "
+        f"tool_calls={trace['loop']['tool_calls_attempted']} "
+        f"items={trace['result']['evidence_items']} "
+        f"trace={trace_path}"
+    )
     return validate_response(response, "evidence_gather_agent")
+
+
+def _write_bet1_trace(trace: dict, suffix: str = "evidence") -> str:
+    """Persist one diagnostic JSON per agent run that uses web_search. Best-effort."""
+    from datetime import datetime, timezone
+    from pathlib import Path
+    try:
+        out_dir = Path("bet1_traces")
+        out_dir.mkdir(exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        path = out_dir / f"{ts}_{suffix}.json"
+        path.write_text(json.dumps(trace, indent=2, default=str), encoding="utf-8")
+        return str(path)
+    except Exception as e:
+        logger.warning(f"[bet1] failed to write trace file: {e}")
+        return ""
+
+
+def _validate_retrieved_urls(evidence_json: dict) -> dict:
+    """Demote any item claiming basis='retrieved_url' with a URL the tool never returned.
+
+    Hallucinated URLs are the single highest-stakes risk of the grounded path.
+    Anything not in `get_retrieved_urls()` gets downgraded to `model_knowledge`
+    with confidence='low' and a flag so reviewers can spot it.
+    """
+    allowed = get_retrieved_urls()
+    sections = ["evidence_summary", "risks", "best_practices", "integration_notes"]
+    demoted = 0
+    for section in sections:
+        items = evidence_json.get(section) or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("basis") == "retrieved_url":
+                url = (item.get("evidence") or "").strip()
+                if not url or url not in allowed:
+                    item["basis"] = "model_knowledge"
+                    item["evidence"] = ""
+                    item["evidence_quote"] = ""
+                    item["retrieved_at"] = ""
+                    item["confidence"] = "low"
+                    item["_demoted_reason"] = "url_not_retrieved"
+                    demoted += 1
+    if demoted:
+        logger.warning(f"evidence_gather_agent: demoted {demoted} item(s) with unverified retrieved_url")
+    return evidence_json
 
 
 async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_architectures_json: dict, previous_critic_feedback: dict) -> dict:
@@ -334,7 +635,6 @@ async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_a
     Returns:
         dict: Critique and recommendations
     """
-    logger.info("Starting critic_agent")
     cric_agent_prompt = ChatPromptTemplate.from_template(Critic_Agent_Prompt)
     chain = cric_agent_prompt | llm | fixed_parser
     input_dict = {
@@ -349,7 +649,6 @@ async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_a
         agent_name="critic_agent",
         prompt_hash=_HASHES["critic_agent"],
     )
-    logger.info("Completed critic_agent")
     return validate_response(response, "critic_agent")
 
 
@@ -366,7 +665,6 @@ async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, s
     Returns:
         dict: Feasibility analysis and estimates
     """
-    logger.info("Starting feasibility_estimator")
     feas_estimator_prompt = ChatPromptTemplate.from_template(feasibility_estimator_prompt)
     chain = feas_estimator_prompt | llm | fixed_parser
     input_dict = {
@@ -381,7 +679,6 @@ async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, s
         agent_name="feasibility_estimator",
         prompt_hash=_HASHES["feasibility_estimator"],
     )
-    logger.info("Completed feasibility_estimator")
     return validate_response(response, "feasibility_estimator")
 
 
@@ -409,7 +706,6 @@ async def ba_final_report_generation(
     Returns:
         str: Final report in markdown format
     """
-    logger.info("Starting ba_final_report_generation")
     final_report_prompt = ChatPromptTemplate.from_template(Report_Generator_Prompt)
     parser = StrOutputParser()
     chain = final_report_prompt | llm | parser
@@ -431,7 +727,6 @@ async def ba_final_report_generation(
         agent_name="ba_final_report_generation",
         prompt_hash=_HASHES["ba_final_report_generation"],
     )
-    logger.info("Completed ba_final_report_generation")
     return validate_response(response, "ba_final_report_generation")
 
 
@@ -446,7 +741,6 @@ async def conversational_summary(chat_history: list, main_report_summary: str) -
     Returns:
         str: Conversation summary
     """
-    logger.info("Starting conversational_summary")
     convo_summary = ChatPromptTemplate.from_template(SUMMARIZE_CHATCONVERSATION_PROMPT)
     parser = StrOutputParser()
     chain = convo_summary | llm_parser | parser
@@ -461,7 +755,6 @@ async def conversational_summary(chat_history: list, main_report_summary: str) -
         model=settings.SUMMARIZATION_MODEL,
         prompt_hash=_HASHES["conversational_summary"],
     )
-    logger.info("Completed conversational_summary")
     return validate_response(response, "conversational_summary")
 
 
@@ -476,7 +769,6 @@ async def main_report_summary(main_report: str, version_number: int = 1) -> dict
     Returns:
         dict: Structured report summary
     """
-    logger.info(f"Starting main_report_summary for version {version_number}")
     main_summary = ChatPromptTemplate.from_template(SUMMARIAZE_MAIN_REPORT_PROMPT)
     parser = JsonOutputParser()
     chain = main_summary | llm_parser | parser
@@ -491,7 +783,6 @@ async def main_report_summary(main_report: str, version_number: int = 1) -> dict
         model=settings.SUMMARIZATION_MODEL,
         prompt_hash=_HASHES["main_report_summary"],
     )
-    logger.info(f"Completed main_report_summary for version {version_number}")
     return validate_response(response, "main_report_summary")
 
 
@@ -518,7 +809,6 @@ async def generate_changelog_summary(
     Returns:
         str: Human-readable changelog summary (2-4 sentences)
     """
-    logger.info(f"Starting generate_changelog_summary for v{previous_version} -> v{new_version}")
 
     # Format changes_applied for the prompt
     if changes_applied:
@@ -548,7 +838,6 @@ async def generate_changelog_summary(
             model=settings.SUMMARIZATION_MODEL,
             prompt_hash=_HASHES["generate_changelog_summary"],
         )
-        logger.info(f"Completed generate_changelog_summary for v{previous_version} -> v{new_version}")
         return response.strip() if response else "Changes applied to generate this version."
     except Exception as e:
         logger.warning(f"Failed to generate changelog summary: {e}")
@@ -594,8 +883,6 @@ async def regenerate_report_sections(
             pending_changes=[{"type": "modify_architecture", "user_request": "Use AWS instead of Azure"}]
         )
     """
-    logger.info(f"Starting section regeneration for {len(regeneration_plan.get('sections_to_regenerate', []))} sections")
-    logger.info(f"Applying {len(pending_changes)} pending changes")
 
     regen_prompt = ChatPromptTemplate.from_template(SECTION_REGENERATION_PROMPT)
     parser = StrOutputParser()
@@ -616,7 +903,6 @@ async def regenerate_report_sections(
         prompt_hash=_HASHES["section_regeneration"],
     )
 
-    logger.info("Section regeneration completed")
 
     # Validate the response is not empty
     validated_response = validate_response(response, "section_regeneration")
@@ -856,11 +1142,6 @@ async def run_pipeline_with_constraints(
         "has_blind_spots": bool(presales_context and presales_context.get("blind_spots"))
     }
 
-    logger.info(
-        f"Starting pipeline with constraints: {context_included['constraints']} constraints, "
-        f"{context_included['questions_answered']} Q&A pairs, "
-        f"{context_included['assumptions']} assumptions"
-    )
 
     try:
         # Format all context as document section
@@ -872,10 +1153,8 @@ async def run_pipeline_with_constraints(
         # Prepend context to document
         if context_section:
             enhanced_document = [context_section] + document
-            logger.info(f"Enhanced document with {len(context_section)} chars of context")
         else:
             enhanced_document = document
-            logger.info("No context to prepend, using original document")
 
         # Run full 9-agent pipeline
         result = await run_agent_pipeline(
@@ -891,7 +1170,6 @@ async def run_pipeline_with_constraints(
         final_report = final_message.content if hasattr(final_message, 'content') else str(final_message)
 
         processing_time = time.time() - start_time
-        logger.info(f"Pipeline with constraints completed in {processing_time:.2f}s")
 
         return {
             "report": final_report,

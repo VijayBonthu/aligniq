@@ -25,7 +25,6 @@ class ExtractText:
         self.user_id = user_id
         self.document_id = document_id
         os.makedirs("uploads_images", exist_ok=True)
-        logger.info(f"document_path: {self.document_path},user_id: {self.user_id}, document_id: {self.document_id}")
 
     @staticmethod
     def iter_block_items(parent):
@@ -140,7 +139,6 @@ class ExtractText:
         # Read the entire PDF into memory
         with open(self.document_path, "rb") as f:
             pdf_bytes = f.read()
-            logger.info("completed reading the document uploaded")
 
         # Process text and images with PyMuPDF from memory
         async with open_pdf(stream=pdf_bytes, filetype="pdf") as doc:
@@ -160,7 +158,6 @@ class ExtractText:
                     with open(image_path, "wb") as f:
                         f.write(image_bytes)
                     content.append({"type": "image", "data": image_path, "content": await ProjectScopingAgent.summarize_image(image_path)})
-        logger.info(f"content from extracted pdf inside process_pdf_with_structure: {content[:10]}")
 
         # Process tables with Camelot using a temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
@@ -174,11 +171,9 @@ class ExtractText:
         except ImportError:
             pass
         except Exception as e:
-            print(f"Error processing tables: {e}")
+            pass
         finally:
             os.remove(temp_file.name)  # Clean up the temporary file
-            logger.info("Extraction process is complete")
-            logger.info(f"content from extracted pdf: {content[:10]}")
         return content
     
     async def process_excel(self) -> List[Dict]:
@@ -278,6 +273,5 @@ async def open_pdf(document_path: str = None, stream: bytes = None, filetype: st
         yield doc
     finally:
         doc.close()
-        print("Closed the PDF document to conserve resources")
 
 #all authentication is done, want to improve the time time for extracting pdf data and get details of images and table there are 2 pdf functions need to look into it

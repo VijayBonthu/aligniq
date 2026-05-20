@@ -10,6 +10,6 @@ export interface ChatHistoryPayload {
 }
 
 export async function saveChat(payload: ChatHistoryPayload): Promise<{ chat_history_id: string }> {
-  const { data } = await api.post('/chat', payload);
+  const { data } = await api.post('chat', payload);
   return data;
 }

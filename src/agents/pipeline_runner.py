@@ -72,6 +72,60 @@ def _next_stage_after(stage: str) -> Optional[str]:
         return None
 
 
+def _get_agent_output(req_analysis: list, agent_name: str) -> Optional[dict]:
+    if not isinstance(req_analysis, list):
+        return None
+    for item in req_analysis:
+        if isinstance(item, dict) and item.get("agent") == agent_name:
+            out = item.get("output")
+            return out if isinstance(out, dict) else None
+    return None
+
+
+def _build_evidence_index(final_state: Optional[dict]) -> dict:
+    """Flatten evidence_gather_agent + requirements_analyzer outputs into a
+    {id: {basis, evidence, evidence_quote, confidence, retrieved_at}} map for
+    the frontend's <ReportContent evidenceMap=... /> citation rendering."""
+    if not isinstance(final_state, dict):
+        return {}
+    req_analysis = final_state.get("req_analysis") or []
+    index: dict = {}
+
+    evidence = _get_agent_output(req_analysis, "evidence_gather_agent") or {}
+    for section in ("evidence_summary", "risks", "best_practices", "integration_notes"):
+        for item in (evidence.get(section) or []):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if not item_id or not isinstance(item_id, str):
+                continue
+            index[item_id] = {
+                "basis":          item.get("basis"),
+                "evidence":       item.get("evidence"),
+                "evidence_quote": item.get("evidence_quote"),
+                "confidence":     item.get("confidence"),
+                "retrieved_at":   item.get("retrieved_at"),
+            }
+
+    requirements = _get_agent_output(req_analysis, "requirements_analyzer") or {}
+    for section in ("functional_requirements", "non_functional_requirements"):
+        for item in (requirements.get(section) or []):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if not item_id or not isinstance(item_id, str) or item_id in index:
+                continue
+            index[item_id] = {
+                "basis":          item.get("basis"),
+                "evidence":       item.get("source_section"),
+                "evidence_quote": item.get("source_quote"),
+                "confidence":     item.get("confidence"),
+                "retrieved_at":   None,
+            }
+
+    return index
+
+
 async def _persist_final_report(
     *,
     chat_history_id: str,
@@ -80,6 +134,7 @@ async def _persist_final_report(
     presales_id: str,
     report_text: str,
     title: str,
+    evidence_index: dict,
     db,
 ) -> None:
     """Append the final report to chat_history, embed it, save report version,
@@ -99,11 +154,12 @@ async def _persist_final_report(
             existing = []
 
     updated_messages = list(existing) + [{
-        "role":      "assistant",
-        "content":   report_text,
-        "timestamp": datetime.utcnow().isoformat(),
-        "type":      "full_report",
-        "selected":  True,
+        "role":           "assistant",
+        "content":        report_text,
+        "timestamp":      datetime.utcnow().isoformat(),
+        "type":           "full_report",
+        "selected":       True,
+        "evidence_index": evidence_index or {},
     }]
 
     await save_chat_history(
@@ -258,6 +314,13 @@ async def run_full_pipeline_async(
             last_message = final_state["message"][-1]
             report_text = last_message.content if hasattr(last_message, "content") else str(last_message)
 
+            evidence_index = _build_evidence_index(final_state)
+            logger.warning(
+                f"[bet1] persisting full_report with evidence_index: "
+                f"{len(evidence_index)} ids "
+                f"(chat_history_id={chat_history_id})"
+            )
+
             await _persist_final_report(
                 chat_history_id=chat_history_id,
                 user_id=user_id,
@@ -265,10 +328,10 @@ async def run_full_pipeline_async(
                 presales_id=presales_id,
                 report_text=report_text,
                 title=title,
+                evidence_index=evidence_index,
                 db=db,
             )
         await complete_pipeline_run(run_id, db)
-        logger.info(f"pipeline_runner: completed run {run_id} for chat {chat_history_id}")
 
     except asyncio.TimeoutError:
         logger.error(f"pipeline_runner: timeout after {timeout}s for run {run_id}")
