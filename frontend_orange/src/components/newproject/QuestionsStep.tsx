@@ -139,11 +139,21 @@ export default function QuestionsStep({
   const handleSubmit = async () => {
     setSubmitting(true);
     try {
-      const payload: Record<string, string> = {};
-      Object.entries(answers).forEach(([k, v]) => {
-        if (v.trim()) payload[k] = v.trim();
-      });
-      if (Object.keys(payload).length > 0) {
+      // F6: submit answers keyed by question_id rather than positional index,
+      // so a UI reorder can never silently cross-wire an answer to the wrong question.
+      const payload: Array<{ question_id: string; answer: string }> = [];
+      const pushFor = (list: PresalesQuestion[], prefix: 'P1' | 'K') => {
+        list.forEach((q, idx) => {
+          if (!q.question_id) return;
+          const key = prefix === 'P1' ? `p1_${idx}` : `question_${idx}`;
+          const answer = (answers[key] || '').trim();
+          if (answer) payload.push({ question_id: q.question_id, answer });
+        });
+      };
+      pushFor(p1, 'P1');
+      pushFor(kickstart, 'K');
+
+      if (payload.length > 0) {
         await presalesService.saveAnswers(presalesId, payload);
       }
       onComplete();

@@ -1,6 +1,6 @@
 import { forwardRef, useMemo, useRef, useState } from 'react';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+import { marked, type Token } from 'marked';
+import { sanitizeHtml, normalizeDiagramFences } from '../../utils/markdown';
 import { wrapAsciiArt } from '../../utils/asciiArt';
 import MermaidBlock from './MermaidBlock';
 import AsciiBlock from './AsciiBlock';
@@ -16,30 +16,45 @@ type Segment =
   | { kind: 'mermaid'; value: string; id: string }
   | { kind: 'ascii'; value: string; id: string };
 
-const FENCE_RE = /```(mermaid|ascii)\s*\n([\s\S]*?)```/g;
-
+/**
+ * Split report markdown into renderable segments. Detection is delegated to
+ * marked's own block lexer (the same path exportDocx uses) rather than a
+ * hand-rolled fence regex, so every real-world fence variant — CRLF endings,
+ * info strings after the tag, indented or `~~~` fences — is recognized. A
+ * ```mermaid / ```ascii code token becomes its own diagram segment; all other
+ * tokens are grouped and rendered to sanitized HTML. This guarantees a diagram
+ * fence can never leak through as a raw code block.
+ */
 function segmentMarkdown(raw: string, instanceId: string): Segment[] {
-  const prepared = wrapAsciiArt(raw);
+  const tokens = marked.lexer(wrapAsciiArt(normalizeDiagramFences(raw)));
   const segs: Segment[] = [];
-  let lastIdx = 0;
   let counter = 0;
-  let m: RegExpExecArray | null;
-  FENCE_RE.lastIndex = 0;
-  while ((m = FENCE_RE.exec(prepared)) !== null) {
-    const before = prepared.slice(lastIdx, m.index);
-    if (before.trim()) {
-      const html = marked.parse(before, { async: false }) as string;
-      segs.push({ kind: 'html', value: DOMPurify.sanitize(html), id: `${instanceId}-${counter++}` });
+  let htmlGroup: Token[] = [];
+
+  const flushHtml = () => {
+    if (htmlGroup.length === 0) return;
+    // marked.parser resolves the link-definition map off the token list, so
+    // carry it over to the sliced group to keep reference-style links working.
+    (htmlGroup as unknown as { links: typeof tokens.links }).links = tokens.links;
+    const html = marked.parser(htmlGroup) as string;
+    if (html.trim()) {
+      segs.push({ kind: 'html', value: sanitizeHtml(html), id: `${instanceId}-${counter++}` });
     }
-    const lang = m[1] as 'mermaid' | 'ascii';
-    segs.push({ kind: lang, value: m[2], id: `${instanceId}-${counter++}` });
-    lastIdx = m.index + m[0].length;
+    htmlGroup = [];
+  };
+
+  for (const tok of tokens) {
+    // marked keeps the whole info string in `lang` (e.g. "mermaid title=x"),
+    // so key off its first word.
+    const lang = tok.type === 'code' ? (tok.lang ?? '').trim().split(/\s+/)[0] : '';
+    if (tok.type === 'code' && (lang === 'mermaid' || lang === 'ascii')) {
+      flushHtml();
+      segs.push({ kind: lang, value: tok.text, id: `${instanceId}-${counter++}` });
+    } else {
+      htmlGroup.push(tok);
+    }
   }
-  const tail = prepared.slice(lastIdx);
-  if (tail.trim()) {
-    const html = marked.parse(tail, { async: false }) as string;
-    segs.push({ kind: 'html', value: DOMPurify.sanitize(html), id: `${instanceId}-${counter++}` });
-  }
+  flushHtml();
   return segs;
 }
 

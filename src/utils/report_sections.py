@@ -24,9 +24,13 @@ from dataclasses import dataclass, asdict
 from typing import Iterator, List, Optional
 
 
-# Matches `## 3. Title` or `### 3.2 Title` (and 4 dot variants like `### 3.2.1`).
-# Group 1 = hash prefix (## or ###), Group 2 = dotted number, Group 3 = title.
-_HEADING_RE = re.compile(r"^(#{2,3})\s+([\d.]+?)\.?\s+(.+?)\s*$")
+# Matches H2/H3 headings, with or without a numeric prefix:
+#   `## 3. Title` / `### 3.2 Title` (legacy Report_Generator_Prompt), AND
+#   `## Title` / `### Title` (contract pipeline stitcher — un-numbered).
+# Group 1 = hash prefix (## or ###), Group 2 = dotted number (optional),
+# Group 3 = title. The numeric group is non-greedy and only matches a leading
+# run of digits/dots followed by whitespace, so plain titles never lose words.
+_HEADING_RE = re.compile(r"^(#{2,3})\s+(?:([\d.]+?)\.?\s+)?(.+?)\s*$")
 
 # Heading text patterns that mark internal-only content. These are belt-and-
 # suspenders fallbacks; the numeric rules below cover the prompt-enforced
@@ -108,7 +112,7 @@ def _iter_heading_lines(markdown: str) -> Iterator[tuple[int, int, str, str]]:
         if not m:
             continue
         level = len(m.group(1))  # ## -> 2, ### -> 3
-        number = m.group(2)
+        number = m.group(2) or ""  # "" when the heading carries no numeric prefix
         title = m.group(3).strip()
         yield idx, level, number, title
 
@@ -131,6 +135,10 @@ def parse_sections(report_markdown: str) -> List[Section]:
 
     sections: List[Section] = []
     current_h2_id: Optional[str] = None
+    # Un-numbered headings derive their id from the title slug, which can
+    # collide (e.g. two "### Overview"). Suffix duplicates so ids stay unique —
+    # otherwise React keys clash and per-section edit/exclude state bleeds.
+    seen_ids: dict[str, int] = {}
 
     for i, (line_idx, level, number, title) in enumerate(headings):
         # Each section's content ends at the NEXT heading of any level we
@@ -141,7 +149,10 @@ def parse_sections(report_markdown: str) -> List[Section]:
         end_idx = headings[i + 1][0] if i + 1 < len(headings) else len(lines)
 
         raw = "\n".join(lines[line_idx:end_idx]).rstrip() + "\n"
-        section_id = _make_id(number, title)
+        base_id = _make_id(number, title)
+        seen = seen_ids.get(base_id, 0)
+        seen_ids[base_id] = seen + 1
+        section_id = base_id if seen == 0 else f"{base_id}-{seen + 1}"
         kind = _classify(number, title)
 
         if level == 2:

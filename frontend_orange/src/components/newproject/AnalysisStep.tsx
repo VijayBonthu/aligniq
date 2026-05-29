@@ -18,7 +18,7 @@ interface AnalysisStepProps {
   generating: boolean;
   onBack: () => void;
   onApplyAssumptions: (assumptions: AnalysisAssumption[]) => void;
-  onGenerateReport: (assumptions: AnalysisAssumption[]) => void;
+  onGenerateReport: (assumptions: AnalysisAssumption[], readinessStatus?: string) => void;
 }
 
 interface AnalysisData {
@@ -267,8 +267,8 @@ export default function AnalysisStep({
       )}
       {assumptions.length > 0 && (
         <IssueGroup
-          title={`Suggested assumptions · ${assumptions.length}`}
-          accent="var(--ok)"
+          title={`AI-inferred assumptions · ${assumptions.length} — review before continuing`}
+          accent="var(--warn)"
           items={assumptions.map((a) => ({
             heading: a.assumption || a.text || 'Assumption',
             body: a.basis,
@@ -352,7 +352,7 @@ export default function AnalysisStep({
           )}
           <button
             type="button"
-            onClick={() => onGenerateReport(assumptions)}
+            onClick={() => onGenerateReport(assumptions, statusKey)}
             style={{
               minWidth: 220,
               padding: '11px 20px',

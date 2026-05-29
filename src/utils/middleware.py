@@ -42,7 +42,8 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                     samesite="lax",
                     secure=self.cookie_secure,
                     domain=self.cookie_domain,
-                    path="/"
+                    path="/",
+                    max_age=60 * 60 * 24 * 30,
                 )
                 logger.debug(f"New CSRF token generated for request to {request.url.path}")
 
@@ -55,7 +56,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             csrf_header = request.headers.get(self.csrf_token_header_name)
             
             # Skip validation for authentication endpoints (login, registration)
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback"]:
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/refresh"]:
                 return await call_next(request)
             
             # Validate CSRF token

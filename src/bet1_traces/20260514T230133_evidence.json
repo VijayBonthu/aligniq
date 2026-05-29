@@ -1,0 +1,23 @@
+{
+  "timestamp_utc": "2026-05-14T23:00:21.609471+00:00",
+  "gate": {
+    "ENABLE_GROUNDED_EVIDENCE": true,
+    "TAVILY_API_KEY_present": true,
+    "grounded_path_taken": true
+  },
+  "loop": {
+    "iterations": 1,
+    "tool_calls_attempted": 0,
+    "queries": [],
+    "search_budget": 5
+  },
+  "result": {
+    "evidence_items": 43,
+    "by_basis": {
+      "document_quote": 38,
+      "model_knowledge": 5
+    },
+    "demoted_urls": 0
+  },
+  "error": null
+}

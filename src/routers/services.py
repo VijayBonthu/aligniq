@@ -36,6 +36,7 @@ from agents import (
     PresalesAgentError
 )
 from agents.presales_workflow import generate_report_with_assumptions
+from agents.tools import repair_mermaid_blocks
 import asyncio
 from utils.helper_utils import save_file, upload_to_s3
 from utils.pdf_generator import generate_pdf_from_markdown
@@ -554,9 +555,50 @@ async def _run_presales_analysis(
         _presales_recorder = LLMCallRecorder(
             db=db, user_id=user_id, presales_id=_presales_id_pre,
         )
+        # Bet 3 — build firm_context block once per run and pass it into the
+        # presales graph. brief_generator is the only node that consumes it
+        # (scanner/blindspot/classifier stay generic to preserve speed).
+        firm_context_block = ""
+        if settings.ENABLE_FIRM_CONTEXT:
+            try:
+                from agents.firm_context import build_firm_context_block
+                user_row = db.query(models.User).filter(models.User.user_id == user_id).first()
+                firm_id = user_row.firm_id if user_row else None
+                firm_context_block = await build_firm_context_block(firm_id, engagement_type=None, db=db)
+            except Exception as e:
+                logger.error(f"_run_presales_analysis: firm_context lookup failed for {user_id}: {e}")
+
         with use_recorder(_presales_recorder):
             # Run the pre-sales pipeline
-            result = await run_presales_pipeline(document=raw_requirements, timeout=180)
+            result = await run_presales_pipeline(
+                document=raw_requirements,
+                timeout=180,
+                firm_context=firm_context_block,
+            )
+
+        # Bet 2.A — pre-flight classifier rejected the upload. Surface a 422
+        # with actionable copy so the UI can prompt the user to upload a real
+        # technical brief instead. Nothing is persisted for rejected docs.
+        if result.get("aborted"):
+            classification = result.get("document_classification") or {}
+            logger.warning(
+                f"Pre-sales upload rejected by classifier: "
+                f"reason={result.get('abort_reason')}, confidence={classification.get('confidence')}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "status": "rejected",
+                    "rejection_reason": result.get("abort_reason"),
+                    "next_step": classification.get("next_step") or
+                        "Upload your RFP or technical requirements document instead.",
+                    "classification": {
+                        "is_technical_brief": classification.get("is_technical_brief"),
+                        "primary_domain": classification.get("primary_domain"),
+                        "confidence": classification.get("confidence"),
+                    },
+                },
+            )
 
         if result.get("error"):
             logger.error(f"Pre-sales pipeline failed: {result['error']}")
@@ -774,7 +816,8 @@ async def generate_presales_report(
                 detail=f"Report generation failed: {result['error']}",
             )
 
-        report_text = result["report"]
+        # Quote any risky mermaid labels so the brief's diagrams render client-side.
+        report_text = repair_mermaid_blocks(result["report"])
         document_title = (
             presales.get("extracted_requirements", {}).get("project_summary")
             or "Presales Brief"
@@ -1038,6 +1081,10 @@ async def get_full_pipeline_status_endpoint(
     """
     Poll endpoint: returns current state of the run, or status='idle' if no
     run has been started yet for this chat.
+
+    `last_completed_node` is included so the UI can show "Resume" instead of
+    "Retry" on failed runs. The heavy `state_snapshot` blob is stripped — the
+    UI never needs it directly.
     """
     from database_scripts import get_pipeline_run_by_chat
 
@@ -1051,7 +1098,132 @@ async def get_full_pipeline_status_endpoint(
     run = await get_pipeline_run_by_chat(chat_history_id, db)
     if not run:
         return {"status": "idle", "chat_history_id": chat_history_id}
+    run.pop("state_snapshot", None)
     return run
+
+
+@router.post("/full-pipeline/resume/{chat_history_id}", status_code=status.HTTP_202_ACCEPTED)
+async def resume_full_pipeline(
+    chat_history_id: str,
+    background_tasks: BackgroundTasks,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """
+    Bet 2.C — resume a previously failed pipeline run from its checkpoint.
+
+    Requires `ENABLE_RESUMABLE_PIPELINE`. 409 if no resumable snapshot exists
+    for this chat. Re-hydrates `req_analysis` + `loop_count` into a fresh
+    pipeline invocation so the user doesn't have to re-go through the wizard.
+    """
+    from database_scripts import (
+        create_or_reset_pipeline_run,
+        get_resumable_run,
+    )
+    from agents.pipeline_runner import run_full_pipeline_async
+
+    if not settings.ENABLE_RESUMABLE_PIPELINE:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resume is not enabled in this environment.",
+        )
+
+    user_id = current_token["regular_login_token"]["id"]
+    check_regen_limit(user_id, db)
+
+    chat = await get_single_user_chat_history(
+        chat_history_id=chat_history_id, user_id=user_id, db=db
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat history not found")
+
+    resumable = await get_resumable_run(chat_history_id, db)
+    if not resumable:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No resumable run for this chat. Use /full-pipeline/start to begin a fresh run.",
+        )
+
+    snapshot = resumable.get("state_snapshot") or {}
+    last_node = resumable.get("last_completed_node")
+
+    # Rebuild the same document context that /start uses, since the runner
+    # needs `document` to seed the LangGraph.
+    document_id = chat.get("document_id")
+    if not document_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chat is missing document_id")
+
+    link = await get_analysis_link(document_id=document_id, user_id=user_id, db=db)
+    if not link or not link.get("presales_id"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No presales analysis linked to this chat.",
+        )
+    presales_id = link["presales_id"]
+    presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
+    if not presales:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+
+    raw_messages = chat.get("message") or "[]"
+    try:
+        msgs = json.loads(raw_messages) if isinstance(raw_messages, str) else (raw_messages or [])
+    except json.JSONDecodeError:
+        msgs = []
+    presales_brief_text = ""
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("type") == "presales_brief":
+            presales_brief_text = m.get("content", "")
+            break
+
+    extracted = presales.get("extracted_requirements") or {}
+    blind_spots = presales.get("blind_spots") or {}
+    enhanced_context = (
+        "## Pre-Sales Analysis Context\n\n"
+        f"### Project Summary\n{extracted.get('project_summary', 'N/A')}\n\n"
+        f"### Technologies Identified\n{json.dumps(extracted.get('technologies_mentioned', []), indent=2)}\n\n"
+        f"### Blind Spots & Risks Identified\n{json.dumps(blind_spots, indent=2)}\n\n"
+        f"### Approved Presales Brief\n{presales_brief_text or '(brief not available — using extracted requirements only)'}\n"
+    )
+    title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
+
+    # Reset run state but preserve the snapshot for the runner to read.
+    run = await create_or_reset_pipeline_run(
+        chat_history_id=chat_history_id,
+        user_id=user_id,
+        db=db,
+        preserve_snapshot=True,
+    )
+
+    background_tasks.add_task(
+        run_full_pipeline_async,
+        run_id=run["run_id"],
+        chat_history_id=chat_history_id,
+        user_id=user_id,
+        document_id=document_id,
+        presales_id=presales_id,
+        document=[enhanced_context],
+        title=title,
+        resume_from_snapshot=snapshot,
+    )
+    increment_regen_count(user_id, db)
+
+    logger.info(
+        f"Resuming pipeline run {run['run_id']} for chat {chat_history_id} "
+        f"from last_completed_node={last_node}"
+    )
+
+    return {
+        "run_id":              run["run_id"],
+        "chat_history_id":     chat_history_id,
+        # 'queued' matches the actual DB state (the runner flips it to
+        # 'running' on the first mark_stage_started call within ~50ms).
+        # The presence of last_completed_node tells the UI this was a resume.
+        "status":              "queued",
+        "current_stage":       run.get("current_stage"),
+        "stages_completed":    run.get("stages_completed") or [],
+        "last_completed_node": last_node,
+        "resumed_from":        last_node,
+    }
 
 
 @router.get("/presales/{document_id}")
@@ -1590,74 +1762,96 @@ async def save_question_answers(
     """
     Save answers for multiple questions.
 
-    Args:
-        presales_id: The presales analysis ID
-        answers: JSON dict mapping frontend key (p1_0, question_0) or question_id -> answer text
+    Bet 2 / F6 — preferred payload is a JSON list of objects keyed by
+    `question_id`:
 
-    Returns:
-        Dict with update status
+        [{"question_id": "<uuid>", "answer": "..."}, ...]
+
+    For backward compatibility (in-flight sessions still serving the old JS),
+    the legacy positional dict is also accepted:
+
+        {"p1_0": "...", "question_0": "...", "<uuid>": "..."}
+
+    Any `question_id` not belonging to this `presales_id` triggers HTTP 422.
     """
     import json as json_module
 
     user_id = current_token["regular_login_token"]["id"]
     logger.info(f"Saving answers for presales: {presales_id}")
 
-    # Parse answers if it's a string
-    if isinstance(answers, str):
-        answers = json_module.loads(answers)
+    parsed = json_module.loads(answers) if isinstance(answers, str) else answers
 
-    logger.info(f"Received answers for {len(answers)} questions")
-    logger.info(f"Received answer keys: {list(answers.keys())}")
-
-    # Get all questions for this presales to map frontend keys to question_ids
+    # Pull the canonical set of valid question_ids once for validation.
     questions = await get_presales_questions(presales_id, user_id, db)
+    valid_question_ids = {q["question_id"] for q in questions}
 
-    # Build mappings from frontend keys to question_id
-    # Frontend sends: p1_0, p1_1 (for P1 blockers, 0-indexed)
-    # Frontend sends: question_0, question_1 (for kickstart questions, 0-indexed)
-    # Backend has: question_number like P1-1, P1-2 (1-indexed) and Q1, Q2
+    mapped_answers: dict = {}
+    unknown_ids: list = []
 
-    # Separate P1 blockers and kickstart questions by type
-    p1_questions = [q for q in questions if q["question_type"] == "p1_blocker"]
-    kickstart_questions = [q for q in questions if q["question_type"] == "kickstart"]
+    if isinstance(parsed, list):
+        # New shape: [{question_id, answer}, ...]
+        logger.info(f"Received {len(parsed)} answers in question_id-keyed format")
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            qid = entry.get("question_id")
+            ans = entry.get("answer")
+            if not qid:
+                continue
+            if qid not in valid_question_ids:
+                unknown_ids.append(qid)
+                continue
+            if ans:  # only persist non-empty
+                mapped_answers[qid] = ans
 
-    # Sort by display_order to ensure correct mapping
-    p1_questions.sort(key=lambda x: x["display_order"])
-    kickstart_questions.sort(key=lambda x: x["display_order"])
+        if unknown_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "unknown_question_ids",
+                    "message": "One or more question_ids do not belong to this presales analysis.",
+                    "unknown_question_ids": unknown_ids,
+                },
+            )
 
-    # Map frontend keys to actual question_ids
-    mapped_answers = {}
+    elif isinstance(parsed, dict):
+        # Legacy positional shape — kept for one deploy cycle.
+        logger.info(f"Received {len(parsed)} answers in legacy positional format")
+        p1_questions = sorted(
+            (q for q in questions if q["question_type"] == "p1_blocker"),
+            key=lambda x: x["display_order"],
+        )
+        kickstart_questions = sorted(
+            (q for q in questions if q["question_type"] == "kickstart"),
+            key=lambda x: x["display_order"],
+        )
 
-    for key, answer in answers.items():
-        question_id = None
+        for key, answer in parsed.items():
+            qid: Optional[str] = None
+            if key.startswith("p1_"):
+                try:
+                    idx = int(key.split("_", 1)[1])
+                    if 0 <= idx < len(p1_questions):
+                        qid = p1_questions[idx]["question_id"]
+                except (ValueError, IndexError):
+                    pass
+            elif key.startswith("question_"):
+                try:
+                    idx = int(key.split("_", 1)[1])
+                    if 0 <= idx < len(kickstart_questions):
+                        qid = kickstart_questions[idx]["question_id"]
+                except (ValueError, IndexError):
+                    pass
+            elif key in valid_question_ids:
+                qid = key
 
-        if key.startswith("p1_"):
-            # P1 blocker: p1_0 -> index 0 -> first P1 question
-            try:
-                idx = int(key.split("_")[1])
-                if idx < len(p1_questions):
-                    question_id = p1_questions[idx]["question_id"]
-                    logger.info(f"Mapped {key} -> P1 question {p1_questions[idx]['question_number']} ({question_id})")
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Failed to parse P1 key {key}: {e}")
-
-        elif key.startswith("question_"):
-            # Kickstart question: question_0 -> index 0 -> first kickstart question
-            try:
-                idx = int(key.split("_")[1])
-                if idx < len(kickstart_questions):
-                    question_id = kickstart_questions[idx]["question_id"]
-                    logger.info(f"Mapped {key} -> kickstart question {kickstart_questions[idx]['question_number']} ({question_id})")
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Failed to parse kickstart key {key}: {e}")
-
-        else:
-            # Assume it's already a question_id (UUID)
-            question_id = key
-            logger.info(f"Using key as question_id: {key}")
-
-        if question_id and answer:  # Only save non-empty answers
-            mapped_answers[question_id] = answer
+            if qid and answer:
+                mapped_answers[qid] = answer
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="`answers` must be a JSON list of {question_id, answer} or a legacy positional dict.",
+        )
 
     logger.info(f"Mapped {len(mapped_answers)} answers to question_ids")
 

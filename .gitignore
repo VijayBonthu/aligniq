@@ -75,3 +75,6 @@ frontend_orange\.env.production
 frontend_orange/.env.production
 gen_secrets.py
 migrations
+dump_latest_report.py
+mermaid-selftest.html
+tests

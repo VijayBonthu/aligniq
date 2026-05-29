@@ -169,9 +169,13 @@ async function renderSerializedToCanvas(
       i.onerror = () => reject(new Error('svg load failed'));
       i.src = url;
     });
+    // Clamp the raster scale so a large diagram never exceeds the browser's
+    // 32767px-per-side canvas cap.
+    const MAX_CANVAS_PX = 32760;
+    const safeScale = Math.min(scale, MAX_CANVAS_PX / Math.max(ser.width, ser.height, 1));
     const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(ser.width * scale));
-    canvas.height = Math.max(1, Math.round(ser.height * scale));
+    canvas.width = Math.max(1, Math.round(ser.width * safeScale));
+    canvas.height = Math.max(1, Math.round(ser.height * safeScale));
     const ctx = canvas.getContext('2d');
     if (!ctx) return null;
     ctx.fillStyle = '#ffffff';

@@ -362,6 +362,8 @@ async def save_report_version(summary_report_details:Dict, db:Session):
 
     """
     try:
+        # Optional structured contract (contract pipeline only); legacy runs omit it.
+        report_contract = summary_report_details.get("report_contract")
         report_details_exists = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == summary_report_details["chat_history_id"]).order_by(models.ReportVersions.created_at.desc()).first()
         if report_details_exists:
             version_details = report_details_exists.version_number + 1
@@ -372,7 +374,8 @@ async def save_report_version(summary_report_details:Dict, db:Session):
                 user_id = summary_report_details["user_id"],
                 version_number = version_details,
                 report_content = summary_report_details["report_content"],
-                summary_report = summary_report_details["summary_report"]
+                summary_report = summary_report_details["summary_report"],
+                report_contract = report_contract
             )
             db.add(new_report_insert)
             db.commit()
@@ -384,7 +387,8 @@ async def save_report_version(summary_report_details:Dict, db:Session):
                 chat_history_id = summary_report_details["chat_history_id"],
                 user_id = summary_report_details["user_id"],
                 report_content = summary_report_details["report_content"],
-                summary_report = summary_report_details["summary_report"]
+                summary_report = summary_report_details["summary_report"],
+                report_contract = report_contract
             )
             db.add(new_report_insert)
             db.commit()

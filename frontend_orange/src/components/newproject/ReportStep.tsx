@@ -10,6 +10,7 @@ interface Props {
   onOpenChat: () => void;
   onBack: () => void;
   onContentChange?: (content: string) => void;
+  requireAssumptionAck?: boolean;
 }
 
 export default function ReportStep({
@@ -19,7 +20,9 @@ export default function ReportStep({
   onOpenChat,
   onBack,
   onContentChange,
+  requireAssumptionAck = false,
 }: Props) {
+  const [assumptionAck, setAssumptionAck] = useState(false);
   const reportRef = useRef<HTMLDivElement | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [draft, setDraft] = useState(reportContent);
@@ -190,6 +193,12 @@ export default function ReportStep({
                   <button
                     type="button"
                     onClick={onOpenChat}
+                    disabled={requireAssumptionAck && !assumptionAck}
+                    title={
+                      requireAssumptionAck && !assumptionAck
+                        ? 'Acknowledge the AI-inferred assumptions before running the full pipeline.'
+                        : undefined
+                    }
                     style={{
                       display: 'inline-flex',
                       alignItems: 'center',
@@ -202,7 +211,8 @@ export default function ReportStep({
                       color: '#1a0a04',
                       border: 'none',
                       boxShadow: 'var(--glow)',
-                      cursor: 'pointer',
+                      cursor: requireAssumptionAck && !assumptionAck ? 'not-allowed' : 'pointer',
+                      opacity: requireAssumptionAck && !assumptionAck ? 0.55 : 1,
                       fontFamily: 'var(--font-sans)',
                     }}
                   >
@@ -237,6 +247,32 @@ export default function ReportStep({
         >
           {saveError}
         </div>
+      )}
+
+      {requireAssumptionAck && !isEditing && (
+        <label
+          style={{
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            padding: '10px 30px',
+            background: 'rgba(234, 179, 8, 0.08)',
+            color: 'var(--warn)',
+            fontSize: 13,
+            fontFamily: 'var(--font-sans)',
+            borderBottom: '1px solid var(--border)',
+            cursor: 'pointer',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={assumptionAck}
+            onChange={(e) => setAssumptionAck(e.target.checked)}
+            style={{ accentColor: 'var(--warn)', cursor: 'pointer' }}
+          />
+          I&rsquo;ve reviewed the AI-inferred assumptions above before running the full pipeline.
+        </label>
       )}
 
       <div

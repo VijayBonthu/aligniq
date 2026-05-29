@@ -11,6 +11,7 @@ from fastapi import HTTPException, status
 from utils.logger import logger
 from datetime import datetime
 import copy
+import json
 import uuid
 from typing import Optional
 
@@ -43,14 +44,23 @@ async def create_user(user_data:dict,provider:str, db:Session):
             subscription_tier = "free",
             subscription_status = "active",
         )
-        try: 
+        try:
             db.add(user_details)
             db.commit()
             db.refresh(user_details)
-            
+
         except SQLAlchemyError as e:
-            db.rollback() 
+            db.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"unable to create details: {str(e.args), str(e.code)}")
+
+        # Auto-assign a 1-person firm (Bet 3). Failure here is non-fatal — the user
+        # still gets a working account, but firm-admin features will no-op until
+        # a firm is assigned manually or via the migration backfill.
+        try:
+            ensure_firm_for_new_user(user_details.user_id, db)
+            db.refresh(user_details)
+        except Exception as fe:  # noqa: BLE001
+            logger.error(f"ensure_firm_for_new_user failed at signup for {user_details.user_id}: {fe}")
 
         if user_details.provider == "Local":
             h_pass = hash_passwords(password=user_data["password"]) 
@@ -3997,6 +4007,21 @@ PIPELINE_STAGES_ORDER = [
     "ba_final_report_generation",
 ]
 
+# Stages for the contract pipeline (USE_CONTRACT_PIPELINE=true). Kept here next
+# to PIPELINE_STAGES_ORDER so it's obvious both lists drive the same UI surface
+# and the same pipeline_runs.stages_completed JSONB column.
+CONTRACT_PIPELINE_STAGES_ORDER = [
+    "plan",
+    "decide",
+    "write_sections",
+    "judge_and_finalize",
+]
+
+
+def stages_order_for_mode(use_contract_pipeline: bool) -> list[str]:
+    """Pick the stage list the runner / frontend should drive against."""
+    return CONTRACT_PIPELINE_STAGES_ORDER if use_contract_pipeline else PIPELINE_STAGES_ORDER
+
 
 def _serialize_pipeline_run(run: "models.PipelineRun") -> dict:
     return {
@@ -4010,14 +4035,26 @@ def _serialize_pipeline_run(run: "models.PipelineRun") -> dict:
         "error": run.error,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        # Bet 2.C — resume support
+        "last_completed_node": getattr(run, "last_completed_node", None),
+        "state_snapshot": getattr(run, "state_snapshot", None),
     }
 
 
-async def create_or_reset_pipeline_run(chat_history_id: str, user_id: str, db: Session) -> dict:
+async def create_or_reset_pipeline_run(
+    chat_history_id: str,
+    user_id: str,
+    db: Session,
+    *,
+    preserve_snapshot: bool = False,
+) -> dict:
     """
     Insert a new pipeline_runs row for the project, or reset an existing one
     back to status='queued' (used on retry after a failure). Always returns
     the run in queued state with empty stages_completed.
+
+    `preserve_snapshot=True` keeps state_snapshot + last_completed_node so the
+    /full-pipeline/resume endpoint can hand them to the runner.
     """
     try:
         run = (
@@ -4027,12 +4064,20 @@ async def create_or_reset_pipeline_run(chat_history_id: str, user_id: str, db: S
         )
         if run:
             run.status = models.PipelineRunStatus.QUEUED
-            run.current_stage = None
-            run.stages_completed = []
-            run.loop_count = 0
             run.error = None
             run.completed_at = None
-            flag_modified(run, "stages_completed")
+            if not preserve_snapshot:
+                # Full restart — clear progress and snapshot.
+                run.current_stage = None
+                run.stages_completed = []
+                run.loop_count = 0
+                run.state_snapshot = None
+                run.last_completed_node = None
+                flag_modified(run, "stages_completed")
+            # else (resume): preserve current_stage / stages_completed / loop_count
+            # so the UI keeps showing completed steps. The runner re-streams the
+            # graph and each already-completed node short-circuits via
+            # completed_nodes; new mark_stage_* calls overwrite as needed.
         else:
             run = models.PipelineRun(
                 run_id=str(uuid.uuid4()),
@@ -4143,6 +4188,85 @@ async def fail_pipeline_run(run_id: str, error_msg: str, db: Session) -> None:
         logger.error(f"fail_pipeline_run failed for {run_id}: {e}")
 
 
+async def persist_state_snapshot(
+    run_id: str,
+    state_subset: dict,
+    node_name: str,
+    db: Session,
+) -> None:
+    """
+    Bet 2.C — checkpoint the LangGraph state after a node completes.
+
+    `state_subset` is a dict of state keys the runner wants to persist for
+    resume. The current allowlist (set in pipeline_runner.run_full_pipeline_async)
+    covers every downstream-consumed key: req_analysis, solution_archi,
+    critic_report, evidence_report, feasibility_report, loop_count,
+    current_loop_node, completed_nodes. Non-JSON values (LangChain BaseMessage
+    objects, etc.) are coerced via `_coerce_state_for_snapshot`.
+
+    On failure mid-pipeline this snapshot lets /full-pipeline/resume hydrate a
+    fresh run with the work the previous run produced, so already-completed
+    nodes short-circuit instead of re-calling the LLM.
+    """
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            logger.warning(f"persist_state_snapshot: run_id {run_id} not found")
+            return
+        # Strip non-JSON-serializable values defensively. LangChain messages are
+        # the usual offender (BaseMessage objects), so coerce them to plain dicts.
+        try:
+            json.dumps(state_subset)
+            payload = state_subset
+        except (TypeError, ValueError):
+            payload = _coerce_state_for_snapshot(state_subset)
+        run.state_snapshot = payload
+        run.last_completed_node = node_name[:64] if node_name else None
+        flag_modified(run, "state_snapshot")
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"persist_state_snapshot failed for {run_id}/{node_name}: {e}")
+
+
+def _coerce_state_for_snapshot(state: dict) -> dict:
+    """Best-effort JSON coercion of a LangGraph state dict for the snapshot column."""
+    def _coerce(v):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, list):
+            return [_coerce(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): _coerce(x) for k, x in v.items()}
+        # langchain Message objects expose .content; everything else falls back to str.
+        content = getattr(v, "content", None)
+        if content is not None:
+            return {"type": v.__class__.__name__, "content": str(content)}
+        return str(v)
+    return {str(k): _coerce(v) for k, v in (state or {}).items()}
+
+
+async def get_resumable_run(chat_history_id: str, db: Session):
+    """
+    Bet 2.C — return a failed run only if it has a checkpoint to resume from.
+
+    Returns the serialized run or None. Callers use this to gate the
+    /full-pipeline/resume endpoint (409 when not resumable).
+    """
+    try:
+        run = (
+            db.query(models.PipelineRun)
+            .filter(models.PipelineRun.chat_history_id == chat_history_id)
+            .filter(models.PipelineRun.status == models.PipelineRunStatus.FAILED)
+            .filter(models.PipelineRun.last_completed_node.isnot(None))
+            .first()
+        )
+        return _serialize_pipeline_run(run) if run else None
+    except SQLAlchemyError as e:
+        logger.error(f"get_resumable_run failed for {chat_history_id}: {e}")
+        return None
+
+
 async def get_pipeline_run_by_chat(chat_history_id: str, db: Session):
     """Return the serialized pipeline run for a project, or None if no row exists."""
     try:
@@ -4171,3 +4295,454 @@ async def get_pipeline_status_map(chat_history_ids: list, db: Session) -> dict:
     except SQLAlchemyError as e:
         logger.error(f"get_pipeline_status_map failed: {e}")
         return {}
+
+
+# ============================================================================
+# FIRM CONTEXT (Bet 3, migration 019)
+# ============================================================================
+
+def _serialize_firm(firm) -> dict:
+    return {
+        "firm_id": firm.firm_id,
+        "name": firm.name,
+        "logo_url": firm.logo_url,
+        "primary_color": firm.primary_color,
+        "created_at": firm.created_at.isoformat() if firm.created_at else None,
+    }
+
+
+def _serialize_rate_card(r) -> dict:
+    return {
+        "rate_id": r.rate_id,
+        "firm_id": r.firm_id,
+        "role": r.role,
+        "seniority": r.seniority,
+        "region": r.region,
+        "hourly_rate_usd": float(r.hourly_rate_usd) if r.hourly_rate_usd is not None else None,
+        "version": r.version,
+        "active": r.active,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _serialize_team_template(t) -> dict:
+    return {
+        "template_id": t.template_id,
+        "firm_id": t.firm_id,
+        "template_name": t.template_name,
+        "engagement_type": t.engagement_type,
+        "roles": t.roles or [],
+        "notes": t.notes,
+        "active": t.active,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _serialize_tech_pref(p) -> dict:
+    return {
+        "pref_id": p.pref_id,
+        "firm_id": p.firm_id,
+        "category": p.category,
+        "preferred": p.preferred or [],
+        "anti_preferred": p.anti_preferred or [],
+        "rationale": p.rationale,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+def _serialize_past_project(p) -> dict:
+    return {
+        "project_id": p.project_id,
+        "firm_id": p.firm_id,
+        "project_name": p.project_name,
+        "client_name": p.client_name,
+        "engagement_type": p.engagement_type,
+        "start_date": p.start_date.isoformat() if p.start_date else None,
+        "end_date": p.end_date.isoformat() if p.end_date else None,
+        "summary": p.summary,
+        "original_brief_md": p.original_brief_md,
+        "final_report_md": p.final_report_md,
+        "retrospective_md": p.retrospective_md,
+        "effort_estimated_weeks": float(p.effort_estimated_weeks) if p.effort_estimated_weeks is not None else None,
+        "effort_actual_weeks": float(p.effort_actual_weeks) if p.effort_actual_weeks is not None else None,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+# ---- Firm membership ----
+
+def get_firm_for_user(user_id: str, db: Session) -> Optional[dict]:
+    """Returns the firm row + the user's firm_role, or None if user has no firm yet."""
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not u or not u.firm_id:
+            return None
+        firm = db.query(models.Firm).filter(models.Firm.firm_id == u.firm_id).first()
+        if not firm:
+            return None
+        return {**_serialize_firm(firm), "firm_role": u.firm_role}
+    except SQLAlchemyError as e:
+        logger.error(f"get_firm_for_user failed for {user_id}: {e}")
+        return None
+
+
+def ensure_firm_for_new_user(user_id: str, db: Session) -> Optional[str]:
+    """
+    Idempotently ensure the user has a firm. If not, create a 1-person firm named
+    after the user and assign firm_admin. Returns the firm_id.
+
+    Called from signup flows so every new user can immediately use the admin UI.
+    """
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not u:
+            return None
+        if u.firm_id:
+            return u.firm_id
+
+        firm_name = (u.full_name or u.email_address or "My firm").strip()
+        if not firm_name.endswith("firm") and not firm_name.endswith("Firm"):
+            firm_name = f"{firm_name}'s firm"
+
+        firm = models.Firm(name=firm_name)
+        db.add(firm)
+        db.flush()  # populate firm.firm_id
+
+        u.firm_id = firm.firm_id
+        u.firm_role = "firm_admin"
+        db.commit()
+        db.refresh(u)
+        return u.firm_id
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"ensure_firm_for_new_user failed for {user_id}: {e}")
+        return None
+
+
+def update_firm(firm_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        firm = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+        if not firm:
+            return None
+        for k in ("name", "logo_url", "primary_color"):
+            if k in updates and updates[k] is not None:
+                setattr(firm, k, updates[k])
+        db.commit()
+        db.refresh(firm)
+        return _serialize_firm(firm)
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"update_firm failed for {firm_id}: {e}")
+        return None
+
+
+# ---- Rate cards ----
+
+def list_rate_cards(firm_id: str, db: Session, active_only: bool = True) -> list:
+    q = db.query(models.FirmRateCard).filter(models.FirmRateCard.firm_id == firm_id)
+    if active_only:
+        q = q.filter(models.FirmRateCard.active == True)  # noqa: E712
+    return [_serialize_rate_card(r) for r in q.order_by(models.FirmRateCard.role, models.FirmRateCard.seniority).all()]
+
+
+def create_rate_card(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmRateCard(
+            firm_id=firm_id,
+            role=data["role"],
+            seniority=data["seniority"],
+            region=data["region"],
+            hourly_rate_usd=data["hourly_rate_usd"],
+            version=data.get("version", 1),
+            active=data.get("active", True),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_rate_card(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_rate_card failed: {e}")
+
+
+def update_rate_card(firm_id: str, rate_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmRateCard)
+            .filter(models.FirmRateCard.firm_id == firm_id,
+                    models.FirmRateCard.rate_id == rate_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("role", "seniority", "region", "hourly_rate_usd", "version", "active"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        db.commit()
+        db.refresh(row)
+        return _serialize_rate_card(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_rate_card failed: {e}")
+
+
+def delete_rate_card(firm_id: str, rate_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmRateCard)
+            .filter(models.FirmRateCard.firm_id == firm_id,
+                    models.FirmRateCard.rate_id == rate_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_rate_card failed: {e}")
+
+
+# ---- Team templates ----
+
+def list_team_templates(firm_id: str, db: Session, active_only: bool = True) -> list:
+    q = db.query(models.FirmTeamTemplate).filter(models.FirmTeamTemplate.firm_id == firm_id)
+    if active_only:
+        q = q.filter(models.FirmTeamTemplate.active == True)  # noqa: E712
+    return [_serialize_team_template(t) for t in q.order_by(models.FirmTeamTemplate.template_name).all()]
+
+
+def get_team_template_for_engagement(firm_id: str, engagement_type: Optional[str], db: Session) -> Optional[dict]:
+    if not engagement_type:
+        return None
+    row = (
+        db.query(models.FirmTeamTemplate)
+        .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                models.FirmTeamTemplate.engagement_type == engagement_type,
+                models.FirmTeamTemplate.active == True)  # noqa: E712
+        .first()
+    )
+    return _serialize_team_template(row) if row else None
+
+
+def create_team_template(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmTeamTemplate(
+            firm_id=firm_id,
+            template_name=data["template_name"],
+            engagement_type=data.get("engagement_type"),
+            roles=data.get("roles", []),
+            notes=data.get("notes"),
+            active=data.get("active", True),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_team_template(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_team_template failed: {e}")
+
+
+def update_team_template(firm_id: str, template_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmTeamTemplate)
+            .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                    models.FirmTeamTemplate.template_id == template_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("template_name", "engagement_type", "roles", "notes", "active"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        if "roles" in updates:
+            flag_modified(row, "roles")
+        db.commit()
+        db.refresh(row)
+        return _serialize_team_template(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_team_template failed: {e}")
+
+
+def delete_team_template(firm_id: str, template_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmTeamTemplate)
+            .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                    models.FirmTeamTemplate.template_id == template_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_team_template failed: {e}")
+
+
+# ---- Tech preferences ----
+
+def list_tech_preferences(firm_id: str, db: Session) -> list:
+    rows = (
+        db.query(models.FirmTechPreference)
+        .filter(models.FirmTechPreference.firm_id == firm_id)
+        .order_by(models.FirmTechPreference.category)
+        .all()
+    )
+    return [_serialize_tech_pref(p) for p in rows]
+
+
+def create_tech_preference(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmTechPreference(
+            firm_id=firm_id,
+            category=data["category"],
+            preferred=data.get("preferred", []),
+            anti_preferred=data.get("anti_preferred", []),
+            rationale=data.get("rationale"),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_tech_pref(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_tech_preference failed: {e}")
+
+
+def update_tech_preference(firm_id: str, pref_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmTechPreference)
+            .filter(models.FirmTechPreference.firm_id == firm_id,
+                    models.FirmTechPreference.pref_id == pref_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("category", "preferred", "anti_preferred", "rationale"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        for jcol in ("preferred", "anti_preferred"):
+            if jcol in updates:
+                flag_modified(row, jcol)
+        db.commit()
+        db.refresh(row)
+        return _serialize_tech_pref(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_tech_preference failed: {e}")
+
+
+def delete_tech_preference(firm_id: str, pref_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmTechPreference)
+            .filter(models.FirmTechPreference.firm_id == firm_id,
+                    models.FirmTechPreference.pref_id == pref_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_tech_preference failed: {e}")
+
+
+# ---- Past projects ----
+
+def list_past_projects(firm_id: str, db: Session) -> list:
+    rows = (
+        db.query(models.FirmPastProject)
+        .filter(models.FirmPastProject.firm_id == firm_id)
+        .order_by(models.FirmPastProject.created_at.desc())
+        .all()
+    )
+    return [_serialize_past_project(p) for p in rows]
+
+
+def get_past_project(firm_id: str, project_id: str, db: Session) -> Optional[dict]:
+    row = (
+        db.query(models.FirmPastProject)
+        .filter(models.FirmPastProject.firm_id == firm_id,
+                models.FirmPastProject.project_id == project_id)
+        .first()
+    )
+    return _serialize_past_project(row) if row else None
+
+
+def create_past_project(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmPastProject(
+            firm_id=firm_id,
+            project_name=data["project_name"],
+            client_name=data.get("client_name"),
+            engagement_type=data.get("engagement_type"),
+            start_date=data.get("start_date"),
+            end_date=data.get("end_date"),
+            summary=data.get("summary"),
+            original_brief_md=data.get("original_brief_md"),
+            final_report_md=data.get("final_report_md"),
+            retrospective_md=data.get("retrospective_md"),
+            effort_estimated_weeks=data.get("effort_estimated_weeks"),
+            effort_actual_weeks=data.get("effort_actual_weeks"),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_past_project(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_past_project failed: {e}")
+
+
+def update_past_project(firm_id: str, project_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmPastProject)
+            .filter(models.FirmPastProject.firm_id == firm_id,
+                    models.FirmPastProject.project_id == project_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in (
+            "project_name", "client_name", "engagement_type", "start_date", "end_date",
+            "summary", "original_brief_md", "final_report_md", "retrospective_md",
+            "effort_estimated_weeks", "effort_actual_weeks",
+        ):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        db.commit()
+        db.refresh(row)
+        return _serialize_past_project(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_past_project failed: {e}")
+
+
+def delete_past_project(firm_id: str, project_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmPastProject)
+            .filter(models.FirmPastProject.firm_id == firm_id,
+                    models.FirmPastProject.project_id == project_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_past_project failed: {e}")

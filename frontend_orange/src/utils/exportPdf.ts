@@ -1,361 +1,348 @@
+import { marked, type Token, type Tokens } from 'marked';
+import { wrapAsciiArt } from './asciiArt';
+import { normalizeDiagramFences } from './markdown';
 import { rasterizeSvgToCanvas } from './svgExportTheme';
 
 /**
- * Render a report DOM node to a multi-page A4 PDF intended as a sharable
- * business document.
+ * Vector PDF export.
  *
- * What this produces:
+ * This does NOT screenshot the DOM. It rebuilds the report from the markdown
+ * with pdfmake, so the body is real vector text — sharp at any zoom, selectable,
+ * searchable, copyable, with clickable citation links — exactly like a
+ * production-generated document. Tables, lists, wrapping, pagination and page
+ * chrome are all native pdfmake (vector).
  *
- * - **Cover page** with brand mark, document title, and generation date.
- *   Drawn with native jsPDF text/shape APIs — vector, crisp at any zoom.
- * - **Content pages** rasterized from the live (dark-themed) report DOM
- *   that's been deep-cloned into an off-screen wrap with CSS-custom-
- *   property overrides flipping the report to high-contrast colors.
- *   Mermaid SVGs are pre-rasterized at 3× with a light-theme override
- *   stylesheet injected into the SVG itself, so diagram text stays dark
- *   and readable on a white page.
- * - **Page chrome** (top brand strip + bottom title/page-number footer)
- *   on every content page, drawn natively after pagination so totals are
- *   accurate.
- * - **Page-aware slicing**: before slicing, we collect Y offsets of every
- *   block boundary (h1–h6, p, li, tr, table, blockquote, pre, .diagram-
- *   block, hr, ul, ol). Each page ends at the largest break point that
- *   still fits on the page, so headings/tables/diagrams are never sliced
- *   through. Hard cuts are reserved for blocks that exceed a full page.
+ * Diagrams: mermaid styles its SVGs with a <style> block, which client-side
+ * SVG→PDF converters ignore (colors come out wrong). The browser is the only
+ * client-side engine that renders mermaid correctly, so each diagram is
+ * rasterized by the browser at high DPI (4×) with the light-theme override and
+ * embedded as a crisp, zoomable image. (Truly-infinite-vector diagrams require
+ * server-side headless Chrome — a separate, heavier path.)
  */
 
-const PDF_VAR_OVERRIDES: Record<string, string> = {
-  '--bg': '#ffffff',
-  '--bg-2': '#ffffff',
-  '--surface': '#ffffff',
-  '--surface-2': '#faf7f2',
-  '--border': '#d8d3cb',
-  '--border-strong': '#c8c2b8',
-  '--fg': '#111111',
-  '--fg-dim': '#333333',
-  '--fg-muted': '#555555',
-  '--accent': '#b25a1f',
-  '--accent-2': '#c87a3f',
-  '--accent-soft': '#f4e7df',
-  '--shadow-lg': 'none',
-  '--glow': 'none',
+const ACCENT = '#b25a1f';
+const FG = '#1c1c1c';
+const FG_DIM = '#3a3a3a';
+const FG_MUTED = '#6b6b6b';
+const RULE = '#d8d3cb';
+const CODE_BG = '#f4f1ec';
+
+const DIAGRAM_RASTER_SCALE = 4;
+// A4 content box in pt with the margins below: 595.28 - 96 ≈ 499 wide,
+// 841.89 - 120 ≈ 722 tall.
+const CONTENT_WIDTH_PT = 499;
+const CONTENT_HEIGHT_PT = 700;
+
+type PdfContent = any; // pdfmake content nodes — kept loose to avoid type churn.
+
+interface DiagramImage {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * Collect rendered mermaid diagrams from the report node in document order and
+ * rasterize each (browser-rendered, light-themed, high DPI) to a PNG data URL,
+ * so the walker can dequeue one per ```mermaid``` token it meets.
+ */
+async function collectDiagramImages(node: HTMLElement | null): Promise<DiagramImage[]> {
+  if (!node) return [];
+  const out: DiagramImage[] = [];
+  const blocks = node.querySelectorAll<HTMLElement>('[data-diagram-id]');
+  for (const block of Array.from(blocks)) {
+    const svg = block.querySelector('svg');
+    if (!svg) continue;
+    const r = await rasterizeSvgToCanvas(svg as unknown as SVGSVGElement, DIAGRAM_RASTER_SCALE);
+    if (!r) continue;
+    out.push({ dataUrl: r.canvas.toDataURL('image/png'), width: r.width, height: r.height });
+  }
+  return out;
+}
+
+/** Map marked inline tokens to pdfmake styled text runs. */
+function inline(tokens: Token[] | undefined, base: Record<string, unknown> = {}): PdfContent[] {
+  if (!tokens) return [];
+  const runs: PdfContent[] = [];
+  for (const t of tokens) {
+    switch (t.type) {
+      case 'text': {
+        const tt = t as Tokens.Text;
+        if (tt.tokens && tt.tokens.length) runs.push(...inline(tt.tokens, base));
+        else runs.push({ text: tt.text, ...base });
+        break;
+      }
+      case 'strong':
+        runs.push(...inline((t as Tokens.Strong).tokens, { ...base, bold: true }));
+        break;
+      case 'em':
+        runs.push(...inline((t as Tokens.Em).tokens, { ...base, italics: true }));
+        break;
+      case 'codespan':
+        runs.push({ text: (t as Tokens.Codespan).text, color: ACCENT, ...base });
+        break;
+      case 'link': {
+        const tt = t as Tokens.Link;
+        const label = tt.tokens && tt.tokens.length ? tt.tokens.map((x) => (x as { text?: string }).text ?? '').join('') : tt.text;
+        runs.push({ text: label || tt.href, link: tt.href, color: ACCENT, decoration: 'underline', ...base });
+        break;
+      }
+      case 'br':
+        runs.push({ text: '\n', ...base });
+        break;
+      case 'del':
+        runs.push(...inline((t as Tokens.Del).tokens, { ...base, decoration: 'lineThrough' }));
+        break;
+      case 'codespan ': // never
+        break;
+      default: {
+        const fb = (t as { text?: string }).text;
+        if (fb) runs.push({ text: fb, ...base });
+      }
+    }
+  }
+  return runs.length ? runs : [{ text: '', ...base }];
+}
+
+const HEADING_STYLE: Record<number, { fontSize: number; color: string; bold: boolean; top: number; bottom: number }> = {
+  1: { fontSize: 22, color: FG, bold: true, top: 4, bottom: 10 },
+  2: { fontSize: 16, color: FG, bold: true, top: 16, bottom: 7 },
+  3: { fontSize: 13, color: ACCENT, bold: true, top: 12, bottom: 5 },
+  4: { fontSize: 11, color: FG_MUTED, bold: true, top: 10, bottom: 4 },
+  5: { fontSize: 10.5, color: FG_MUTED, bold: true, top: 8, bottom: 3 },
+  6: { fontSize: 10, color: FG_MUTED, bold: true, top: 8, bottom: 3 },
 };
 
 /**
- * Wrap is 820px wide with 36px horizontal padding → 748px content area.
- * Force every diagram to fill this width (with a height cap so a tall
- * sequence diagram still fits on one A4 page) and bump the raster scale to
- * 4× so even after the html2canvas snapshot at 2× the embedded image still
- * has > 3× device-pixel ratio when zoomed in a PDF viewer.
+ * Insert zero-width break opportunities so pdfmake can wrap long unbreakable
+ * tokens inside narrow table columns (version strings, scoped package names,
+ * paths, URLs). Without this, one over-wide column pushes the table past the
+ * page width and the rightmost column(s) get clipped in the PDF.
  */
-const SVG_RASTER_SCALE = 4;
-const DIAGRAM_TARGET_WIDTH = 720;
-const DIAGRAM_MAX_HEIGHT = 980;
+function softBreak(s: string): string {
+  const ZWSP = '​';
+  return s
+    .replace(/([/_\-.@:,;\\])/g, `$1${ZWSP}`) // break right after common separators
+    .replace(/(\S{14})(?=\S)/g, `$1${ZWSP}`); // and inside very long unbroken runs
+}
 
-const BREAK_SELECTORS = [
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'p',
-  'li',
-  'tr',
-  'thead',
-  'tbody',
-  'table',
-  'blockquote',
-  'pre',
-  '.diagram-block',
-  'hr',
-  'ul',
-  'ol',
-];
-
-/* Brand palette in jsPDF RGB tuples. */
-const BRAND_ACCENT: [number, number, number] = [178, 90, 31]; // #b25a1f
-const BRAND_ACCENT_SOFT: [number, number, number] = [200, 122, 63]; // #c87a3f
-const TEXT_DARK: [number, number, number] = [17, 17, 17];
-const TEXT_MUTED: [number, number, number] = [110, 110, 110];
-const RULE_LIGHT: [number, number, number] = [216, 211, 203];
-
-const MARGIN = 44;
-const HEADER_BAND = 28;
-const FOOTER_BAND = 28;
-
-/** Replace every <svg> in `root` with a high-DPI <img> using the light theme. */
-async function inlineRasterizeSvgs(root: HTMLElement): Promise<void> {
-  const svgs = Array.from(root.querySelectorAll('svg'));
-  await Promise.all(
-    svgs.map(async (svg) => {
-      const rasterized = await rasterizeSvgToCanvas(svg as SVGSVGElement, SVG_RASTER_SCALE);
-      if (!rasterized) return;
-      const aspect = rasterized.width / rasterized.height;
-      let displayW = DIAGRAM_TARGET_WIDTH;
-      let displayH = displayW / aspect;
-      if (displayH > DIAGRAM_MAX_HEIGHT) {
-        displayH = DIAGRAM_MAX_HEIGHT;
-        displayW = displayH * aspect;
-      }
-      const dataUrl = rasterized.canvas.toDataURL('image/png');
-      const replacement = document.createElement('img');
-      replacement.src = dataUrl;
-      replacement.style.width = `${Math.round(displayW)}px`;
-      replacement.style.height = `${Math.round(displayH)}px`;
-      replacement.style.display = 'block';
-      replacement.style.maxWidth = '100%';
-      replacement.style.margin = '12px auto';
-      replacement.style.background = '#ffffff';
-      replacement.style.border = '1px solid #d8d3cb';
-      replacement.style.padding = '8px';
-      replacement.style.boxSizing = 'border-box';
-      await new Promise<void>((resolve) => {
-        replacement.onload = () => resolve();
-        replacement.onerror = () => resolve();
-      });
-      svg.replaceWith(replacement);
-    }),
+function softBreakRuns(runs: PdfContent[]): PdfContent[] {
+  return runs.map((r) =>
+    r && typeof r.text === 'string' ? { ...r, text: softBreak(r.text) } : r,
   );
 }
 
-/** Break-point Y offsets relative to `root`, in CSS pixels, sorted ascending. */
-function collectBreakPoints(root: HTMLElement): number[] {
-  const rootTop = root.getBoundingClientRect().top;
-  const points = new Set<number>([0]);
-  for (const sel of BREAK_SELECTORS) {
-    const list = root.querySelectorAll(sel);
-    for (const el of Array.from(list)) {
-      const r = (el as HTMLElement).getBoundingClientRect();
-      points.add(Math.max(0, Math.round(r.top - rootTop)));
-      points.add(Math.max(0, Math.round(r.top + r.height - rootTop)));
+function tableCell(tokens: Token[] | undefined, header: boolean): PdfContent {
+  return {
+    text: softBreakRuns(inline(tokens, header ? { bold: true } : {})),
+    fillColor: header ? '#efe9e2' : undefined,
+    margin: [3, 2, 3, 2],
+    fontSize: 8,
+  };
+}
+
+function listItems(list: Tokens.List, images: DiagramImage[], idx: { i: number }): PdfContent[] {
+  return list.items.map((item) => {
+    const inlineToks: Token[] = [];
+    const blockToks: Token[] = [];
+    for (const child of item.tokens || []) {
+      if (['list', 'table', 'code', 'blockquote', 'heading', 'space', 'hr'].includes(child.type)) blockToks.push(child);
+      else if (child.type === 'text' && (child as Tokens.Text).tokens) inlineToks.push(...((child as Tokens.Text).tokens || []));
+      else if (child.type === 'paragraph') inlineToks.push(...((child as Tokens.Paragraph).tokens || []));
+      else inlineToks.push(child);
+    }
+    const lead: PdfContent = { text: inline(inlineToks) };
+    if (!blockToks.length) return lead;
+    return { stack: [lead, ...walk(blockToks, images, idx)] };
+  });
+}
+
+function walk(tokens: Token[], images: DiagramImage[], idx: { i: number }): PdfContent[] {
+  const out: PdfContent[] = [];
+  for (const tok of tokens) {
+    switch (tok.type) {
+      case 'heading': {
+        const t = tok as Tokens.Heading;
+        const s = HEADING_STYLE[t.depth] || HEADING_STYLE[6];
+        out.push({
+          text: inline(t.tokens),
+          fontSize: s.fontSize,
+          bold: s.bold,
+          color: s.color,
+          margin: [0, s.top, 0, s.bottom],
+        });
+        break;
+      }
+      case 'paragraph':
+        out.push({ text: inline((tok as Tokens.Paragraph).tokens), margin: [0, 0, 0, 8], lineHeight: 1.3 });
+        break;
+      case 'blockquote':
+        out.push({
+          margin: [0, 4, 0, 10],
+          table: {
+            widths: [3, '*'],
+            body: [[
+              { text: '', fillColor: ACCENT },
+              { stack: walk((tok as Tokens.Blockquote).tokens, images, idx), margin: [8, 4, 4, 4], color: FG_DIM, italics: true },
+            ]],
+          },
+          layout: 'noBorders',
+        });
+        break;
+      case 'list': {
+        const t = tok as Tokens.List;
+        const items = listItems(t, images, idx);
+        out.push({ [t.ordered ? 'ol' : 'ul']: items, margin: [4, 0, 0, 8], lineHeight: 1.25 } as PdfContent);
+        break;
+      }
+      case 'code': {
+        const t = tok as Tokens.Code;
+        const lang = (t.lang ?? '').trim().split(/\s+/)[0];
+        if (lang === 'mermaid' || lang === 'ascii') {
+          const img = images[idx.i++];
+          if (img) {
+            const aspect = img.width / img.height || 1;
+            let w = Math.min(CONTENT_WIDTH_PT, img.width);
+            if (w / aspect > CONTENT_HEIGHT_PT) w = CONTENT_HEIGHT_PT * aspect;
+            out.push({ image: img.dataUrl, width: w, alignment: 'center', margin: [0, 6, 0, 12] });
+            break;
+          }
+          // No rendered image (failed diagram): fall through to source text.
+        }
+        out.push({
+          text: t.text,
+          fontSize: 8.5,
+          color: FG_DIM,
+          preserveLeadingSpaces: true,
+          fillColor: CODE_BG,
+          margin: [0, 4, 0, 10],
+        });
+        break;
+      }
+      case 'table': {
+        const t = tok as Tokens.Table;
+        const body: PdfContent[][] = [];
+        body.push(t.header.map((h) => tableCell(h.tokens, true)));
+        for (const row of t.rows) body.push(row.map((c) => tableCell(c.tokens, false)));
+        out.push({
+          table: { headerRows: 1, widths: t.header.map(() => '*'), body, dontBreakRows: true },
+          layout: {
+            hLineWidth: () => 0.5,
+            vLineWidth: () => 0.5,
+            hLineColor: () => RULE,
+            vLineColor: () => RULE,
+          },
+          margin: [0, 4, 0, 12],
+          fontSize: 9,
+        });
+        break;
+      }
+      case 'hr':
+        out.push({ canvas: [{ type: 'line', x1: 0, y1: 0, x2: CONTENT_WIDTH_PT, y2: 0, lineWidth: 0.5, lineColor: RULE }], margin: [0, 8, 0, 12] });
+        break;
+      case 'space':
+        break;
+      default: {
+        const fb = (tok as { text?: string }).text;
+        if (fb && fb.trim()) out.push({ text: fb, margin: [0, 0, 0, 8] });
+      }
     }
   }
-  points.add(root.scrollHeight);
-  return Array.from(points).sort((a, b) => a - b);
+  return out;
 }
 
-function drawCoverPage(
-  pdf: import('jspdf').jsPDF,
-  title: string,
-  pageWidth: number,
-  pageHeight: number,
-): void {
-  // Top accent bar
-  pdf.setFillColor(...BRAND_ACCENT);
-  pdf.rect(0, 0, pageWidth, 6, 'F');
-
-  // Brand mark
-  pdf.setFont('helvetica', 'bold');
-  pdf.setFontSize(11);
-  pdf.setTextColor(...BRAND_ACCENT);
-  pdf.text('ALIGNIQ', MARGIN, 56);
-
-  // Document type label
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(8.5);
-  pdf.setTextColor(...TEXT_MUTED);
-  pdf.text('TECHNICAL ANALYSIS REPORT', MARGIN, 70);
-
-  // Centered title block
-  const titleY = pageHeight / 2 - 60;
-  pdf.setDrawColor(...BRAND_ACCENT);
-  pdf.setLineWidth(2);
-  pdf.line(MARGIN, titleY - 24, MARGIN + 60, titleY - 24);
-
-  pdf.setFont('helvetica', 'bold');
-  pdf.setFontSize(28);
-  pdf.setTextColor(...TEXT_DARK);
-  const titleLines = pdf.splitTextToSize(title || 'Project Report', pageWidth - MARGIN * 2);
-  pdf.text(titleLines, MARGIN, titleY);
-
-  // Subhead
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(11);
-  pdf.setTextColor(...TEXT_MUTED);
-  pdf.text(
-    'Generated by the AlignIQ multi-agent analysis pipeline.',
-    MARGIN,
-    titleY + (titleLines.length * 30) + 14,
-  );
-
-  // Footer block
-  pdf.setDrawColor(...RULE_LIGHT);
-  pdf.setLineWidth(0.5);
-  pdf.line(MARGIN, pageHeight - 90, pageWidth - MARGIN, pageHeight - 90);
-
-  const date = new Date().toLocaleDateString('en-US', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-  pdf.setFont('helvetica', 'bold');
-  pdf.setFontSize(8.5);
-  pdf.setTextColor(...TEXT_MUTED);
-  pdf.text('GENERATED', MARGIN, pageHeight - 70);
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(11);
-  pdf.setTextColor(...TEXT_DARK);
-  pdf.text(date, MARGIN, pageHeight - 54);
-
-  pdf.setFont('helvetica', 'bold');
-  pdf.setFontSize(8.5);
-  pdf.setTextColor(...TEXT_MUTED);
-  pdf.text('CLASSIFICATION', pageWidth / 2, pageHeight - 70);
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(11);
-  pdf.setTextColor(...TEXT_DARK);
-  pdf.text('Internal · Client-shareable', pageWidth / 2, pageHeight - 54);
-
-  // Bottom accent bar
-  pdf.setFillColor(...BRAND_ACCENT);
-  pdf.rect(0, pageHeight - 6, pageWidth, 6, 'F');
+function coverPage(title: string): PdfContent {
+  const date = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  return {
+    stack: [
+      { text: 'ALIGNIQ', color: ACCENT, bold: true, fontSize: 12, margin: [0, 120, 0, 0] },
+      { text: 'TECHNICAL ANALYSIS REPORT', color: FG_MUTED, fontSize: 9, characterSpacing: 1, margin: [0, 6, 0, 36] },
+      { canvas: [{ type: 'line', x1: 0, y1: 0, x2: 60, y2: 0, lineWidth: 2, lineColor: ACCENT }], margin: [0, 0, 0, 18] },
+      { text: title, fontSize: 27, bold: true, color: FG, margin: [0, 0, 0, 14] },
+      { text: 'Generated by the AlignIQ multi-agent analysis pipeline.', color: FG_MUTED, fontSize: 11 },
+      { text: `Generated ${date}`, color: FG_MUTED, fontSize: 9, margin: [0, 36, 0, 0] },
+    ],
+    pageBreak: 'after',
+  };
 }
 
-function drawPageChrome(
-  pdf: import('jspdf').jsPDF,
-  pageNum: number,
-  totalContentPages: number,
-  title: string,
-  pageWidth: number,
-  pageHeight: number,
-): void {
-  // Top brand band
-  pdf.setFillColor(...BRAND_ACCENT);
-  pdf.rect(0, 0, pageWidth, 3, 'F');
-  pdf.setFont('helvetica', 'bold');
-  pdf.setFontSize(8);
-  pdf.setTextColor(...BRAND_ACCENT);
-  pdf.text('ALIGNIQ', MARGIN, 18);
-
-  // Top right: truncated title
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(8);
-  pdf.setTextColor(...TEXT_MUTED);
-  const trunc = title.length > 70 ? `${title.slice(0, 70)}…` : title;
-  pdf.text(trunc, pageWidth - MARGIN, 18, { align: 'right' });
-
-  pdf.setDrawColor(...RULE_LIGHT);
-  pdf.setLineWidth(0.4);
-  pdf.line(MARGIN, 24, pageWidth - MARGIN, 24);
-
-  // Footer
-  pdf.line(MARGIN, pageHeight - 26, pageWidth - MARGIN, pageHeight - 26);
-  pdf.setFont('helvetica', 'normal');
-  pdf.setFontSize(8);
-  pdf.setTextColor(...TEXT_MUTED);
-  pdf.text('AlignIQ · Generated Report', MARGIN, pageHeight - 14);
-  pdf.setFont('helvetica', 'bold');
-  pdf.setTextColor(...BRAND_ACCENT_SOFT);
-  pdf.text(`${pageNum} / ${totalContentPages}`, pageWidth - MARGIN, pageHeight - 14, {
-    align: 'right',
-  });
-}
-
-export async function exportNodeToPdf(
-  node: HTMLElement,
+export async function exportMarkdownToPdf(
+  markdown: string,
   filename: string,
-  opts: { title?: string } = {},
+  opts: { title?: string; node?: HTMLElement | null } = {},
 ): Promise<void> {
-  const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
-    import('html2canvas'),
-    import('jspdf'),
+  const title = opts.title?.trim() || 'Project Report';
+
+  const [pdfMakeMod, vfsMod] = await Promise.all([
+    import('pdfmake/build/pdfmake'),
+    import('pdfmake/build/vfs_fonts'),
   ]);
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const pdfMake: any = (pdfMakeMod as any).default ?? pdfMakeMod;
 
-  const wrap = document.createElement('div');
-  wrap.className = 'pdf-export-root';
-  wrap.style.cssText =
-    'position: fixed; left: -10000px; top: 0; width: 820px; background: #ffffff; color: #111111; padding: 24px 36px; z-index: -1;';
-  for (const [name, value] of Object.entries(PDF_VAR_OVERRIDES)) {
-    wrap.style.setProperty(name, value, 'important');
-  }
-  wrap.appendChild(node.cloneNode(true));
-  document.body.appendChild(wrap);
-
-  try {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    await inlineRasterizeSvgs(wrap);
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-
-    const breakPointsCss = collectBreakPoints(wrap);
-
-    const snapshotScale = 2;
-    const canvas = await html2canvas(wrap, {
-      scale: snapshotScale,
-      useCORS: true,
-      logging: false,
-      backgroundColor: '#ffffff',
-    });
-
-    const cssToCanvasY = canvas.height / wrap.offsetHeight;
-    const breakPointsCanvas = breakPointsCss
-      .map((y) => Math.round(y * cssToCanvasY))
-      .filter((y) => y >= 0 && y <= canvas.height);
-    if (!breakPointsCanvas.includes(canvas.height)) breakPointsCanvas.push(canvas.height);
-
-    const pdf = new jsPDF({ unit: 'pt', format: 'a4', orientation: 'portrait' });
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    const title = opts.title?.trim() || 'Project Report';
-
-    // Cover page first.
-    drawCoverPage(pdf, title, pageWidth, pageHeight);
-
-    const contentTop = HEADER_BAND + 8;
-    const contentBottom = pageHeight - FOOTER_BAND - 8;
-    const contentHeight = contentBottom - contentTop;
-    const contentWidth = pageWidth - MARGIN * 2;
-    const imgWidth = contentWidth;
-    const maxSliceHeightPx = contentHeight * (canvas.width / contentWidth);
-
-    let renderedPx = 0;
-    const contentPageStarts: number[] = [];
-    while (renderedPx < canvas.height) {
-      const target = renderedPx + maxSliceHeightPx;
-      let sliceEnd = renderedPx;
-      for (const bp of breakPointsCanvas) {
-        if (bp > renderedPx && bp <= target && bp > sliceEnd) sliceEnd = bp;
+  // Locate the {filename: base64} font map regardless of how the bundler exposed
+  // the module (0.2.x nested it under .pdfMake.vfs; 0.3.x exports the map itself;
+  // ESM interop may wrap it under .default).
+  // Must check the VALUE is real base64 data, not just that a *.ttf key exists:
+  // Vite's CJS interop can expose the namespace with .ttf keys whose values are
+  // undefined (the real data lives on .default), which would make pdfmake do
+  // Buffer.from(undefined) → "first argument must be ... Received type undefined".
+  const findVfs = (m: any): any => {
+    for (const c of [m?.default, m, m?.vfs, m?.default?.vfs, m?.pdfMake?.vfs, m?.default?.pdfMake?.vfs]) {
+      if (
+        c &&
+        typeof c === 'object' &&
+        Object.entries(c).some(
+          ([k, val]) => k.toLowerCase().endsWith('.ttf') && typeof val === 'string' && val.length > 100,
+        )
+      ) {
+        return c;
       }
-      if (sliceEnd === renderedPx) {
-        sliceEnd = Math.min(target, canvas.height);
-      }
-      const sliceHeight = Math.max(1, sliceEnd - renderedPx);
-
-      const sliceCanvas = document.createElement('canvas');
-      sliceCanvas.width = canvas.width;
-      sliceCanvas.height = sliceHeight;
-      const ctx = sliceCanvas.getContext('2d');
-      if (!ctx) break;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, sliceCanvas.width, sliceCanvas.height);
-      ctx.drawImage(
-        canvas,
-        0,
-        renderedPx,
-        canvas.width,
-        sliceHeight,
-        0,
-        0,
-        sliceCanvas.width,
-        sliceCanvas.height,
-      );
-      const dataUrl = sliceCanvas.toDataURL('image/jpeg', 0.94);
-      pdf.addPage();
-      const sliceHeightPt = (sliceHeight * imgWidth) / canvas.width;
-      pdf.addImage(dataUrl, 'JPEG', MARGIN, contentTop, imgWidth, sliceHeightPt);
-      contentPageStarts.push(renderedPx);
-      renderedPx = sliceEnd;
     }
-
-    // Apply chrome to content pages now that we know the total.
-    const totalContentPages = contentPageStarts.length;
-    for (let i = 0; i < totalContentPages; i++) {
-      pdf.setPage(2 + i); // page 1 = cover
-      drawPageChrome(pdf, i + 1, totalContentPages, title, pageWidth, pageHeight);
-    }
-
-    pdf.save(filename);
-  } finally {
-    wrap.remove();
+    return undefined;
+  };
+  const vfs = findVfs(vfsMod);
+  // 0.3.x browser API is addVirtualFileSystem(); .vfs is the 0.2.x fallback.
+  if (vfs) {
+    if (typeof pdfMake.addVirtualFileSystem === 'function') pdfMake.addVirtualFileSystem(vfs);
+    pdfMake.vfs = vfs;
   }
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  const images = await collectDiagramImages(opts.node ?? null);
+  const tokens = marked.lexer(wrapAsciiArt(normalizeDiagramFences(markdown)));
+  const body = walk(tokens, images, { i: 0 });
+
+  const docDefinition: PdfContent = {
+    pageSize: 'A4',
+    pageMargins: [48, 54, 48, 48],
+    info: { title, creator: 'AlignIQ' },
+    defaultStyle: { fontSize: 10.5, color: FG, lineHeight: 1.25 },
+    content: [coverPage(title), ...body],
+    footer: (currentPage: number, pageCount: number): PdfContent => {
+      if (currentPage === 1) return null;
+      return {
+        margin: [48, 12, 48, 0],
+        columns: [
+          { text: 'AlignIQ · Generated Report', fontSize: 8, color: FG_MUTED },
+          { text: `${currentPage - 1} / ${pageCount - 1}`, fontSize: 8, color: ACCENT, alignment: 'right' },
+        ],
+      };
+    },
+    header: (currentPage: number): PdfContent => {
+      if (currentPage === 1) return null;
+      return {
+        margin: [48, 18, 48, 0],
+        columns: [
+          { text: 'ALIGNIQ', fontSize: 8, bold: true, color: ACCENT },
+          { text: title.length > 70 ? `${title.slice(0, 70)}…` : title, fontSize: 8, color: FG_MUTED, alignment: 'right' },
+        ],
+      };
+    },
+  };
+
+  // pdfmake 0.3.x download() returns a Promise; 0.2.x returns undefined and
+  // triggers the download synchronously. Await only when it's thenable.
+  const ret = pdfMake.createPdf(docDefinition).download(filename);
+  if (ret && typeof ret.then === 'function') await ret;
 }

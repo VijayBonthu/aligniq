@@ -1,13 +1,15 @@
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Depends, Request
 import uvicorn
 from dotenv import load_dotenv
 import models
 from models import engine
 from fastapi.middleware.cors import CORSMiddleware
-from routers import authentication, services, third_party_integrations, billing
+from routers import authentication, services, third_party_integrations, billing, firm_admin
 from utils.logger import setup_logger
-from utils.rate_limit import lifespan
+from utils.rate_limit import lifespan as rate_limit_lifespan
 from utils.middleware import CSRFMiddleware, RateLimitMiddleware
 
 # Setup logging once at application startup
@@ -16,6 +18,56 @@ logger = setup_logger()
 load_dotenv()
 
 models.Base.metadata.create_all(bind=engine)
+
+
+# Threshold for reaping stuck `running` pipeline_runs after a backend restart.
+# Must exceed `PIPELINE_TIMEOUT` so a healthy long-running row on another worker
+# is never stolen. 30 min is the safe ceiling for current pipeline durations.
+_STUCK_RUN_THRESHOLD_MINUTES = 30
+_RESTART_RECOVERY_MSG = (
+    "Backend restarted before this run completed — click Retry to resume from last checkpoint."
+)
+
+
+def _reconcile_stuck_pipeline_runs() -> None:
+    """Flip pipeline_runs left in 'running' across a backend restart to 'failed'.
+
+    BackgroundTasks die with the worker process, so any row still marked
+    `running` after our threshold is orphaned. Idempotent across multi-worker
+    startups: the first worker flips eligible rows; subsequent workers find none.
+    Healthy mid-flight rows on other workers are protected by the threshold.
+    """
+    db = models.sessionlocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=_STUCK_RUN_THRESHOLD_MINUTES)
+        stuck = (
+            db.query(models.PipelineRun)
+            .filter(models.PipelineRun.status == models.PipelineRunStatus.RUNNING)
+            .filter(models.PipelineRun.started_at < cutoff)
+            .all()
+        )
+        if not stuck:
+            return
+        now = datetime.now(timezone.utc)
+        for run in stuck:
+            run.status = models.PipelineRunStatus.FAILED
+            run.error = _RESTART_RECOVERY_MSG
+            run.completed_at = now
+        db.commit()
+        logger.info(f"Reconciled {len(stuck)} stuck pipeline run(s) on startup")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Pipeline run reconciliation failed: {e}")
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _reconcile_stuck_pipeline_runs()
+    async with rate_limit_lifespan(app):
+        yield
+
 
 app = FastAPI(lifespan=lifespan)
 # app = FastAPI()
@@ -28,6 +80,7 @@ _default_local_origins = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:5173",
+    "http://192.168.2.26:3001",
     "https://staging.grounded-iq.com",
 ]
 _env_origins = os.getenv("CORS_ORIGINS", "")
@@ -54,6 +107,7 @@ app.include_router(authentication.router, prefix="/api/v1", tags=["authenticatio
 app.include_router(services.router, prefix="/api/v1", tags=["services"])
 app.include_router(third_party_integrations.router, prefix="/api/v1", tags=["third party integrations"])
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
+app.include_router(firm_admin.router, prefix="/api/v1", tags=["firm"])
 
 @app.get("/")
 async def home():

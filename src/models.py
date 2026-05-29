@@ -74,6 +74,9 @@ class User(Base):
     subscription_status     = Column(String(50), nullable=False, server_default=text("'active'"))
     stripe_subscription_id  = Column(String, nullable=True)
     subscription_period_end = Column(TIMESTAMP(timezone=True), nullable=True)
+    # Firm membership (migration 019, Bet 3)
+    firm_id                 = Column(String, ForeignKey("firms.firm_id"), nullable=True, index=True)
+    firm_role               = Column(String(32), nullable=True)  # 'firm_admin' | 'member'
 
 class LoginDetails(Base):
     __tablename__="login_details"
@@ -146,6 +149,7 @@ class ReportVersions(Base):
     report_content = Column(String, nullable=False)
     summary_report = Column(JSON, nullable=False)
     pending_changes = Column(JSON, nullable=True, default=[])  # Track modifications before regeneration
+    report_contract = Column(JSON, nullable=True, default=None)  # Structured ReportContract (contract pipeline); NULL for legacy runs
     schema_version = Column(String, nullable=False, default="1.0")  # For future migrations
     is_default = Column(Boolean, nullable=False, default=True, index=True)  # Mark as default/recommended version
     # Changelog tracking fields
@@ -540,6 +544,10 @@ class PipelineRun(Base):
     started_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     completed_at     = Column(TIMESTAMP(timezone=True), nullable=True)
 
+    # Bet 2.C — resumable pipeline. NULL on legacy runs.
+    state_snapshot      = Column(JSON, nullable=True)
+    last_completed_node = Column(String(64), nullable=True)
+
 
 class TransactionHistory(Base):
     """
@@ -611,3 +619,87 @@ class LLMCallLog(Base):
 
     created_at          = Column(TIMESTAMP(timezone=True), nullable=False,
                                  server_default=text("now()"))
+
+
+# ============================================================================
+# FIRM CONTEXT MODELS (Bet 3 - migration 019)
+# ============================================================================
+
+class Firm(Base):
+    """A consultancy/firm. Tenant boundary for rate cards, templates, past projects."""
+    __tablename__ = "firms"
+
+    firm_id        = Column(String, primary_key=True, nullable=False, index=True,
+                            default=lambda: "firm_" + uuid.uuid4().hex)
+    name           = Column(String(255), nullable=False)
+    logo_url       = Column(Text, nullable=True)
+    primary_color  = Column(String(7), nullable=True)  # '#RRGGBB' for Bet 4 branded exports
+    created_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"),
+                            onupdate=text("now()"))
+
+
+class FirmRateCard(Base):
+    __tablename__ = "firm_rate_cards"
+
+    rate_id          = Column(String, primary_key=True, nullable=False, index=True,
+                              default=lambda: str(uuid.uuid4()))
+    firm_id          = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
+                              nullable=False, index=True)
+    role             = Column(String(64), nullable=False)
+    seniority        = Column(String(32), nullable=False)
+    region           = Column(String(32), nullable=False)
+    hourly_rate_usd  = Column(Float, nullable=False)
+    version          = Column(Integer, nullable=False, default=1)
+    active           = Column(Boolean, nullable=False, default=True)
+    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
+class FirmTeamTemplate(Base):
+    __tablename__ = "firm_team_templates"
+
+    template_id     = Column(String, primary_key=True, nullable=False, index=True,
+                             default=lambda: str(uuid.uuid4()))
+    firm_id         = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
+                             nullable=False, index=True)
+    template_name   = Column(String(128), nullable=False)
+    engagement_type = Column(String(64), nullable=True)
+    roles           = Column(JSON, nullable=False)   # [{role, seniority, count, allocation_pct}]
+    notes           = Column(Text, nullable=True)
+    active          = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
+class FirmTechPreference(Base):
+    __tablename__ = "firm_tech_preferences"
+
+    pref_id        = Column(String, primary_key=True, nullable=False, index=True,
+                            default=lambda: str(uuid.uuid4()))
+    firm_id        = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
+                            nullable=False, index=True)
+    category       = Column(String(64), nullable=False)
+    preferred      = Column(JSON, nullable=False)         # ['AWS', 'GCP']
+    anti_preferred = Column(JSON, nullable=True)          # ['Azure']
+    rationale      = Column(Text, nullable=True)
+    created_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
+class FirmPastProject(Base):
+    __tablename__ = "firm_past_projects"
+
+    project_id              = Column(String, primary_key=True, nullable=False, index=True,
+                                     default=lambda: str(uuid.uuid4()))
+    firm_id                 = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
+                                     nullable=False, index=True)
+    project_name            = Column(String(255), nullable=False)
+    client_name             = Column(String(255), nullable=True)
+    engagement_type         = Column(String(64), nullable=True)
+    start_date              = Column(DateTime(timezone=True), nullable=True)
+    end_date                = Column(DateTime(timezone=True), nullable=True)
+    summary                 = Column(Text, nullable=True)
+    original_brief_md       = Column(Text, nullable=True)
+    final_report_md         = Column(Text, nullable=True)
+    retrospective_md        = Column(Text, nullable=True)
+    effort_estimated_weeks  = Column(Float, nullable=True)
+    effort_actual_weeks     = Column(Float, nullable=True)
+    created_at              = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))

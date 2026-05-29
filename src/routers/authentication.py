@@ -71,7 +71,9 @@ async def callback(request: Request, db:Session=Depends(get_db)):
         "verified_email":user.verified_email,
         "picture": user.picture,
         "provider": user.provider,
-        "email":user.email_address
+        "email":user.email_address,
+        "firm_id": user.firm_id,
+        "firm_role": user.firm_role,
     }
     token = create_token(user_data=payload)
     refresh_token_val = create_refresh_token(user_id=user.user_id, db=db)
@@ -135,7 +137,9 @@ async def create_account(user_details:Registration_login_password, db:Session=De
         "verified_email":user.verified_email,
         "picture": user.picture,
         "provider": user.provider,
-        "email":user.email_address
+        "email":user.email_address,
+        "firm_id": user.firm_id,
+        "firm_role": user.firm_role,
     }
 
     token = create_token(user_data=payload)
@@ -154,11 +158,15 @@ def log_into_account(login_details:login_details, db:Session=Depends(get_db)):
 
     checked_password = verify_password(password=login_details.password,hashed_password=user_details[6])
     if checked_password:
+        # Fetch the full User row so we can include firm fields in the JWT (Bet 3).
+        u = db.query(User).filter(User.user_id == user_details[1]).first()
         payload= {
             "id": user_details[1],
             "verified_email":user_details[4],
             "provider": user_details[5],
             "email":user_details[0],
+            "firm_id": u.firm_id if u else None,
+            "firm_role": u.firm_role if u else None,
         }
         token = create_token(user_data=payload)
         refresh_token_val = create_refresh_token(user_id=user_details[1], db=db)
@@ -306,7 +314,9 @@ async def refresh_access_token(request_body: RefreshTokenRequest, db: Session = 
         "verified_email": user.verified_email,
         "picture": user.picture,
         "provider": user.provider,
-        "email": user.email_address
+        "email": user.email_address,
+        "firm_id": user.firm_id,
+        "firm_role": user.firm_role,
     }
     new_access_token = create_token(user_data=payload)
     new_refresh_token = rotate_refresh_token(request_body.refresh_token, user_id, db)

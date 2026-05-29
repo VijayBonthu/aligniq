@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { toast } from 'react-hot-toast';
-import { exportNodeToPdf } from '../../utils/exportPdf';
+import { exportMarkdownToPdf } from '../../utils/exportPdf';
 import { exportMarkdownToDocx } from '../../utils/exportDocx';
 
 interface Props {
@@ -18,18 +18,30 @@ function safeFilename(stem: string): string {
   return (stem || 'report').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
 }
 
+/**
+ * Mermaid diagrams render asynchronously into the live DOM. Both exporters
+ * read that DOM (PDF clones it, DOCX rasterizes the rendered SVGs), so wait
+ * until no diagram is still in its loading state before snapshotting —
+ * otherwise diagrams come out missing or, for DOCX, shifted out of position.
+ * Bounded so a permanently-stuck diagram can't block the download forever.
+ */
+async function waitForDiagrams(node: HTMLElement, timeoutMs = 6000): Promise<void> {
+  const start = Date.now();
+  while (node.querySelectorAll('.diagram-block--loading').length > 0) {
+    if (Date.now() - start > timeoutMs) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 export default function ReportToolbar({ getReportNode, markdown, title, trailing }: Props) {
   const [busy, setBusy] = useState<'pdf' | 'docx' | null>(null);
 
   const handlePdf = async () => {
     const node = getReportNode();
-    if (!node) {
-      toast.error('Nothing to export.');
-      return;
-    }
     setBusy('pdf');
     try {
-      await exportNodeToPdf(node, `${safeFilename(title)}.pdf`, { title });
+      if (node) await waitForDiagrams(node);
+      await exportMarkdownToPdf(markdown, `${safeFilename(title)}.pdf`, { title, node });
     } catch (err) {
       console.error(err);
       toast.error('PDF export failed.');
@@ -39,9 +51,11 @@ export default function ReportToolbar({ getReportNode, markdown, title, trailing
   };
 
   const handleDocx = async () => {
+    const node = getReportNode();
     setBusy('docx');
     try {
-      await exportMarkdownToDocx(markdown, `${safeFilename(title)}.docx`, { title });
+      if (node) await waitForDiagrams(node);
+      await exportMarkdownToDocx(markdown, `${safeFilename(title)}.docx`, { title, node });
     } catch (err) {
       console.error(err);
       toast.error('DOCX export failed.');

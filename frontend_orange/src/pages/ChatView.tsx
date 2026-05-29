@@ -96,6 +96,13 @@ export default function ChatView() {
           return;
         }
 
+        // Failed / cancelled: /full-pipeline owns the Retry/Resume surface.
+        // Bounce there instead of falling into the wizard via analysis_mode.
+        if (details.pipeline_status === 'failed' || details.pipeline_status === 'cancelled') {
+          navigate(`/full-pipeline/${chatHistoryId}`, { replace: true });
+          return;
+        }
+
         if (details.analysis_mode === 'presales') {
           // Project is still in presales — bounce to wizard.
           navigate(`/new-project/${chatHistoryId}`, { replace: true });

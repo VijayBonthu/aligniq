@@ -6,10 +6,28 @@ These tools enable the LLM to directly interact with pending changes,
 document search, and report operations.
 """
 
+from contextvars import ContextVar
 from langchain_core.tools import tool
 from typing import List, Optional, Any
 import json
 from utils.logger import logger
+
+
+# Bet 3 — firm_id context for `firm_project_search`. Set by pipeline_runner.py
+# (or any caller that binds the tool) BEFORE the agent runs; the tool reads from
+# this contextvar so the LLM cannot influence tenant scope by passing
+# untrusted args. Empty/None means no firm scope → tool returns empty.
+_firm_id_ctx: ContextVar[Optional[str]] = ContextVar("aligniq_firm_id", default=None)
+
+
+def set_firm_id_context(firm_id: Optional[str]):
+    """Set the firm_id contextvar for the current async task. Returns the token
+    so the caller can `_firm_id_ctx.reset(token)` after the agent run."""
+    return _firm_id_ctx.set(firm_id)
+
+
+def get_firm_id_context() -> Optional[str]:
+    return _firm_id_ctx.get()
 
 
 # ============= CONTEXT HOLDER =============
@@ -2349,3 +2367,37 @@ After providing any optimization suggestion, ask:
 4. **Be Honest**: If you don't know or can't do something, say so clearly
 5. **Report-Grounded**: Always retrieve from report/document before answering project questions
 """
+
+
+# ============= FIRM CONTEXT TOOLS (Bet 3) =============
+
+@tool
+async def firm_project_search(query: str, max_results: int = 3) -> str:
+    """
+    Search this firm's past delivered projects for evidence relevant to the
+    current engagement. Use this to ground architecture choices and effort
+    estimates in the firm's actual delivery history (effort variance,
+    technology trade-offs, retrospective lessons). Prefer focused queries
+    such as "real-time chat scaling lessons" or "Azure HIPAA compliance gaps"
+    over generic vendor names.
+
+    Args:
+        query: Natural-language search query against past-project briefs,
+               final reports, and retrospectives.
+        max_results: Maximum number of matching project chunks to return
+                     (default 3, capped at 5).
+
+    Returns: JSON string with {"hits": [...]} where each hit has project_id,
+    project_name, engagement_type, snippet, score. Empty list means no
+    relevant past projects in the firm's portfolio.
+    """
+    firm_id = get_firm_id_context()
+    if not firm_id:
+        return json.dumps({"hits": [], "note": "no firm context bound"})
+    try:
+        from vectordb.firm_projects import search_firm_projects
+        hits = await search_firm_projects(firm_id, query, k=min(max_results, 5))
+        return json.dumps({"hits": hits})
+    except Exception as e:
+        logger.warning(f"firm_project_search failed: {e}")
+        return json.dumps({"hits": [], "error": str(e)})

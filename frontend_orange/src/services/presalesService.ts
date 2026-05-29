@@ -5,7 +5,21 @@ export async function getQuestions(presalesId: string) {
   return data;
 }
 
-export async function saveAnswers(presalesId: string, answers: Record<string, string>) {
+export interface AnswerSubmission {
+  question_id: string;
+  answer: string;
+}
+
+/**
+ * Submit answers keyed by `question_id` (F6). Backend validates every id
+ * belongs to this presales_id and 422s on unknown ids. The previous
+ * positional-key shape (`p1_0`, `question_0`) is still accepted server-side
+ * during one deploy cycle for safety, but new callers must use this shape.
+ */
+export async function saveAnswers(
+  presalesId: string,
+  answers: AnswerSubmission[],
+) {
   const form = new FormData();
   form.append('answers', JSON.stringify(answers));
   const { data } = await api.post(

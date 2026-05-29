@@ -18,6 +18,13 @@ import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
 import AppShell from './components/layout/AppShell';
 import UpgradeModal from './components/billing/UpgradeModal';
+import FirmAdminRoute from './components/auth/FirmAdminRoute';
+import FirmSettings from './pages/firm/FirmSettings';
+import RateCardPage from './pages/firm/RateCard';
+import TeamTemplatesPage from './pages/firm/TeamTemplates';
+import TechPreferencesPage from './pages/firm/TechPreferences';
+import PastProjectsPage from './pages/firm/PastProjects';
+import PastProjectEditor from './pages/firm/PastProjectEditor';
 
 function BgLayers() {
   const { pathname } = useLocation();
@@ -31,6 +38,7 @@ function BgLayers() {
     pathname.startsWith('/messages') ||
     pathname.startsWith('/reports') ||
     pathname.startsWith('/settings') ||
+    pathname.startsWith('/firm') ||
     pathname.startsWith('/pricing')
   )
     return null;
@@ -208,6 +216,76 @@ function App() {
                 <ProtectedRoute>
                   <Dashboard />
                 </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/firm/settings"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <FirmSettings />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/rate-cards"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <RateCardPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/team-templates"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <TeamTemplatesPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/tech-preferences"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <TechPreferencesPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectsPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects/new"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectEditor />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects/:projectId"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectEditor />
+                  </AppShell>
+                </FirmAdminRoute>
               }
             />
             <Route path="*" element={<Navigate to="/" replace />} />

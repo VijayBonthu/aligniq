@@ -100,8 +100,12 @@ export default function ProjectCard({ project, delay = 0 }: Props) {
     <div
       onClick={() => {
         const ps = project.pipeline_status;
-        const isPipelineLive = ps === 'running' || ps === 'queued';
-        const dest = isPipelineLive
+        // A pipeline_runs row exists in any of these states; /full-pipeline
+        // owns the surface (live progress for queued/running, Retry/Resume
+        // for failed/cancelled).
+        const sendToPipeline =
+          ps === 'queued' || ps === 'running' || ps === 'failed' || ps === 'cancelled';
+        const dest = sendToPipeline
           ? `/full-pipeline/${project.chat_history_id}`
           : project.full_report_generated && project.chat_history_id
           ? `/chat/${project.chat_history_id}`

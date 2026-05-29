@@ -66,5 +66,34 @@ class Settings:
     USE_STREAMING_CHAT = os.getenv("USE_STREAMING_CHAT", "false").lower() == "true"
     STREAMING_TIMEOUT = int(os.getenv("STREAMING_TIMEOUT", "300"))  # 5 minutes default for streaming
 
+    # Bet 2 — first-impression protection
+    ENABLE_PREFLIGHT_GATE     = os.getenv("ENABLE_PREFLIGHT_GATE", "false").lower() == "true"
+    ENABLE_PARALLEL_BRIEF     = os.getenv("ENABLE_PARALLEL_BRIEF", "false").lower() == "true"
+    ENABLE_RESUMABLE_PIPELINE = os.getenv("ENABLE_RESUMABLE_PIPELINE", "false").lower() == "true"
+
+    # Bet 3 — firm context (rate cards, tech preferences, team templates, past-project RAG)
+    ENABLE_FIRM_CONTEXT       = os.getenv("ENABLE_FIRM_CONTEXT", "false").lower() == "true"
+
+    # Contract pipeline (plan -> parallel section writers -> judge). Replaces the
+    # 8-agent linear pipeline. Off by default; the runner branches on this flag.
+    # See design/plans + the_generate_full_pipeline plan for the redesign rationale.
+    USE_CONTRACT_PIPELINE     = os.getenv("USE_CONTRACT_PIPELINE", "false").lower() == "true"
+    # Smart model for the planner + judge nodes. Defaults to the same model as
+    # the writers so the new path is runnable without provisioning a new key;
+    # flip SMART_MODEL_NAME to Sonnet 4.6 / GPT-5 once the path is validated.
+    SMART_MODEL_PROVIDER      = os.getenv("SMART_MODEL_PROVIDER", "openai")  # openai | anthropic
+    SMART_MODEL_NAME          = os.getenv("SMART_MODEL_NAME") or os.getenv("GENERATING_REPORT_MODEL")
+    # Cap section-writer revisions to 1 per section. Surfaced as a setting so
+    # eval runs can test the loop is genuinely bounded.
+    CONTRACT_JUDGE_MAX_REVISIONS_PER_SECTION = int(os.getenv("CONTRACT_JUDGE_MAX_REVISIONS_PER_SECTION", "1"))
+
+    # Slice 2 — Tavily-backed "known issues & integration gotchas". Off by default;
+    # the known_issues sub-step is inert without both the flag AND a key, so the
+    # report renders normally when either is missing.
+    ENABLE_KNOWN_ISSUES        = os.getenv("ENABLE_KNOWN_ISSUES", "false").lower() == "true"
+    TAVILY_API_KEY             = os.getenv("TAVILY_API_KEY", "")
+    KNOWN_ISSUES_MAX_QUERIES   = int(os.getenv("KNOWN_ISSUES_MAX_QUERIES", "6"))
+    KNOWN_ISSUES_RESULTS_PER_QUERY = int(os.getenv("KNOWN_ISSUES_RESULTS_PER_QUERY", "3"))
+
 
 settings = Settings()

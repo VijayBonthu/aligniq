@@ -28,12 +28,17 @@ from utils.chat_history import save_chat_history, save_report_version
 from utils.llm_metrics import LLMCallRecorder, use_recorder
 from agents.workflow_graph import agent  # compiled LangGraph
 from agents.agentic_workflow import main_report_summary
+from agents.firm_context import build_firm_context_block
+from agents.contract_workflow import run_contract_pipeline, CONTRACT_STAGES_ORDER
+from agents.tools import repair_mermaid_blocks
 from database_scripts import (
     mark_stage_started,
     mark_stage_completed,
     increment_loop_count,
     complete_pipeline_run,
     fail_pipeline_run,
+    persist_state_snapshot,
+    get_resumable_run,
     update_analysis_link_with_full_report,
 )
 
@@ -81,9 +86,19 @@ async def _persist_final_report(
     report_text: str,
     title: str,
     db,
+    report_contract: Optional[dict] = None,
 ) -> None:
     """Append the final report to chat_history, embed it, save report version,
-    and mark the analysis_link as full_report_generated."""
+    and mark the analysis_link as full_report_generated.
+
+    `report_contract` is the structured ReportContract dump (contract pipeline);
+    None for the legacy 8-agent path."""
+
+    # Deterministically fix mermaid the writer left invalid (e.g. unquoted parens
+    # in flowchart labels) BEFORE persisting — so the stored report, its
+    # embeddings, and every client render share the same valid markdown. Covers
+    # both the contract and legacy paths since this is their shared save point.
+    report_text = repair_mermaid_blocks(report_text)
 
     # Append message to existing chat history.
     chat_record = (
@@ -138,6 +153,7 @@ async def _persist_final_report(
                 "user_id":         user_id,
                 "report_content":  report_text,
                 "summary_report":  summary,
+                "report_contract": report_contract,
             },
             db=db,
         )
@@ -164,6 +180,7 @@ async def run_full_pipeline_async(
     presales_id: str,
     document: list[str],
     title: str,
+    resume_from_snapshot: Optional[dict] = None,
 ) -> None:
     """
     Top-level entry scheduled via BackgroundTasks. Owns its own DB session.
@@ -171,19 +188,95 @@ async def run_full_pipeline_async(
     Streams per-node updates from the compiled LangGraph, persists progress to
     pipeline_runs, and on success persists the final report and marks the
     analysis link as full_report_generated.
+
+    Bet 2.C — when `resume_from_snapshot` is provided (loaded from a previously
+    failed run's `state_snapshot`), the runner hydrates the persisted state
+    (req_analysis, loop_count, and the set of `completed_nodes`) into the
+    initial state. The LangGraph re-walks from START, but each node wrapper
+    checks `completed_nodes` and short-circuits if its own work is already done,
+    so only the failing-and-after nodes actually call LLMs. This gives the
+    user-visible behavior of "resume from last checkpoint" without requiring a
+    LangGraph checkpointer.
     """
     db = models.sessionlocal()
     timeout = settings.PIPELINE_TIMEOUT
-    initial_state = {
-        "document":     document,
-        "req_analysis": [],
-        "loop_count":   0,
-        "message":      [],
+
+    # Bet 3 — look up the firm for this user and build the markdown context block
+    # that every agent prompt consumes. Failure here is non-fatal: agents handle
+    # an empty firm_context by falling back to generic best-practice output.
+    firm_context_block = ""
+    firm_id_for_run: Optional[str] = None
+    if settings.ENABLE_FIRM_CONTEXT:
+        try:
+            firm_row = db.query(models.User).filter(models.User.user_id == user_id).first()
+            firm_id_for_run = firm_row.firm_id if firm_row else None
+            firm_context_block = await build_firm_context_block(firm_id_for_run, engagement_type=None, db=db)
+            if firm_context_block:
+                logger.info(f"pipeline_runner: firm_context loaded for run {run_id} (firm {firm_id_for_run}, {len(firm_context_block)} chars)")
+        except Exception as e:
+            logger.error(f"pipeline_runner: firm_context lookup failed for {user_id}: {e}")
+
+    # Branch on USE_CONTRACT_PIPELINE before touching the legacy state shape.
+    # Old path is untouched; new path uses the 4-stage plan/decide/write/judge runner.
+    if settings.USE_CONTRACT_PIPELINE:
+        await _run_contract_pipeline_path(
+            run_id=run_id,
+            chat_history_id=chat_history_id,
+            user_id=user_id,
+            document_id=document_id,
+            presales_id=presales_id,
+            document=document,
+            title=title,
+            firm_context=firm_context_block,
+            firm_id=firm_id_for_run,
+            db=db,
+        )
+        return
+
+    initial_state: dict = {
+        "document":        document,
+        "req_analysis":    [],
+        "loop_count":      0,
+        "message":         [],
+        "firm_context":    firm_context_block,
+        "completed_nodes": [],
     }
+    if settings.ENABLE_RESUMABLE_PIPELINE and resume_from_snapshot:
+        initial_state["req_analysis"]    = list(resume_from_snapshot.get("req_analysis") or [])
+        initial_state["loop_count"]      = int(resume_from_snapshot.get("loop_count") or 0)
+        initial_state["completed_nodes"] = list(resume_from_snapshot.get("completed_nodes") or [])
+        logger.info(
+            f"pipeline_runner: resuming run {run_id} with "
+            f"{len(initial_state['req_analysis'])} preserved agent outputs, "
+            f"loop_count={initial_state['loop_count']}, "
+            f"completed_nodes={initial_state['completed_nodes']}"
+        )
 
     last_started_stage: Optional[str] = None
     stage_start_ts: float = 0.0
     final_state: Optional[dict] = None
+    # Accumulated state for snapshotting. astream(updates) yields the node's
+    # return value, which (since AgentState has no reducers) is the FULL state
+    # for keys the node touched. We REPLACE rather than extend to avoid
+    # duplicating req_analysis across nodes.
+    snapshot_state: dict = {
+        "req_analysis":    list(initial_state["req_analysis"]),
+        "loop_count":      initial_state["loop_count"],
+        "completed_nodes": list(initial_state["completed_nodes"]),
+    }
+
+    def _merge_into_snapshot(node_state: dict) -> None:
+        if not isinstance(node_state, dict):
+            return
+        req = node_state.get("req_analysis")
+        if isinstance(req, list):
+            snapshot_state["req_analysis"] = list(req)
+        lc = node_state.get("loop_count")
+        if isinstance(lc, int):
+            snapshot_state["loop_count"] = lc
+        completed = node_state.get("completed_nodes")
+        if isinstance(completed, list):
+            snapshot_state["completed_nodes"] = list(completed)
 
     async def _stream() -> None:
         nonlocal last_started_stage, stage_start_ts, final_state
@@ -212,6 +305,22 @@ async def run_full_pipeline_async(
                     duration_ms = int((time.monotonic() - stage_start_ts) * 1000)
                     await mark_stage_completed(run_id, last_started_stage, duration_ms, db)
                     await mark_stage_completed(run_id, stage, 0, db)
+
+                # Bet 2.C — snapshot after each completed node so a failure
+                # later doesn't lose the partial work. Skip the terminal node;
+                # _persist_final_report owns persistence for that stage.
+                if settings.ENABLE_RESUMABLE_PIPELINE and node_name != "ba_final_report_node":
+                    _merge_into_snapshot(node_state)
+                    try:
+                        await persist_state_snapshot(
+                            run_id=run_id,
+                            state_subset=snapshot_state,
+                            node_name=node_name,
+                            db=db,
+                        )
+                    except Exception as e:
+                        # Snapshotting is best-effort — never fail the pipeline on it.
+                        logger.warning(f"pipeline_runner: persist_state_snapshot failed for {run_id}/{node_name}: {e}")
 
                 # Bump loop counter when critic re-enters the architect.
                 if stage == "critic_agent" and isinstance(node_state, dict):
@@ -248,6 +357,12 @@ async def run_full_pipeline_async(
         user_id=user_id,
     )
 
+    # Bet 3 — bind firm_id into the contextvar that `firm_project_search` reads.
+    # Tenant scope comes from the JWT-derived firm_row.firm_id, never from
+    # LLM-supplied arguments. Reset after the run regardless of outcome.
+    from utils.chat_tools import set_firm_id_context, _firm_id_ctx
+    _firm_id_token = set_firm_id_context(firm_id_for_run)
+
     try:
         with use_recorder(recorder):
             await asyncio.wait_for(_stream(), timeout=timeout)
@@ -277,6 +392,108 @@ async def run_full_pipeline_async(
         logger.error(f"pipeline_runner: run {run_id} failed: {e}", exc_info=True)
         await fail_pipeline_run(run_id, str(e), db)
     finally:
+        try:
+            _firm_id_ctx.reset(_firm_id_token)
+        except Exception:
+            pass
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+async def _run_contract_pipeline_path(
+    *,
+    run_id: str,
+    chat_history_id: str,
+    user_id: str,
+    document_id: str,
+    presales_id: str,
+    document: list[str],
+    title: str,
+    firm_context: str,
+    firm_id: Optional[str],
+    db,
+) -> None:
+    """Sibling of run_full_pipeline_async for USE_CONTRACT_PIPELINE=true.
+
+    Same persistence contract (pipeline_runs rows, llm_call_log telemetry,
+    final report + embeddings + analysis_link flip on success). Only the
+    middle of the function differs: 4 stages instead of 8.
+    """
+    timeout = settings.PIPELINE_TIMEOUT
+    stage_start_ts: dict[str, float] = {}
+
+    async def _on_started(stage: str) -> None:
+        stage_start_ts[stage] = time.monotonic()
+        await mark_stage_started(run_id, stage, db)
+
+    async def _on_completed(stage: str) -> None:
+        started = stage_start_ts.get(stage, time.monotonic())
+        duration_ms = int((time.monotonic() - started) * 1000)
+        await mark_stage_completed(run_id, stage, duration_ms, db)
+
+    # services.py merges the approved presales brief into the document blob.
+    # The planner prompt treats the CRD and the raw chunks both as inputs;
+    # passing the same blob to both is intentional for now — splitting CRD
+    # from raw document chunks is a deferred refinement.
+    document_blob = "\n\n".join(s for s in (document or []) if s) or "(empty document)"
+
+    recorder = LLMCallRecorder(
+        db=db,
+        pipeline_run_id=run_id,
+        chat_history_id=chat_history_id,
+        presales_id=presales_id,
+        user_id=user_id,
+    )
+
+    # Bind firm_id context the same way the legacy path does — the firm-project
+    # tools the writers will eventually call (Step 3) read this contextvar.
+    from utils.chat_tools import set_firm_id_context, _firm_id_ctx
+    _firm_id_token = set_firm_id_context(firm_id)
+
+    try:
+        with use_recorder(recorder):
+            result = await asyncio.wait_for(
+                run_contract_pipeline(
+                    document=[document_blob],
+                    crd=document_blob,
+                    firm_context=firm_context,
+                    on_stage_started=_on_started,
+                    on_stage_completed=_on_completed,
+                ),
+                timeout=timeout,
+            )
+
+            report_text = result["report_markdown"]
+            if not report_text:
+                raise RuntimeError("Contract pipeline finished but produced empty report")
+
+            await _persist_final_report(
+                chat_history_id=chat_history_id,
+                user_id=user_id,
+                document_id=document_id,
+                presales_id=presales_id,
+                report_text=report_text,
+                title=title,
+                db=db,
+                report_contract=result.get("contract"),
+            )
+
+        await complete_pipeline_run(run_id, db)
+        logger.info(f"pipeline_runner: contract path completed run {run_id} for chat {chat_history_id}")
+
+    except asyncio.TimeoutError:
+        logger.error(f"pipeline_runner: contract path timeout after {timeout}s for run {run_id}")
+        await fail_pipeline_run(run_id, f"Pipeline timed out after {timeout}s", db)
+    except Exception as e:
+        logger.error(f"pipeline_runner: contract path run {run_id} failed: {e}", exc_info=True)
+        await fail_pipeline_run(run_id, str(e), db)
+    finally:
+        try:
+            _firm_id_ctx.reset(_firm_id_token)
+        except Exception:
+            pass
         try:
             db.close()
         except Exception:

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { loadMermaid } from '../../utils/mermaidLoader';
+import { repairMermaid } from '../../utils/markdown';
 import AsciiBlock from './AsciiBlock';
 import type { LightboxContent } from './DiagramLightbox';
 
@@ -12,6 +13,7 @@ interface Props {
 export default function MermaidBlock({ source, id, onZoom }: Props) {
   const [svg, setSvg] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -19,32 +21,46 @@ export default function MermaidBlock({ source, id, onZoom }: Props) {
     const renderId = `mmd-${id}`;
     loadMermaid()
       .then(async (mermaid) => {
-        try {
-          // Mermaid v10+ does NOT throw on syntax errors — it returns a rendered
-          // "Syntax error in text" SVG. Pre-validate so we never inject that.
-          const valid = await mermaid
-            .parse(source, { suppressErrors: true })
-            .catch(() => false);
-          if (!valid) {
-            if (!cancelled) setFailed(true);
+        // Render directly and detect mermaid's "error diagram" in the output.
+        // We deliberately do NOT pre-validate with mermaid.parse(): in some
+        // mermaid builds parse() can throw for reasons unrelated to the diagram
+        // (lazy diagram-loader / init issues), which would silently drop EVERY
+        // diagram. render() is the real path; if it throws we capture why.
+        // Try the source as-is first, then a repaired copy (common LLM mistakes
+        // like unquoted parens). A valid diagram is never rewritten.
+        const repaired = repairMermaid(source);
+        const candidates = repaired !== source ? [source, repaired] : [source];
+        let lastErr: string | null = null;
+        for (const candidate of candidates) {
+          try {
+            const { svg: out } = await mermaid.render(renderId, candidate);
+            if (out.includes('aria-roledescription="error"') || out.includes('Syntax error')) {
+              lastErr = 'mermaid produced an error diagram (invalid syntax)';
+              continue;
+            }
+            if (!cancelled) setSvg(out);
             return;
+          } catch (e) {
+            lastErr = e instanceof Error ? e.message : String(e);
+          } finally {
+            // mermaid leaves a temp measurement node on document.body. Strip it.
+            const orphan = document.getElementById(`d${renderId}`);
+            if (orphan && orphan.parentNode === document.body) orphan.remove();
           }
-          const { svg: out } = await mermaid.render(renderId, source);
-          if (out.includes('aria-roledescription="error"') || out.includes('Syntax error')) {
-            if (!cancelled) setFailed(true);
-            return;
-          }
-          if (!cancelled) setSvg(out);
-        } catch {
-          if (!cancelled) setFailed(true);
-        } finally {
-          // Mermaid leaves a temp measurement node on document.body. Strip it.
-          const orphan = document.getElementById(`d${renderId}`);
-          if (orphan && orphan.parentNode === document.body) orphan.remove();
+        }
+        if (!cancelled) {
+          console.error('[MermaidBlock] render failed:', lastErr, '\n--- source ---\n', source);
+          setErrMsg(lastErr);
+          setFailed(true);
         }
       })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
+      .catch((e) => {
+        if (!cancelled) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error('[MermaidBlock] mermaid failed to load:', e);
+          setErrMsg(`mermaid failed to load: ${msg}`);
+          setFailed(true);
+        }
       });
     return () => {
       cancelled = true;
@@ -52,7 +68,24 @@ export default function MermaidBlock({ source, id, onZoom }: Props) {
   }, [source, id]);
 
   if (failed) {
-    return <AsciiBlock source={source} onZoom={onZoom} sourceLabel="diagram source" />;
+    return (
+      <div data-diagram-id={id}>
+        {errMsg && (
+          <div
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 11,
+              color: 'var(--warn, #d98c4a)',
+              margin: '14px 0 -6px',
+              letterSpacing: '.02em',
+            }}
+          >
+            Diagram couldn’t render: {errMsg}
+          </div>
+        )}
+        <AsciiBlock source={source} onZoom={onZoom} sourceLabel="diagram source" />
+      </div>
+    );
   }
   if (!svg) {
     return (

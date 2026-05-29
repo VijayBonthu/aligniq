@@ -91,7 +91,7 @@ def update_or_append(state: dict, agent_name: str, response: dict) -> None:
     state['req_analysis'].append({"agent": agent_name, "output": response})
     logger.debug(f"Appended new output for agent: {agent_name}")
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """
     State object passed through the LangGraph pipeline.
 
@@ -100,19 +100,63 @@ class AgentState(TypedDict):
         req_analysis: List of agent outputs, each with 'agent' name and 'output' data
         loop_count: Counter for critic feedback loops
         message: List of AI/Human messages for conversation history
+        firm_context: Markdown <firm_context> block injected into every agent
+            prompt (Bet 3). Empty string when the firm has no loaded context or
+            ENABLE_FIRM_CONTEXT is off.
+        completed_nodes: Node names that have already produced their output and
+            should short-circuit on resume (Bet 2.C, retry UX). Populated by
+            each node wrapper after success. solution_architectures_node and
+            critic_node are only treated as "done for skip" when loop_count is 0
+            (i.e. the critic loop has exited cleanly).
     """
     document: list[str]
     req_analysis: List[dict]
     loop_count: int
     message: List[Union[AIMessage, HumanMessage]]
+    firm_context: str
+    completed_nodes: List[str]
+
+
+# Nodes whose work is INSIDE the critic feedback loop. On resume they may need
+# to re-run even if previously completed, because the loop may not have exited.
+_LOOP_NODES = {"solution_architectures_node", "critic_node"}
+
+
+def _should_skip_resumed_node(node_name: str, state: dict) -> bool:
+    """
+    Idempotent-skip predicate for Bet 2.C resume.
+
+    A node skips when its name is already in state["completed_nodes"]. For
+    nodes inside the critic loop, we additionally require loop_count==0 — that
+    means the previous run exited the loop cleanly; if loop_count>0 we're
+    resuming mid-loop and must re-execute.
+    """
+    completed = state.get("completed_nodes") or []
+    if node_name not in completed:
+        return False
+    if node_name in _LOOP_NODES and (state.get("loop_count") or 0) > 0:
+        return False
+    return True
+
+
+def _mark_node_completed(state: dict, node_name: str) -> None:
+    """Append node_name to completed_nodes, de-duped, preserving order."""
+    existing = list(state.get("completed_nodes") or [])
+    if node_name not in existing:
+        existing.append(node_name)
+    state["completed_nodes"] = existing
 
 
 async def req_analyse_node(state: AgentState) -> AgentState:
     """Requirements analysis node - first step in pipeline."""
+    if _should_skip_resumed_node("req_analyse_node", state):
+        logger.info("[resume-skip] req_analyse_node")
+        return state
     logger.info("Starting req_analyse_node")
     try:
-        response = await requirements_analyzer(state['document'])
+        response = await requirements_analyzer(state['document'], firm_context=state.get("firm_context", ""))
         update_or_append(state, "requirements_analyzer", response)
+        _mark_node_completed(state, "req_analyse_node")
         logger.info("req_analyse_node completed successfully")
         return state
     except PipelineError:
@@ -124,6 +168,9 @@ async def req_analyse_node(state: AgentState) -> AgentState:
 
 async def amb_resolve_node(state: AgentState) -> AgentState:
     """Ambiguity resolution node - identifies and resolves ambiguities."""
+    if _should_skip_resumed_node("amb_resolve_node", state):
+        logger.info("[resume-skip] amb_resolve_node")
+        return state
     logger.info("Starting amb_resolve_node")
     try:
         req_analyze_json = get_agent_output(state, "requirements_analyzer", required=True)
@@ -139,6 +186,7 @@ async def amb_resolve_node(state: AgentState) -> AgentState:
         )
 
         update_or_append(state, "ambiguity_resolver", response)
+        _mark_node_completed(state, "amb_resolve_node")
         logger.info("amb_resolve_node completed successfully")
         return state
     except PipelineError:
@@ -150,6 +198,9 @@ async def amb_resolve_node(state: AgentState) -> AgentState:
 
 async def validator_node(state: AgentState) -> AgentState:
     """Validator node - validates requirements for consistency."""
+    if _should_skip_resumed_node("validator_node", state):
+        logger.info("[resume-skip] validator_node")
+        return state
     logger.info("Starting validator_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -158,6 +209,7 @@ async def validator_node(state: AgentState) -> AgentState:
         response = await validator_agent(req_analyzer_json=requirements, amb_resolver_json=assumptions)
 
         update_or_append(state, "validator_agent", response)
+        _mark_node_completed(state, "validator_node")
         logger.info("validator_node completed successfully")
         return state
     except PipelineError:
@@ -193,6 +245,9 @@ async def midway_report_node(state: AgentState) -> AgentState:
 
 async def solution_architectures_node(state: AgentState) -> AgentState:
     """Solution architecture node - designs technical solution."""
+    if _should_skip_resumed_node("solution_architectures_node", state):
+        logger.info("[resume-skip] solution_architectures_node (critic loop already exited)")
+        return state
     logger.info("Starting solution_architectures_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -205,10 +260,12 @@ async def solution_architectures_node(state: AgentState) -> AgentState:
             req_analyzer_json=requirements,
             amb_resolver_json=amb_resolver_json,
             validator_json=validators,
-            critic_feedback=critic_feedback
+            critic_feedback=critic_feedback,
+            firm_context=state.get("firm_context", ""),
         )
 
         update_or_append(state, "solution_architectures", response)
+        _mark_node_completed(state, "solution_architectures_node")
         logger.info("solution_architectures_node completed successfully")
         return state
     except PipelineError:
@@ -220,6 +277,9 @@ async def solution_architectures_node(state: AgentState) -> AgentState:
 
 async def evidence_gather_node(state: AgentState) -> AgentState:
     """Evidence gathering node - collects supporting evidence and best practices."""
+    if _should_skip_resumed_node("evidence_gather_node", state):
+        logger.info("[resume-skip] evidence_gather_node")
+        return state
     logger.info("Starting evidence_gather_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -229,10 +289,12 @@ async def evidence_gather_node(state: AgentState) -> AgentState:
         response = await evidence_gather_agent(
             recommendations_json=requirements,
             validated_requirements_json=validators,
-            solution_architectures=sol_architecture
+            solution_architectures=sol_architecture,
+            firm_context=state.get("firm_context", ""),
         )
 
         update_or_append(state, "evidence_gather_agent", response)
+        _mark_node_completed(state, "evidence_gather_node")
         logger.info("evidence_gather_node completed successfully")
         return state
     except PipelineError:
@@ -244,6 +306,9 @@ async def evidence_gather_node(state: AgentState) -> AgentState:
 
 async def critic_node(state: AgentState) -> AgentState:
     """Critic node - critiques solution and identifies issues."""
+    if _should_skip_resumed_node("critic_node", state):
+        logger.info("[resume-skip] critic_node (critic loop already exited)")
+        return state
     logger.info("Starting critic_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -256,12 +321,14 @@ async def critic_node(state: AgentState) -> AgentState:
             req_analyzer_json=requirements,
             validator_json=validators,
             solution_architectures_json=solution_architectures,
-            previous_critic_feedback=previous_critic_feedback
+            previous_critic_feedback=previous_critic_feedback,
+            firm_context=state.get("firm_context", ""),
         )
 
         update_or_append(state, "critic_agent", response)
 
         state["loop_count"] = state.get("loop_count", 0) + 1
+        _mark_node_completed(state, "critic_node")
         logger.info(f"critic_node completed successfully, loop_count={state['loop_count']}")
         return state
     except PipelineError:
@@ -296,12 +363,15 @@ def critic_to_alternative_loop(state: AgentState) -> str:
             state["loop_count"] = 0
             return "end_loop"
     except Exception as e:
-        logger.warning(f"Error in critic_to_alternative_loop: {str(e)}, defaulting to end_loop")
-        return "end_loop"
+        logger.exception("critic_to_alternative_loop failed; raising PipelineError instead of silently ending the loop")
+        raise PipelineError(f"Critic loop decision failed: {e}") from e
 
 
 async def feasibility_estimator_node(state: AgentState) -> AgentState:
     """Feasibility estimator node - estimates timeline and resources."""
+    if _should_skip_resumed_node("feasibility_estimator_node", state):
+        logger.info("[resume-skip] feasibility_estimator_node")
+        return state
     logger.info("Starting feasibility_estimator_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -313,10 +383,12 @@ async def feasibility_estimator_node(state: AgentState) -> AgentState:
             req_analyzer_json=requirements,
             validator_json=validators,
             solution_architectures_json=solution_architectures,
-            evidence_gather_json=evidence_gathered
+            evidence_gather_json=evidence_gathered,
+            firm_context=state.get("firm_context", ""),
         )
 
         update_or_append(state, "feasibility_estimator", response)
+        _mark_node_completed(state, "feasibility_estimator_node")
         logger.info("feasibility_estimator_node completed successfully")
 
         # Debug output - only in debug mode
@@ -337,6 +409,9 @@ async def feasibility_estimator_node(state: AgentState) -> AgentState:
 
 async def ba_final_report_node(state: AgentState) -> AgentState:
     """Final report node - generates comprehensive BA report."""
+    if _should_skip_resumed_node("ba_final_report_node", state):
+        logger.info("[resume-skip] ba_final_report_node")
+        return state
     logger.info("Starting ba_final_report_node")
     try:
         requirements = get_agent_output(state, "requirements_analyzer", required=True)
@@ -354,10 +429,12 @@ async def ba_final_report_node(state: AgentState) -> AgentState:
             solution_architectures=solution_architectures,
             critic_feedback=critic_feedback_json,
             evidence=evidence_gathered,
-            feasibility=feasibility_json
+            feasibility=feasibility_json,
+            firm_context=state.get("firm_context", ""),
         )
 
         state['message'].append(AIMessage(content=response))
+        _mark_node_completed(state, "ba_final_report_node")
         logger.info("ba_final_report_node completed successfully")
 
         # Debug output - only in debug mode
@@ -471,7 +548,9 @@ async def run_agent_pipeline(
         "document": document,
         "req_analysis": [],
         "loop_count": 0,
-        "message": []
+        "message": [],
+        "firm_context": "",
+        "completed_nodes": [],
     }
 
     logger.info(f"Starting agent pipeline with timeout={timeout}s")

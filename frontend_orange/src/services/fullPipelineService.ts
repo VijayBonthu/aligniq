@@ -24,6 +24,8 @@ export interface PipelineRunSnapshot {
   error: string | null;
   started_at?: string | null;
   completed_at?: string | null;
+  last_completed_node?: string | null;
+  resumed_from?: string | null;
 }
 
 /** Kick off the 9-agent pipeline. Returns 202 immediately. */
@@ -38,6 +40,25 @@ export async function startFullPipeline(chatHistoryId: string) {
     chat_history_id: string;
     status: PipelineStatus;
     current_stage: string | null;
+    message?: string;
+  };
+}
+
+/**
+ * Resume a previously failed pipeline run from the persisted snapshot.
+ * Backend gates this on `ENABLE_RESUMABLE_PIPELINE` and the run must have a
+ * non-null `last_completed_node`; otherwise returns 409.
+ */
+export async function resumeFullPipeline(chatHistoryId: string) {
+  const { data } = await api.post(`/full-pipeline/resume/${chatHistoryId}`);
+  return data as {
+    run_id: string;
+    chat_history_id: string;
+    status: PipelineStatus;
+    current_stage: string | null;
+    stages_completed?: PipelineStageEntry[];
+    last_completed_node?: string | null;
+    resumed_from?: string | null;
     message?: string;
   };
 }
