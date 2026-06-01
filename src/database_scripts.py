@@ -116,9 +116,15 @@ async def user_documents(doc_data:dict, db:Session) -> dict:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"unable to create document data {str(e)}")
     
 async def get_summary_report(chat_history_id:str, db:Session)-> dict:
+    """Return the ACTIVE report version for a chat — the user-selected default
+    when one is set, otherwise the newest. This is the single source of truth the
+    chat answers from, so marking a version default makes every answer (and the
+    re-embedded vector store) reflect that version instead of the latest."""
     try:
-        query = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == chat_history_id).order_by(models.ReportVersions.created_at.desc())
-        record = query.first()
+        base = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == chat_history_id)
+        record = base.filter(models.ReportVersions.is_default == True).order_by(models.ReportVersions.created_at.desc()).first()
+        if not record:
+            record = base.order_by(models.ReportVersions.created_at.desc()).first()
         return record
     except SQLAlchemyError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error occured with the DB, chat history id: {chat_history_id}, error: {str(e)}")
@@ -730,12 +736,27 @@ async def get_all_report_versions(chat_history_id: str, db: Session) -> list:
 
         versions = []
         for record in records:
+            exec_summary = record.summary_report.get("executive_summary") if record.summary_report else None
+            # A short, identifiable name for the version: prefer the changelog of
+            # what changed; else the first line of the exec summary; else a number.
+            if record.changelog_summary:
+                label = record.changelog_summary
+            elif record.version_number == 1:
+                label = "Initial report"
+            elif exec_summary:
+                first_line = exec_summary.strip().split("\n")[0]
+                label = (first_line[:90] + "…") if len(first_line) > 90 else first_line
+            else:
+                label = f"Version {record.version_number}"
+
             versions.append({
                 "report_version_id": record.report_version_id,
                 "version_number": record.version_number,
                 "version": record.version_number,  # Alias for compatibility
                 "created_at": record.created_at.isoformat() if record.created_at else None,
-                "summary": record.summary_report.get("executive_summary", "No summary available") if record.summary_report else "No summary",
+                "summary": exec_summary or "No summary available",
+                "label": label,
+                "is_default": bool(record.is_default),
                 "is_latest": record.version_number == records[0].version_number if records else False,
                 # Changelog tracking fields
                 "changes_applied": record.changes_applied,
@@ -786,6 +807,7 @@ async def get_report_version_by_number(chat_history_id: str, version_number: int
             "version_number": record.version_number,
             "report_content": record.report_content,
             "summary_report": record.summary_report,
+            "report_contract": record.report_contract,  # typed decisions; powers cross-version delta/rank
             "created_at": record.created_at.isoformat() if record.created_at else None,
             # Changelog tracking fields
             "changes_applied": record.changes_applied,
@@ -4746,3 +4768,58 @@ def delete_past_project(firm_id: str, project_id: str, db: Session) -> bool:
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"delete_past_project failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Jira credentials — server-side OAuth token storage (one row per user).
+# ---------------------------------------------------------------------------
+def get_jira_credentials(user_id: str, db: Session):
+    """Return the user's JiraCredential row, or None if Jira isn't connected."""
+    return db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+
+
+def save_jira_credentials(user_id: str, *, access_token: str, refresh_token: Optional[str] = None,
+                          cloud_id: Optional[str] = None, account_id: Optional[str] = None,
+                          email: Optional[str] = None, scope: Optional[str] = None,
+                          expires_at: Optional[datetime] = None, db: Session) -> dict:
+    """Upsert a user's Jira tokens. Used by the OAuth callback (full set) and the
+    refresh path (new access token + rotated refresh + expiry)."""
+    try:
+        from utils.crypto import encrypt_secret
+        row = db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+        if row is None:
+            row = models.JiraCredential(user_id=user_id)
+            db.add(row)
+        # Encrypt the secret tokens at rest (Fernet). email/account_id/scope are not secrets.
+        row.access_token = encrypt_secret(access_token)
+        if refresh_token is not None:
+            row.refresh_token = encrypt_secret(refresh_token)
+        if cloud_id is not None:
+            row.cloud_id = cloud_id
+        if account_id is not None:
+            row.account_id = account_id
+        if email is not None:
+            row.email = email
+        if scope is not None:
+            row.scope = scope
+        row.expires_at = expires_at
+        db.commit()
+        db.refresh(row)
+        return {"user_id": user_id, "connected": True}
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"save_jira_credentials failed: {e}")
+
+
+def delete_jira_credentials(user_id: str, db: Session) -> bool:
+    """Disconnect Jira for a user. Idempotent."""
+    try:
+        row = db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"delete_jira_credentials failed: {e}")

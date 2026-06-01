@@ -8,6 +8,9 @@ import useStreamingChat from '../hooks/useStreamingChat';
 import RichMessage, { type ChatMessage } from '../components/chat/RichMessage';
 import IntegrationsSidebar from '../components/chat/IntegrationsSidebar';
 import PreMortemPanel from '../components/chat/PreMortemPanel';
+import ToolActivity from '../components/chat/ToolActivity';
+import PendingChangesPanel from '../components/chat/PendingChangesPanel';
+import VersionsPanel from '../components/chat/VersionsPanel';
 
 type TabKey = 'chat' | 'premortem';
 
@@ -23,12 +26,48 @@ interface ChatRecord {
   pipeline_status?: 'idle' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 }
 
-const SUGGESTIONS = [
-  'Show all risks',
-  'Architecture diagram',
-  'Timeline overview',
-  'Generate full report',
+interface QuickAction {
+  label: string;
+  prompt: string;
+}
+
+// Persona-grouped quick-actions that map to existing agent tools, so the chat's
+// power is discoverable without typing. Clicking sends the prompt; the agent
+// picks the right tool.
+const QUICK_ACTIONS: { group: string; actions: QuickAction[] }[] = [
+  { group: 'PM', actions: [
+    { label: 'Client meeting brief', prompt: 'Prepare a client meeting brief for this project.' },
+    { label: 'Blockers & open questions', prompt: 'What are the blockers and open questions I should resolve with the client?' },
+  ] },
+  { group: 'Exec', actions: [
+    { label: 'Go / no-go', prompt: 'Give me an executive go/no-go summary with budget, timeline, and the top risks.' },
+  ] },
+  { group: 'Architect', actions: [
+    { label: 'Technical deep-dive', prompt: 'Give me a technical deep-dive: why this architecture, the trade-offs, and the failure modes to watch.' },
+    { label: 'Architecture diagram', prompt: 'Show me the architecture diagram.' },
+  ] },
+  { group: 'Developer', actions: [
+    { label: 'Implementation gotchas', prompt: 'What implementation gotchas and risky assumptions should developers know before starting?' },
+    { label: 'Tech stack', prompt: 'What is the recommended tech stack?' },
+  ] },
+  { group: 'Optimize', actions: [
+    { label: 'Cut cost', prompt: 'Analyze cost reduction opportunities with their trade-offs.' },
+    { label: 'Speed up timeline', prompt: 'Analyze ways to accelerate the timeline with their trade-offs.' },
+  ] },
 ];
+
+// Mirror of the backend briefing-tool -> label map, so the "Queue as change" /
+// export affordances show up on a freshly streamed analysis without a reload.
+const TOOL_SAVED_LABELS: Record<string, string> = {
+  prepare_client_meeting_brief: 'Client Meeting Brief',
+  prepare_executive_summary: 'Executive Summary',
+  get_technical_deep_dive: 'Technical Deep-Dive',
+  get_implementation_gotchas: 'Implementation Gotchas',
+  get_project_blind_spots: 'Blind Spots',
+  analyze_cost_reduction: 'Cost Analysis',
+  analyze_timeline_acceleration: 'Timeline Analysis',
+  suggest_optimization: 'Optimization',
+};
 
 function nowTs() {
   return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -43,7 +82,7 @@ function parseStoredMessages(raw: unknown, projectTitle?: string | null): ChatMe
     arr = [];
   }
   return arr
-    .filter((m): m is { role: string; content: string; type?: string } =>
+    .filter((m): m is { role: string; content: string; type?: string; saved_label?: string } =>
       Boolean(m && typeof m === 'object' && 'role' in m && 'content' in m),
     )
     .map((m, i) => ({
@@ -54,6 +93,7 @@ function parseStoredMessages(raw: unknown, projectTitle?: string | null): ChatMe
       selected: true,
       type: typeof m.type === 'string' ? m.type : undefined,
       reportTitle: projectTitle || undefined,
+      savedLabel: typeof m.saved_label === 'string' ? m.saved_label : undefined,
     }));
 }
 
@@ -61,7 +101,7 @@ export default function ChatView() {
   const navigate = useNavigate();
   const { user, subscription } = useAuth();
   const { chatHistoryId } = useParams<{ chatHistoryId: string }>();
-  const { streamChat, cancelStream, isStreaming, currentContent, thinkingMessage } =
+  const { streamChat, cancelStream, isStreaming, currentContent, thinkingMessage, currentTool, toolStatus } =
     useStreamingChat();
 
   const [record, setRecord] = useState<ChatRecord | null>(null);
@@ -70,6 +110,13 @@ export default function ChatView() {
   const [contextMode, setContextMode] = useState(false);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<TabKey>('chat');
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [changeDraft, setChangeDraft] = useState<string | undefined>(undefined);
+  const [savedOnly, setSavedOnly] = useState(false);
+  // The assistant message currently streaming; diagrams in it render only once
+  // it finishes (an unclosed ```mermaid fence can't be rendered mid-stream).
+  const [streamingMsgId, setStreamingMsgId] = useState<string | number | null>(null);
   const reportReady = record?.pipeline_status === 'completed' || record?.pipeline_status === 'idle' || record?.pipeline_status == null;
   // Server is the source of truth on hydration; bumped locally on each send so
   // the indicator updates without re-fetching /chat/{id} after every message.
@@ -77,6 +124,10 @@ export default function ChatView() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const seqRef = useRef(0);
+  // Whether the message list is pinned to the bottom (controls auto-follow while
+  // streaming). Updated on scroll; starts true so the initial load lands at the end.
+  const atBottomRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
 
   useEffect(() => {
     if (!chatHistoryId) {
@@ -131,11 +182,30 @@ export default function ChatView() {
     };
   }, [chatHistoryId, navigate]);
 
+  // Stick-to-bottom: only auto-scroll while the user is at/near the bottom. If
+  // they scroll up to read mid-stream, leave the viewport where they put it.
   useEffect(() => {
-    if (scrollRef.current) {
+    if (atBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, isStreaming, currentContent]);
+
+  const handleMessagesScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom < 80; // px threshold
+    atBottomRef.current = atBottom;
+    setShowJump((prev) => (prev === !atBottom ? prev : !atBottom));
+  };
+
+  const jumpToLatest = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    atBottomRef.current = true;
+    setShowJump(false);
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  };
 
   const selectedCount = useMemo(
     () => messages.filter((m) => m.selected !== false).length,
@@ -153,8 +223,26 @@ export default function ChatView() {
     messageLimit == null ? null : Math.max(0, messageLimit - messageCount);
   const atCap = messagesRemaining === 0;
 
-  const send = async () => {
-    const trimmed = input.trim();
+  // Re-fetch the persisted chat so the rendered full_report swaps to the active
+  // version after the user picks a different default in the Versions panel.
+  const reloadChat = async () => {
+    if (!chatHistoryId) return;
+    try {
+      const res = await api.get<{ user_details?: ChatRecord }>(`/chat/${chatHistoryId}`);
+      const details = res.data?.user_details;
+      if (!details) return;
+      const parsed = parseStoredMessages(details.message, details.title);
+      seqRef.current = parsed.length;
+      setRecord(details);
+      setMessages(parsed);
+      setMessageCount(typeof details.message_count === 'number' ? details.message_count : 0);
+    } catch {
+      /* non-fatal */
+    }
+  };
+
+  const send = async (textOverride?: string) => {
+    const trimmed = (textOverride ?? input).trim();
     if (!trimmed || isStreaming) return;
     if (!record || !chatHistoryId || !user) return;
     if (atCap) {
@@ -178,6 +266,11 @@ export default function ChatView() {
       selected: true,
     };
     setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
+    // The user just sent — re-pin to the bottom so their message and the incoming
+    // answer scroll into view even if they had scrolled up to read.
+    atBottomRef.current = true;
+    setShowJump(false);
+    setStreamingMsgId(assistantId);
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
@@ -202,10 +295,16 @@ export default function ChatView() {
             prev.map((m) => (m.id === assistantId ? { ...m, content: accumulated } : m)),
           );
         },
-        onComplete: (content) => {
+        onComplete: (content, toolsUsed) => {
+          // If a briefing/analysis tool produced this reply, tag it so the saved
+          // badge + export + "Queue as change" affordances appear immediately.
+          const label = (toolsUsed || [])
+            .map((t) => TOOL_SAVED_LABELS[t.tool])
+            .find(Boolean);
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, content } : m)),
+            prev.map((m) => (m.id === assistantId ? { ...m, content, savedLabel: label } : m)),
           );
+          setStreamingMsgId(null); // stream done — let diagrams render
           // Backend increments per user turn; mirror that locally so the indicator
           // and the cap gate both update without an extra round-trip.
           setMessageCount((c) => c + 1);
@@ -218,12 +317,20 @@ export default function ChatView() {
                 : m,
             ),
           );
+          setStreamingMsgId(null);
           toast.error(errMsg);
         },
       });
     } catch {
       // useStreamingChat already surfaces via onError above.
     }
+  };
+
+  // Prefill the composer (and focus) without sending, so a one-click action can
+  // be edited before the user hits Enter. Shared by quick-actions and "Ask in chat".
+  const prefillComposer = (prompt: string) => {
+    setInput(prompt);
+    textareaRef.current?.focus();
   };
 
   const handleKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -359,6 +466,22 @@ export default function ChatView() {
             </svg>
             Build Deliverable
           </button>
+          <button
+            onClick={() => { if (reportReady) { setChangeDraft(undefined); setPendingOpen(true); } }}
+            disabled={!reportReady}
+            title="Review queued changes and regenerate the report"
+            style={headerPill(reportReady)}
+          >
+            Changes
+          </button>
+          <button
+            onClick={() => { if (reportReady) setVersionsOpen(true); }}
+            disabled={!reportReady}
+            title="Compare and roll back report versions"
+            style={headerPill(reportReady)}
+          >
+            Versions
+          </button>
           <div
             role="tablist"
             style={{
@@ -474,7 +597,7 @@ export default function ChatView() {
           </div>
         )}
 
-        <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: '20px 0' }}>
+        <div ref={scrollRef} onScroll={handleMessagesScroll} style={{ flex: 1, overflowY: 'auto', padding: '20px 0' }}>
           <div style={{ maxWidth: 780, margin: '0 auto', padding: '0 28px' }}>
             {messages.length === 0 && (
               <div
@@ -492,14 +615,28 @@ export default function ChatView() {
                 </p>
               </div>
             )}
-            {messages.map((m) => (
-              <RichMessage
-                key={m.id}
-                msg={m}
-                contextMode={contextMode}
-                onToggleSelect={() => toggleSelect(m.id)}
-              />
-            ))}
+            {savedOnly && (
+              <p style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--fg-muted)', textAlign: 'center', margin: '0 0 10px', letterSpacing: '.05em' }}>
+                SHOWING SAVED OUTPUTS ONLY
+              </p>
+            )}
+            {messages
+              .filter((m) => !savedOnly || Boolean(m.savedLabel))
+              .map((m) => (
+                <RichMessage
+                  key={m.id}
+                  msg={m}
+                  contextMode={contextMode}
+                  onToggleSelect={() => toggleSelect(m.id)}
+                  onQueueChange={(text) => { setChangeDraft(text); setPendingOpen(true); }}
+                  streaming={isStreaming && m.id === streamingMsgId}
+                />
+              ))}
+            {savedOnly && messages.every((m) => !m.savedLabel) && (
+              <p style={{ textAlign: 'center', fontSize: 12, color: 'var(--fg-muted)', padding: '20px' }}>
+                No saved briefings yet. Use a persona quick-action (e.g. Go / no-go, Cost analysis) to generate one.
+              </p>
+            )}
             {isStreaming && thinkingMessage && (
               <p
                 style={{
@@ -513,46 +650,81 @@ export default function ChatView() {
                 {thinkingMessage}
               </p>
             )}
+            <ToolActivity tool={currentTool} status={toolStatus} />
           </div>
+          {showJump && (
+            <button
+              onClick={jumpToLatest}
+              title="Scroll to latest"
+              style={{
+                position: 'sticky', bottom: 12, left: 0, right: 0, margin: '0 auto',
+                width: 'fit-content', zIndex: 5, display: 'flex', alignItems: 'center', gap: 6,
+                padding: '6px 14px', borderRadius: 999,
+                border: '1px solid var(--border-strong)', background: 'var(--surface)',
+                color: 'var(--fg-dim)', fontSize: 11.5, fontFamily: 'var(--font-sans)',
+                cursor: 'pointer', boxShadow: 'var(--shadow-lg)',
+              }}
+            >
+              ↓ Jump to latest
+            </button>
+          )}
         </div>
 
-        {messages.length < 4 && (
-          <div
-            style={{
-              flexShrink: 0,
-              padding: '0 20px 8px',
-              display: 'flex',
-              gap: 6,
-              flexWrap: 'wrap',
-              maxWidth: 820,
-              margin: '0 auto',
-              width: '100%',
-            }}
-          >
-            {SUGGESTIONS.map((s) => (
-              <button
-                key={s}
-                onClick={() => {
-                  setInput(s);
-                  textareaRef.current?.focus();
-                }}
+        <div
+          style={{
+            flexShrink: 0,
+            padding: '0 20px 8px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            maxWidth: 920,
+            margin: '0 auto',
+            width: '100%',
+            overflowX: 'auto',
+          }}
+        >
+          {QUICK_ACTIONS.map((g) => (
+            <div key={g.group} style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+              <span
                 style={{
-                  padding: '5px 11px',
-                  borderRadius: 999,
-                  border: '1px solid var(--border)',
-                  background: 'var(--surface)',
-                  color: 'var(--fg-dim)',
-                  fontSize: 11,
-                  fontFamily: 'var(--font-sans)',
-                  cursor: 'pointer',
-                  whiteSpace: 'nowrap',
+                  fontFamily: 'var(--font-mono)', fontSize: 8.5, letterSpacing: '.08em',
+                  textTransform: 'uppercase', color: 'var(--fg-muted)',
                 }}
               >
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
+                {g.group}
+              </span>
+              {g.actions.map((a) => (
+                <button
+                  key={a.label}
+                  onClick={() => prefillComposer(a.prompt)}
+                  disabled={isStreaming || atCap || !reportReady}
+                  style={{
+                    padding: '5px 11px', borderRadius: 999, border: '1px solid var(--border)',
+                    background: 'var(--surface)', color: 'var(--fg-dim)', fontSize: 11,
+                    fontFamily: 'var(--font-sans)', cursor: 'pointer', whiteSpace: 'nowrap',
+                    opacity: isStreaming || atCap || !reportReady ? 0.5 : 1,
+                  }}
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          ))}
+          <div style={{ flex: 1, minWidth: 8 }} />
+          <button
+            onClick={() => setSavedOnly((v) => !v)}
+            title="Show only saved briefings/analyses"
+            style={{
+              flexShrink: 0, padding: '5px 11px', borderRadius: 999,
+              border: `1px solid ${savedOnly ? 'var(--accent)' : 'var(--border)'}`,
+              background: savedOnly ? 'var(--accent-soft)' : 'var(--surface)',
+              color: savedOnly ? 'var(--accent)' : 'var(--fg-dim)', fontSize: 11,
+              fontFamily: 'var(--font-mono)', letterSpacing: '.04em', cursor: 'pointer', whiteSpace: 'nowrap',
+            }}
+          >
+            {savedOnly ? '✕ Saved' : '★ Saved'}
+          </button>
+        </div>
 
         <div
           style={{
@@ -716,9 +888,44 @@ export default function ChatView() {
         </>
         )}
       </div>
-      <IntegrationsSidebar />
+      <IntegrationsSidebar chatHistoryId={chatHistoryId} />
+      {chatHistoryId && (
+        <PendingChangesPanel
+          chatHistoryId={chatHistoryId}
+          open={pendingOpen}
+          onClose={() => { setPendingOpen(false); setChangeDraft(undefined); }}
+          draft={changeDraft}
+        />
+      )}
+      {chatHistoryId && (
+        <VersionsPanel
+          chatHistoryId={chatHistoryId}
+          open={versionsOpen}
+          onClose={() => setVersionsOpen(false)}
+          onChanged={reloadChat}
+          onAskInChat={(p) => { setVersionsOpen(false); prefillComposer(p); }}
+        />
+      )}
     </div>
   );
+}
+
+function headerPill(enabled: boolean): React.CSSProperties {
+  return {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '5px 11px',
+    borderRadius: 999,
+    border: `1px solid ${enabled ? 'var(--border-strong)' : 'var(--border)'}`,
+    background: 'transparent',
+    color: enabled ? 'var(--fg-dim)' : 'var(--fg-muted)',
+    fontSize: 11,
+    fontFamily: 'var(--font-mono)',
+    letterSpacing: '.06em',
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    opacity: enabled ? 1 : 0.6,
+  };
 }
 
 function TabButton({

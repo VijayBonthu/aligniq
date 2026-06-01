@@ -78,3 +78,7 @@ migrations
 dump_latest_report.py
 mermaid-selftest.html
 tests
+HANDOFF.md
+frontend_green\.env.production
+frontend_green/.env.production
+frontend_orange

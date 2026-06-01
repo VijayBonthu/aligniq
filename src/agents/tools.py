@@ -135,6 +135,21 @@ _SEQ_ALIAS_RE = re.compile(
     r"^(\s*(?:participant|actor)\s+\S+\s+as\s+)(.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# Flowchart-style participant labels — `participant S["Scheduler, daily…"]` or
+# `participant S[Scheduler]` — are invalid in a sequenceDiagram: the parser wants
+# `participant S` / `participant S as <name>` and rejects the `[` (the real-world
+# "Expecting 'ACTOR', got 'INVALID'" failure). The LLM borrowed flowchart node
+# syntax. Capture id + bracket label so we can rewrite to a quoted `as` alias.
+_SEQ_PARTICIPANT_BRACKET_RE = re.compile(
+    r"^(\s*(?:participant|actor)\s+)([A-Za-z0-9_]+)\s*\[\s*(.+?)\s*\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Inside a sequenceDiagram, actors are *referenced* in message / Note / activate
+# lines with the same bad flowchart shape, e.g. `S["Scheduler"] ->> W["Worker"]: hi`.
+# The parser rejects the `[` after an actor too (`Expecting '…ARROW…', got ','`).
+# Once the participant declarations carry the label via `as`, these inline labels
+# are pure noise — strip every `id[…]` down to the bare id so the messages parse.
+_SEQ_ACTOR_BRACKET_RE = re.compile(r"([A-Za-z0-9_]+)\[[^\]\n]*\]")
 
 
 def _quote_mermaid_label(label: str) -> str:
@@ -169,8 +184,18 @@ def _repair_one_mermaid_block(body: str) -> str:
         )
         return _FLOWCHART_EDGE_LABEL_RE.sub(_quote_edge_label, out)
     if head.startswith("sequenceDiagram"):
+        # 1) Declarations: `participant S[...]` -> `participant S as "..."`. Must
+        #    run before the strip below so the label is preserved as the alias.
+        out = _SEQ_PARTICIPANT_BRACKET_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)} as {_quote_mermaid_label(m.group(3))}", body
+        )
+        # 2) Strip the bracket label off every remaining inline actor reference
+        #    (message / Note / activate lines). Declarations were rewritten in (1),
+        #    so this only touches refs; the declared `as` alias keeps the name.
+        out = _SEQ_ACTOR_BRACKET_RE.sub(lambda m: m.group(1), out)
+        # 3) Quote any bare `as` aliases (idempotent: (1) already emits quoted ones).
         out = _SEQ_ALIAS_RE.sub(
-            lambda m: f"{m.group(1)}{_quote_mermaid_label(m.group(2))}", body
+            lambda m: f"{m.group(1)}{_quote_mermaid_label(m.group(2))}", out
         )
         return "\n".join(_replace_seq_semicolons(ln) for ln in out.split("\n"))
     return body

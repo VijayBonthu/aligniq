@@ -257,3 +257,174 @@ def assemble_deliverable(
 def default_excluded_ids(sections: List[Section]) -> List[str]:
     """Section IDs that should default to excluded (kind == 'internal')."""
     return [s.id for s in sections if s.kind == "internal"]
+
+
+# ---------------------------------------------------------------------------
+# Fenced-block + diagram extraction, and friendly-name section lookup.
+#
+# These power the "report-as-wiki" chat retrieval (Tier 1): the chat agent
+# serves whole sections and diagrams DETERMINISTICALLY from the stored report
+# markdown instead of reassembling fuzzy vector fragments. The same fence
+# splitter keeps mermaid/code blocks atomic during section-aware chunking
+# (vectordb/chunking.py) so embeddings never shred a diagram again.
+# ---------------------------------------------------------------------------
+
+# Fenced code/diagram block: ```lang\n ... \n```  (lang optional). DOTALL so the
+# body can span lines; non-greedy so adjacent blocks don't merge.
+_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n.*?```", re.DOTALL)
+
+# Any markdown heading line (H1–H6), used to label a diagram with its section.
+_ANY_HEADING_RE = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
+
+# Fence languages we treat as renderable diagrams (the chat UI renders mermaid +
+# ascii via MermaidBlock; plantuml/uml/graphviz are kept for forward-compat).
+DIAGRAM_LANGS = {
+    "mermaid", "ascii", "plantuml", "uml", "dot", "graphviz", "sequencediagram",
+}
+
+
+def iter_fenced_blocks(markdown: str) -> Iterator[tuple[int, int, str, str]]:
+    """Yield (start, end, lang_lowercased, full_block_text) for every fenced
+    block in `markdown`, in order. `full_block_text` includes the ``` fences."""
+    if not markdown:
+        return
+    for m in _FENCE_RE.finditer(markdown):
+        yield m.start(), m.end(), (m.group(1) or "").lower(), m.group(0)
+
+
+def _nearest_heading(markdown: str, pos: int) -> str:
+    """The text of the last heading that appears before `pos` (or '')."""
+    best = ""
+    for m in _ANY_HEADING_RE.finditer(markdown[:pos]):
+        best = m.group(1).strip()
+    return best
+
+
+def extract_diagrams(markdown: str, kind: Optional[str] = None) -> List[dict]:
+    """Pull every diagram fence out of the report markdown, intact.
+
+    Returns a list of {"kind", "heading", "code"} where `code` is the verbatim
+    ```fence``` block (ready to return to the chat, which renders it). `heading`
+    is the nearest preceding section heading so the agent can label/cite it.
+    `kind` filters to a single diagram language (e.g. "mermaid").
+    """
+    out: List[dict] = []
+    if not markdown:
+        return out
+    want = kind.strip().lower() if kind else None
+    for start, _end, lang, full in iter_fenced_blocks(markdown):
+        if lang not in DIAGRAM_LANGS:
+            continue
+        if want and lang != want:
+            continue
+        out.append({
+            "kind": lang or "mermaid",
+            "heading": _nearest_heading(markdown, start),
+            "code": full,
+        })
+    return out
+
+
+# Friendly section name -> heading keywords, ordered MOST specific first. Matched
+# case-insensitively as substrings of the parsed heading text. Lets the chat tool
+# accept stable names (tech_stack, timeline, ...) regardless of the exact
+# (numbered or un-numbered) heading the pipeline emitted. Order matters: the most
+# specific alias that matches any heading wins (so "tech_stack" prefers
+# "Recommended Tech Stack" over a generic "Architecture", and "timeline" prefers
+# "Phased Roadmap" over "Cost & Effort Estimate").
+_SECTION_ALIASES: dict[str, List[str]] = {
+    "executive_summary": ["executive summary", "summary", "overview", "tl;dr"],
+    "tech_stack": ["technology stack", "tech stack", "recommended tech", "technology", "stack", "solution architecture", "proposed architecture", "architecture"],
+    "team_structure": ["team composition", "team structure", "staffing gaps", "staffing", "team", "resourcing", "roles", "squad"],
+    "timeline": ["phased roadmap", "roadmap", "timeline", "schedule", "milestones", "delivery plan", "phases", "duration"],
+    "risks": ["risks & mitigations", "risks and mitigations", "key risks", "risk register", "risk", "known issues", "gotchas", "concerns", "blind spots", "challenges"],
+    "recommendations": ["recommendations", "recommendation", "next steps", "go/no-go", "verdict", "feasibility & cost", "feasibility"],
+}
+
+
+def find_section(sections: List[Section], name: str) -> Optional[Section]:
+    """Resolve a friendly name / id / heading to a parsed Section, or None.
+
+    Resolution order: exact section id -> exact heading -> alias-keyword match in
+    priority order (most specific alias first, H2 before H3) -> heading substring.
+    Empty input returns None.
+    """
+    if not sections or not name:
+        return None
+    raw = name.strip()
+    key = raw.lower()
+
+    for s in sections:  # exact id
+        if s.id == raw:
+            return s
+    for s in sections:  # exact heading text
+        if s.heading_text.lower() == key:
+            return s
+
+    # Priority match: try each alias in order; the first alias that hits any
+    # heading wins (H2 preferred over H3 for that alias).
+    aliases = _SECTION_ALIASES.get(key, [key])
+    for alias in aliases:
+        for level in (2, 3):
+            for s in sections:
+                if s.heading_level == level and alias in s.heading_text.lower():
+                    return s
+
+    for s in sections:  # last resort: the raw name appears in a heading
+        if key in s.heading_text.lower():
+            return s
+    return None
+
+
+def report_delivery_items(markdown: str, summary_report, scope: str = "risks",
+                          section_ids: Optional[set] = None) -> tuple[str, List[dict]]:
+    """Build (epic_description, items) for a report -> Jira/delivery export.
+
+    scope 'risks'  -> one item per entry in the typed risk register.
+    scope 'sections' -> one item per non-internal report section (optionally filtered
+    to `section_ids`). Each item = {"summary", "description"}. Shared by the Jira
+    REST endpoint and the push_to_jira chat tool so they stay in lockstep.
+    """
+    summary = summary_report if isinstance(summary_report, dict) else {}
+    items: List[dict] = []
+
+    if scope == "sections":
+        ids = set(section_ids or [])
+        for s in parse_sections(markdown or ""):
+            if s.kind == "internal":
+                continue
+            if ids and s.id not in ids:
+                continue
+            items.append({"summary": s.heading_text, "description": s.raw_markdown})
+        return ("Delivery work breakdown generated from the AlignIQ analysis report.", items)
+
+    risks = summary.get("key_risks") or summary.get("risks") or []
+    if isinstance(risks, list):
+        for r in risks:
+            if isinstance(r, dict):
+                title = r.get("risk") or r.get("title") or r.get("description") or "Risk"
+                desc = r.get("mitigation") or r.get("impact") or ""
+                items.append({"summary": str(title), "description": str(desc)})
+            elif r:
+                items.append({"summary": str(r), "description": ""})
+    return ("Risk register exported from the AlignIQ analysis report.", items)
+
+
+def list_sections(markdown: str) -> List[dict]:
+    """A lightweight table-of-contents for the report: id, heading, level, and
+    whether the section contains a diagram. Powers the chat 'what's in here?'
+    navigation and lets the agent cite sections."""
+    sections = parse_sections(markdown)
+    toc: List[dict] = []
+    for s in sections:
+        has_diagram = any(
+            lang in DIAGRAM_LANGS for _s, _e, lang, _f in iter_fenced_blocks(s.raw_markdown)
+        )
+        toc.append({
+            "id": s.id,
+            "heading": s.heading_text,
+            "level": s.heading_level,
+            "kind": s.kind,
+            "has_diagram": has_diagram,
+        })
+    return toc

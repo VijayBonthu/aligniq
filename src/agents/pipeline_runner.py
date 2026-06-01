@@ -87,6 +87,7 @@ async def _persist_final_report(
     title: str,
     db,
     report_contract: Optional[dict] = None,
+    applied_changes: Optional[list] = None,
 ) -> None:
     """Append the final report to chat_history, embed it, save report version,
     and mark the analysis_link as full_report_generated.
@@ -132,28 +133,47 @@ async def _persist_final_report(
         db=db,
     )
 
-    # Vector embeddings for /chat-with-doc retrieval.
+    # Vector embeddings for /chat-with-doc retrieval (fallback path — chat serves
+    # sections/diagrams deterministically from report_content). Section-aware +
+    # content_type metadata so even fuzzy search returns coherent sections.
     try:
-        chunks = await chunking.chunk_text(text=report_text)
-        await vector_db.create_embeddings(
-            texts=chunks,
+        await vector_db.embed_report(
+            markdown=report_text,
             model=settings.EMBEDDING_MODEL,
             chat_history_id=chat_history_id,
+            document_id=document_id,
         )
     except Exception as e:
-        # Non-fatal: chat still works without embeddings, just no retrieval.
+        # Non-fatal: chat still works without embeddings, just no fuzzy retrieval.
         logger.error(f"pipeline_runner: embedding failed for {chat_history_id}: {e}")
+
+    # Build a human-readable changelog so each regenerated version is identifiable
+    # in the Versions panel (deterministic — the changes the user actually queued).
+    changes_applied = applied_changes or []
+    changelog_summary = None
+    if changes_applied:
+        reqs = [c.get("user_request", "").strip() for c in changes_applied
+                if isinstance(c, dict) and c.get("user_request")]
+        reqs = [r for r in reqs if r]
+        if reqs:
+            head = "; ".join(reqs[:3])
+            more = f" (+{len(reqs) - 3} more)" if len(reqs) > 3 else ""
+            changelog_summary = f"Applied {len(reqs)} change(s): {head}{more}"
+        else:
+            changelog_summary = "Regenerated with changes"
 
     # Report version row (mirrors services.generate_full_report behavior).
     try:
         summary = await main_report_summary(main_report=report_text, version_number=1)
         await save_report_version(
             summary_report_details={
-                "chat_history_id": chat_history_id,
-                "user_id":         user_id,
-                "report_content":  report_text,
-                "summary_report":  summary,
-                "report_contract": report_contract,
+                "chat_history_id":    chat_history_id,
+                "user_id":            user_id,
+                "report_content":     report_text,
+                "summary_report":     summary,
+                "report_contract":    report_contract,
+                "changes_applied":    changes_applied,
+                "changelog_summary":  changelog_summary,
             },
             db=db,
         )
@@ -181,6 +201,7 @@ async def run_full_pipeline_async(
     document: list[str],
     title: str,
     resume_from_snapshot: Optional[dict] = None,
+    applied_changes: Optional[list] = None,
 ) -> None:
     """
     Top-level entry scheduled via BackgroundTasks. Owns its own DB session.
@@ -230,6 +251,7 @@ async def run_full_pipeline_async(
             firm_context=firm_context_block,
             firm_id=firm_id_for_run,
             db=db,
+            applied_changes=applied_changes,
         )
         return
 
@@ -381,6 +403,7 @@ async def run_full_pipeline_async(
                 report_text=report_text,
                 title=title,
                 db=db,
+                applied_changes=applied_changes,
             )
         await complete_pipeline_run(run_id, db)
         logger.info(f"pipeline_runner: completed run {run_id} for chat {chat_history_id}")
@@ -414,6 +437,7 @@ async def _run_contract_pipeline_path(
     firm_context: str,
     firm_id: Optional[str],
     db,
+    applied_changes: Optional[list] = None,
 ) -> None:
     """Sibling of run_full_pipeline_async for USE_CONTRACT_PIPELINE=true.
 
@@ -478,6 +502,7 @@ async def _run_contract_pipeline_path(
                 title=title,
                 db=db,
                 report_contract=result.get("contract"),
+                applied_changes=applied_changes,
             )
 
         await complete_pipeline_run(run_id, db)

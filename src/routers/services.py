@@ -4991,6 +4991,51 @@ async def remove_pending_change_endpoint(
         raise HTTPException(status_code=500, detail=f"Error removing pending change: {str(e)}")
 
 
+@router.put('/pending-changes/{chat_history_id}/{change_id}')
+async def update_pending_change_endpoint(
+    chat_history_id: str,
+    change_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Edit a queued pending change in place (text / target section / change type).
+    Powers the pending-change panel's inline edit, so a requirement the chat
+    captured imperfectly can be corrected or expanded without deleting and
+    re-adding it. Reuses the existing update_pending_change DB helper.
+
+    Body: { user_request?: str, target_section?: str, change_type?: str }
+    """
+    from database_scripts import update_pending_change
+
+    updates: dict = {}
+    if payload:
+        if "user_request" in payload:
+            user_request = (payload.get("user_request") or "").strip()
+            if not user_request:
+                raise HTTPException(status_code=400, detail="user_request cannot be empty")
+            updates["user_request"] = user_request
+        if "target_section" in payload:
+            target_section = payload.get("target_section") or "general"
+            updates["target_section"] = target_section
+            # Keep the derived type in sync with the add endpoint's convention.
+            updates["type"] = f"modify_{target_section}" if target_section != "general" else "modify_architecture"
+        if "change_type" in payload:
+            updates["change_type"] = payload.get("change_type") or "modify"
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updatable fields provided")
+    try:
+        result = await update_pending_change(chat_history_id, change_id, updates, db)
+        logger.info(f"Updated pending change {change_id} for chat_history_id: {chat_history_id}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating pending change: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating pending change: {str(e)}")
+
+
 @router.delete('/pending-changes/{chat_history_id}')
 async def clear_all_pending_changes_endpoint(
     chat_history_id: str,
@@ -5010,6 +5055,159 @@ async def clear_all_pending_changes_endpoint(
     except Exception as e:
         logger.error(f"Error clearing pending changes: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error clearing pending changes: {str(e)}")
+
+
+@router.post('/pending-changes/{chat_history_id}', status_code=status.HTTP_201_CREATED)
+async def add_pending_change_endpoint(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Queue a pending change WITHOUT routing through the chat LLM. Powers the
+    "Queue this change" quick-action (e.g. from a cost-analysis suggestion) and
+    the pending-change panel. Mirrors the add_pending_change tool exactly so the
+    change shape and undo transaction are identical.
+
+    Body: { user_request: str (required), target_section?: str, change_type?: str }
+    """
+    from database_scripts import add_pending_change as db_add_change, record_transaction
+
+    user_request = (payload or {}).get("user_request", "").strip()
+    if not user_request:
+        raise HTTPException(status_code=400, detail="user_request is required")
+    target_section = (payload or {}).get("target_section", "general")
+    change_type = (payload or {}).get("change_type", "modify")
+    change_data = {
+        "user_request": user_request,
+        "target_section": target_section,
+        "type": f"modify_{target_section}" if target_section != "general" else "modify_architecture",
+        "change_type": change_type,
+    }
+    try:
+        result = await db_add_change(chat_history_id, change_data, db)
+        if result.get("status") == "success":
+            await record_transaction(
+                chat_history_id=chat_history_id,
+                action_type="add_change",
+                action_data={"change_id": result.get("change_id"), "user_request": user_request, "change_data": change_data},
+                description=f"Added {result.get('change_id')}: {user_request[:50]}",
+                db=db,
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding pending change: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error adding pending change: {str(e)}")
+
+
+@router.post('/report/regenerate/{chat_history_id}', status_code=status.HTTP_202_ACCEPTED)
+async def regenerate_report_endpoint(
+    chat_history_id: str,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Regenerate the report applying all queued pending changes as mandatory
+    constraints — ASYNC. Reuses the full-pipeline job (run_full_pipeline_async)
+    and pipeline_runs, so the UI tracks progress via /full-pipeline/status and
+    FullPipelineProgress exactly like initial generation (no 10-min blocking call).
+
+    Pending changes are baked into the scheduled run's document, then cleared
+    optimistically (a transaction is recorded for recoverability).
+    """
+    from database_scripts import (
+        create_or_reset_pipeline_run, get_pipeline_run_by_chat,
+        get_pending_changes, clear_pending_changes, record_transaction,
+    )
+    from agents.pipeline_runner import run_full_pipeline_async
+
+    user_id = current_user["regular_login_token"]["id"]
+    check_regen_limit(user_id, db)
+
+    chat = await get_single_user_chat_history(chat_history_id=chat_history_id, user_id=user_id, db=db)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat history not found")
+    document_id = chat.get("document_id")
+    if not document_id:
+        raise HTTPException(status_code=400, detail="Chat is missing document_id")
+
+    pending = await get_pending_changes(chat_history_id, db)
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending changes to apply. Queue a change first.")
+
+    link = await get_analysis_link(document_id=document_id, user_id=user_id, db=db)
+    if not link or not link.get("presales_id"):
+        raise HTTPException(status_code=400, detail="No presales analysis linked to this chat.")
+    presales_id = link["presales_id"]
+    presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
+    if not presales:
+        raise HTTPException(status_code=404, detail="Presales analysis not found")
+
+    existing = await get_pipeline_run_by_chat(chat_history_id, db)
+    if existing and existing["status"] in ("queued", "running"):
+        return {
+            "run_id": existing["run_id"], "chat_history_id": chat_history_id,
+            "status": existing["status"], "current_stage": existing["current_stage"],
+            "message": "Pipeline already in progress",
+        }
+
+    # Same presales-derived context as initial generation, with the queued changes
+    # prepended as MANDATORY constraints so every agent honors them.
+    raw_messages = chat.get("message") or "[]"
+    try:
+        msgs = json.loads(raw_messages) if isinstance(raw_messages, str) else (raw_messages or [])
+    except json.JSONDecodeError:
+        msgs = []
+    presales_brief_text = ""
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("type") == "presales_brief":
+            presales_brief_text = m.get("content", "")
+            break
+    extracted = presales.get("extracted_requirements") or {}
+    blind_spots = presales.get("blind_spots") or {}
+    constraints_block = "## MANDATORY CHANGES TO APPLY (override prior analysis)\n" + "\n".join(
+        f"- [{c.get('id', 'CHG')}] ({c.get('target_section', 'general')}/{c.get('change_type', 'modify')}) {c.get('user_request', '')}"
+        for c in pending
+    ) + "\n"
+    enhanced_context = (
+        constraints_block + "\n"
+        "## Pre-Sales Analysis Context\n\n"
+        f"### Project Summary\n{extracted.get('project_summary', 'N/A')}\n\n"
+        f"### Technologies Identified\n{json.dumps(extracted.get('technologies_mentioned', []), indent=2)}\n\n"
+        f"### Blind Spots & Risks Identified\n{json.dumps(blind_spots, indent=2)}\n\n"
+        f"### Approved Presales Brief\n{presales_brief_text or '(brief not available — using extracted requirements only)'}\n"
+    )
+    title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
+
+    run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
+    background_tasks.add_task(
+        run_full_pipeline_async,
+        run_id=run["run_id"], chat_history_id=chat_history_id, user_id=user_id,
+        document_id=document_id, presales_id=presales_id, document=[enhanced_context], title=title,
+        applied_changes=pending,
+    )
+    increment_regen_count(user_id, db)
+
+    # Optimistically clear the queue (changes are now in the scheduled document).
+    try:
+        await record_transaction(
+            chat_history_id=chat_history_id, action_type="regenerate",
+            action_data={"applied_changes": pending},
+            description=f"Regenerated applying {len(pending)} change(s)", db=db,
+        )
+        await clear_pending_changes(chat_history_id, db)
+    except Exception as e:
+        logger.warning(f"regenerate: failed to clear pending changes for {chat_history_id}: {e}")
+
+    return {
+        "run_id": run["run_id"], "chat_history_id": chat_history_id,
+        "status": run["status"], "current_stage": run["current_stage"],
+        "applied_changes": len(pending),
+    }
 
 
 # ============================================================
@@ -5040,6 +5238,71 @@ async def get_version_history(
     except Exception as e:
         logger.error(f"Error retrieving version history: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error retrieving version history: {str(e)}")
+
+
+@router.get('/report-versions/{chat_history_id}/metrics')
+async def get_version_metrics_endpoint(
+    chat_history_id: str,
+    versions: str = None,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """Cross-version comparable metrics (cost / timeline / verdict / headline tech),
+    computed deterministically from each version's stored decisions. Powers the compare
+    screen's metrics matrix and the 'cheapest/fastest' ranking.
+
+    NOTE: defined BEFORE /{version_number} so the literal 'metrics' segment isn't parsed
+    as a version number (the same shadowing that broke /diff).
+
+    Optional `?versions=1,3,4` scopes to a subset; default = all versions.
+    """
+    from utils.version_compare import version_metrics
+    try:
+        subset = None
+        if versions:
+            subset = [int(x) for x in versions.replace(" ", "").split(",") if x]
+        metrics = await version_metrics(chat_history_id, db, subset)
+        return {"chat_history_id": chat_history_id, "metrics": metrics}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error computing version metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error computing version metrics: {str(e)}")
+
+
+@router.get('/report-versions/{chat_history_id}/sections/{version_number}')
+async def get_version_sections_endpoint(
+    chat_history_id: str,
+    version_number: int,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """Parsed sections of one version (id, heading, raw_markdown, has_diagram) — feeds the
+    side-by-side section picker on the compare screen. Diagram fences stay atomic. Two path
+    segments, so no collision with /{version_number}."""
+    from utils.report_sections import parse_sections, iter_fenced_blocks, DIAGRAM_LANGS
+    try:
+        rec = await get_report_version_by_number(chat_history_id, version_number, db)
+        md = rec.get("report_content") or ""
+        sections = []
+        for s in parse_sections(md if isinstance(md, str) else ""):
+            has_diagram = any(
+                lang in DIAGRAM_LANGS for _a, _b, lang, _f in iter_fenced_blocks(s.raw_markdown)
+            )
+            sections.append({
+                "id": s.id,
+                "heading": s.heading_text,
+                "level": s.heading_level,
+                "kind": s.kind,
+                "has_diagram": has_diagram,
+                "raw_markdown": s.raw_markdown,
+            })
+        return {"chat_history_id": chat_history_id, "version_number": version_number, "sections": sections}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting version sections: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting version sections: {str(e)}")
 
 
 @router.get('/report-versions/{chat_history_id}/{version_number}')
@@ -5108,7 +5371,7 @@ async def rollback_to_previous_version(
         raise HTTPException(status_code=500, detail=f"Error rolling back: {str(e)}")
 
 
-@router.get('/report-versions/{chat_history_id}/diff')
+@router.get('/report-versions/{chat_history_id}/diff/{version_a}/{version_b}')
 async def compare_versions(
     chat_history_id: str,
     version_a: int,
@@ -5117,16 +5380,42 @@ async def compare_versions(
     db: Session = Depends(get_db)
 ):
     """
-    Compare two report versions and get diff statistics.
+    Compare two report versions. Path params (not query) so the route can't be
+    mistaken for /report-versions/{id}/{version_number} — that collision was why
+    compare returned nothing.
 
-    Query params:
-        version_a: First version number
-        version_b: Second version number
-
-    Returns diff statistics and summary comparison.
+    Returns diff statistics + the two executive summaries + changelogs.
     """
     try:
         diff = await get_report_diff(chat_history_id, version_a, version_b, db)
+        # Enrich with each version's changelog so the comparison is meaningful,
+        # not just line counts.
+        try:
+            from utils.version_compare import compute_contract_delta
+            va = await get_report_version_by_number(chat_history_id, version_a, db)
+            vb = await get_report_version_by_number(chat_history_id, version_b, db)
+            diff["changelog_a"] = va.get("changelog_summary")
+            diff["changelog_b"] = vb.get("changelog_summary")
+            # Typed decision delta (cost / timeline / tech swaps / verdict) — computed,
+            # never narrated. None when neither version carries a contract.
+            diff["decision_delta"] = compute_contract_delta(
+                va.get("report_contract"), vb.get("report_contract")
+            )
+            # The "why" log: changes applied across the span (earlier, later] — i.e. the
+            # queued items that produced each version after the earlier one.
+            lo, hi = sorted((version_a, version_b))
+            applied = []
+            for n in range(lo + 1, hi + 1):
+                try:
+                    rec = await get_report_version_by_number(chat_history_id, n, db)
+                    ca = rec.get("changes_applied") or []
+                    if isinstance(ca, list):
+                        applied.extend(ca)
+                except Exception:
+                    continue
+            diff["changes_applied"] = applied
+        except Exception:
+            pass
         logger.info(f"Computed diff between versions {version_a} and {version_b} for chat_history_id: {chat_history_id}")
         return diff
     except HTTPException:
@@ -5134,6 +5423,43 @@ async def compare_versions(
     except Exception as e:
         logger.error(f"Error computing diff: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error computing diff: {str(e)}")
+
+
+@router.post('/report-versions/{chat_history_id}/default/{version_number}')
+async def set_default_report_version(
+    chat_history_id: str,
+    version_number: int,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """
+    Mark a version as the active/default. The chat then answers from THIS version
+    (get_summary_report is default-preferred) and the vector store is re-embedded
+    with its content, so fuzzy search stops surfacing the previously-active
+    version. No new version is created.
+    """
+    from database_scripts import set_default_version, get_report_version_content
+
+    user_id = current_user["regular_login_token"]["id"]
+    try:
+        result = await set_default_version(chat_history_id, user_id, version_number, db)
+        try:
+            content = await get_report_version_content(chat_history_id, version_number, db)
+            if content:
+                await vector_db.embed_report(
+                    markdown=content,
+                    model=settings.EMBEDDING_MODEL,
+                    chat_history_id=chat_history_id,
+                )
+                logger.info(f"Re-embedded vector DB for new default version {version_number}")
+        except Exception as vec_error:
+            logger.warning(f"Failed to re-embed after set-default: {str(vec_error)}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting default version {version_number}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error setting default version: {str(e)}")
 
 
 # ============================================================================
@@ -5868,6 +6194,29 @@ async def conversation_with_doc_stream(
         # context-manager boundaries cleanly here).
         _ctx = use_recorder(_stream_recorder)
         _ctx.__enter__()
+        # Bet 3 — bind the firm scope that firm_project_search reads. Tenant scope
+        # comes from the user's firm_id (JWT-derived), never from LLM args. Must be
+        # set inside this SSE task: contextvars don't cross the task boundary.
+        _firm_token = None
+        if getattr(settings, "ENABLE_FIRM_CONTEXT", False):
+            try:
+                from utils.chat_tools import set_firm_id_context
+                _u = db.query(models.User).filter(models.User.user_id == user_id).first()
+                _firm_token = set_firm_id_context(_u.firm_id if _u else None)
+            except Exception as _fe:
+                logger.warning(f"stream: firm context bind failed for {user_id}: {_fe}")
+        # Bind the Jira token (if connected) so push_to_jira can create tickets. Tokens
+        # are stored server-side and auto-refreshed; resolve the current user's access
+        # token from the DB (None if not connected).
+        try:
+            from utils.chat_tools import tool_context as _tool_ctx
+            from jira_logic.jira_components import get_valid_jira_access_token
+            try:
+                _tool_ctx.jira_token = await get_valid_jira_access_token(user_id, db)
+            except Exception:
+                _tool_ctx.jira_token = None
+        except Exception as _je:
+            logger.warning(f"stream: jira token bind failed: {_je}")
         try:
             # Get conversation history for context
             conversation_history = [
@@ -5897,6 +6246,24 @@ async def conversation_with_doc_stream(
 
             # Save chat history after streaming completes
             if final_content:
+                # Durable loop: if a briefing/analysis tool produced this reply,
+                # tag it so the "Saved outputs" view can resurface + export it
+                # instead of it being lost in scrollback.
+                _BRIEFING_TOOLS = {
+                    "prepare_client_meeting_brief": "Client Meeting Brief",
+                    "prepare_executive_summary": "Executive Summary",
+                    "get_technical_deep_dive": "Technical Deep-Dive",
+                    "get_implementation_gotchas": "Implementation Gotchas",
+                    "get_project_blind_spots": "Blind Spots",
+                    "analyze_cost_reduction": "Cost Analysis",
+                    "analyze_timeline_acceleration": "Timeline Analysis",
+                    "suggest_optimization": "Optimization",
+                }
+                saved_label = next(
+                    (_BRIEFING_TOOLS[t["tool"]] for t in tools_called
+                     if isinstance(t, dict) and t.get("tool") in _BRIEFING_TOOLS),
+                    None,
+                )
                 new_assistant_message = {
                     "role": "assistant",
                     "content": final_content,
@@ -5905,6 +6272,9 @@ async def conversation_with_doc_stream(
                     "type": "streaming_response",
                     "tools_called": tools_called
                 }
+                if saved_label:
+                    new_assistant_message["saved_output"] = True
+                    new_assistant_message["saved_label"] = saved_label
                 chat_context["message"].append(new_assistant_message)
                 await save_chat_history(chat=chat_context, db=db)
                 increment_message_count(chat_history_id, user_id, db)
@@ -5918,6 +6288,12 @@ async def conversation_with_doc_stream(
                 error_detail=str(e)
             ).to_sse()
         finally:
+            if _firm_token is not None:
+                try:
+                    from utils.chat_tools import _firm_id_ctx
+                    _firm_id_ctx.reset(_firm_token)
+                except Exception:
+                    pass
             try:
                 _ctx.__exit__(None, None, None)
             except Exception:

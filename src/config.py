@@ -24,6 +24,9 @@ class Settings:
     JIRA_CLIENT_ID = os.getenv("JIRA_CLIENT_ID")
     JIRA_CLIENT_SECRET = os.getenv("JIRA_CLIENT_SECRET")
     JIRA_REDIRECT_URI=os.getenv("JIRA_REDIRECT_URI")
+    # Optional dedicated Fernet key for encrypting stored Jira tokens at rest. If unset,
+    # utils/crypto derives a stable key from SECRET_KEY_J (encryption is always on).
+    JIRA_TOKEN_ENC_KEY=os.getenv("JIRA_TOKEN_ENC_KEY")
     GOOGLE_JWKS = os.getenv("GOOGLE_JWKS_URL")
     JIRA_JWKS = os.getenv("JIRA_JWKS_URL")
     S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
@@ -35,6 +38,16 @@ class Settings:
     REDIS_PORT = os.getenv("REDIS_PORT")
     # REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
     REDIS_SSL = os.getenv("REDIS_SSL")
+
+    # Rate limiting (Redis-backed, per identity per window unless noted).
+    # Limits are requests-per-window; tune via .env without code changes.
+    RATE_LIMIT_ENABLED        = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+    RATE_LIMIT_READ           = int(os.getenv("RATE_LIMIT_READ", "240"))      # GET / polling — generous (2s poll = 30/min; 8x headroom)
+    RATE_LIMIT_DEFAULT        = int(os.getenv("RATE_LIMIT_DEFAULT", "90"))    # other mutations (save answers, etc.)
+    RATE_LIMIT_EXPENSIVE      = int(os.getenv("RATE_LIMIT_EXPENSIVE", "20"))  # LLM / pipeline / upload / report-gen — slow anyway
+    RATE_LIMIT_AUTH           = int(os.getenv("RATE_LIMIT_AUTH", "20"))       # login/register/refresh/callback — per IP, anti brute-force
+    RATE_LIMIT_GLOBAL_IP      = int(os.getenv("RATE_LIMIT_GLOBAL_IP", "600")) # per real client IP across ALL routes — DDoS backstop
     CHROMA_API_KEY = os.getenv("CHROMA_API_KEY")
     CHROME_TENANT = os.getenv("CHROMA_TENANT")
     CHROMA_DATABASE = os.getenv("CHROMA_DATABASE")

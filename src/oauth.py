@@ -59,12 +59,15 @@ class JiraOAuth:
         logger.info(f"JiraOAuth initialized with redirect_uri: {self.redirect_uri}")
         self.oauth2_client = WebApplicationClient(self.client_id)
 
-    async def get_authorization_url(self):
-        """Generate authorization URL for Jira OAuth"""
+    async def get_authorization_url(self, state: str = None):
+        """Generate authorization URL for Jira OAuth. A caller-supplied `state` (a signed
+        token carrying the app user_id) is echoed back to the callback, so the callback
+        can tie the Jira tokens to the right user without any auth header on the redirect."""
         try:
             result = self.oauth2_client.prepare_authorization_request(
                 "https://auth.atlassian.com/authorize",
                 redirect_url=self.redirect_uri,
+                state=state,
                 scope=[
                     "read:jira-user",
                     "read:jira-work",
@@ -119,12 +122,47 @@ class JiraOAuth:
             if response.status_code != 200:
                 error_detail = response.json() if response.text else "No error details provided"
                 raise Exception(f"Token request failed: {error_detail}")
-                
+
             return response.json()
-            
+
         except Exception as e:
             logger.error(f"Failed to get access token: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to get access token: {str(e)}"
             )
+
+    async def refresh_access_token(self, refresh_token: str):
+        """Exchange a Jira refresh token for a fresh access token (rotating refresh).
+
+        Atlassian access tokens are short-lived (~1h); the `offline_access` scope grants
+        a refresh token we use here so the user doesn't have to reconnect each hour.
+        Atlassian rotates refresh tokens, so the caller must persist the NEW one.
+
+        Raises 401 for a PERMANENT failure (invalid_grant — token revoked/expired; the
+        caller should drop the credential and prompt reconnect) and 502 for a TRANSIENT
+        failure (network / Atlassian 5xx; the caller should keep the credential and retry)."""
+        token_url = "https://auth.atlassian.com/oauth/token"
+        body = {
+            'grant_type': 'refresh_token',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'refresh_token': refresh_token,
+        }
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        try:
+            response = requests.post(token_url, json=body, headers=headers, verify=True, timeout=20)
+        except requests.RequestException as e:
+            logger.error(f"Jira token refresh network error: {str(e)}")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Jira temporarily unavailable")
+
+        if response.status_code == 200:
+            return response.json()
+
+        detail = (response.text or "")[:300]
+        if response.status_code in (400, 401, 403):
+            # invalid_grant and friends — the refresh token is no longer accepted.
+            logger.warning(f"Jira refresh permanently failed ({response.status_code}): {detail}")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Jira session expired — reconnect Jira")
+        logger.error(f"Jira refresh transient failure ({response.status_code}): {detail}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Jira temporarily unavailable")

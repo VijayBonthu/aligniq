@@ -94,6 +94,22 @@ class RefreshToken(Base):
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
+class JiraCredential(Base):
+    """Server-side Jira OAuth tokens — one row per app user. The Atlassian access token
+    is short-lived (~1h) and refreshed in place via the refresh token; no Jira token ever
+    reaches the browser. Replaces the old client-held Jira JWT + Jira_Authorization header."""
+    __tablename__ = "jira_credentials"
+    user_id       = Column(String, ForeignKey(User.user_id), primary_key=True, index=True)
+    access_token  = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    cloud_id      = Column(String, nullable=True)
+    account_id    = Column(String, nullable=True)
+    email         = Column(String, nullable=True)
+    scope         = Column(Text, nullable=True)
+    expires_at    = Column(TIMESTAMP(timezone=True), nullable=True)  # Atlassian access-token expiry
+    created_at    = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at    = Column(TIMESTAMP(timezone=True), nullable=True, onupdate=func.now())
+
 class UsageTracking(Base):
     __tablename__ = "usage_tracking"
     id                        = Column(Integer, primary_key=True, index=True)

@@ -59,6 +59,10 @@ class StreamingToolChatAgent:
         tool_context.chat_history_id = chat_history_id
         tool_context.db = db
         tool_context.user_id = user_id
+        # Reset the per-turn report cache: tool_context is a process-global, so a
+        # cached report from a prior request must not leak into this one.
+        tool_context._report_cache_key = None
+        tool_context._report = None
 
         # Initialize tools and create tool map for execution
         self.tools = get_all_tools()
@@ -105,6 +109,23 @@ class StreamingToolChatAgent:
         Yields:
             StreamEvent objects
         """
+        # Surface the ACTIVE (user-selected default) version so the model never
+        # infers "current version" from a newest-first list. Source of truth:
+        # get_summary_report (the is_default row, fallback newest).
+        try:
+            from database_scripts import get_summary_report
+            _active_row = await get_summary_report(self.chat_history_id, self.db)
+            _active_vnum = getattr(_active_row, "version_number", None) if _active_row else None
+        except Exception:
+            _active_vnum = None
+        if _active_vnum is not None:
+            _active_line = (
+                f"Active report version: v{_active_vnum} (the user-selected default). "
+                "When asked which version is current/active/default, answer with THIS version — "
+                "the active version is the one flagged default, NOT necessarily the newest."
+            )
+            report_context = f"{_active_line}\n\n{report_context}" if report_context else _active_line
+
         messages = self._build_messages(user_message, conversation_history, report_context)
         tools_called = []
         max_iterations = 10

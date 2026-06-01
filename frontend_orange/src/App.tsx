@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard';
 import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
 import ChatView from './pages/ChatView';
+import CompareView from './pages/CompareView';
 import FullPipelineProgress from './pages/FullPipelineProgress';
 import DeliverableBuilder from './pages/DeliverableBuilder';
 import Messages from './pages/Messages';
@@ -33,6 +34,7 @@ function BgLayers() {
     pathname.startsWith('/projects') ||
     pathname.startsWith('/new-project') ||
     pathname.startsWith('/chat') ||
+    pathname.startsWith('/compare') ||
     pathname.startsWith('/full-pipeline') ||
     pathname.startsWith('/deliverable') ||
     pathname.startsWith('/messages') ||
@@ -148,6 +150,16 @@ function App() {
                 <ProtectedRoute>
                   <AppShell>
                     <ChatView />
+                  </AppShell>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/compare/:chatHistoryId"
+              element={
+                <ProtectedRoute>
+                  <AppShell>
+                    <CompareView />
                   </AppShell>
                 </ProtectedRoute>
               }

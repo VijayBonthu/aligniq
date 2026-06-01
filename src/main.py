@@ -81,6 +81,7 @@ _default_local_origins = [
     "http://localhost:3001",
     "http://localhost:5173",
     "http://192.168.2.26:3001",
+    "http://192.168.2.26:3002",
     "https://staging.grounded-iq.com",
 ]
 _env_origins = os.getenv("CORS_ORIGINS", "")
@@ -89,6 +90,13 @@ origins = (
     if _env_origins
     else _default_local_origins
 )
+# Middleware order: Starlette wraps last-added on the outside, so request flow is
+# CORS -> CSRF -> RateLimit -> handler. CORS is outermost so rejected responses
+# (429 from rate-limit, 403 from CSRF) still carry Access-Control-* headers and stay
+# readable by the browser instead of surfacing as opaque CORS/network errors. CSRF
+# still runs before RateLimit, so CSRF-invalid requests don't consume rate-limit quota.
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(CSRFMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -96,12 +104,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
-
-# Middleware order: Starlette wraps last-added on the outside, so request flow is
-# CSRF -> RateLimit -> CORS -> handler. Reject CSRF-invalid requests before they
-# consume rate-limit quota.
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(CSRFMiddleware)
 
 app.include_router(authentication.router, prefix="/api/v1", tags=["authentication"])
 app.include_router(services.router, prefix="/api/v1", tags=["services"])

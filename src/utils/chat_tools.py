@@ -37,8 +37,86 @@ class ToolContext:
     chat_history_id: str = None
     db: Any = None
     user_id: str = None  # REQUIRED for get_regeneration_context and create_new_report_version
+    jira_token: str = None  # Jira OAuth access token for push_to_jira (set on the stream path)
+    # Per-turn cache of the latest report row, keyed by chat_history_id so a stale
+    # row from another chat is never served. Invalidated by report writes
+    # (regenerate/rollback/set_default) so the agent always sees fresh content.
+    _report_cache_key: str = None
+    _report: Any = None
 
 tool_context = ToolContext()
+
+
+async def _load_report(force: bool = False):
+    """Fetch the latest report once per turn and cache it on tool_context.
+
+    Multiple tools (get_report_section, get_diagrams, risks, analysis, ...) need
+    the same report; this collapses what used to be one get_summary_report DB
+    hit per tool into one per turn.
+
+    IMPORTANT: we cache a *detached* plain object, never the live ReportVersions
+    ORM instance. tool_context is a process-global, so a cached ORM row outlives
+    its request's DB session; the next attribute access then raises
+    DetachedInstanceError. We read the fields we need while the session is alive
+    and hand back a SimpleNamespace that needs no session."""
+    from types import SimpleNamespace
+    from database_scripts import get_summary_report
+
+    cid = tool_context.chat_history_id
+    if (not force) and tool_context._report_cache_key == cid and tool_context._report is not None:
+        return tool_context._report
+
+    row = await get_summary_report(cid, tool_context.db)
+    if row is None:
+        report = None
+    else:
+        report = SimpleNamespace(
+            report_content=getattr(row, "report_content", None),
+            summary_report=getattr(row, "summary_report", None),
+            # The column is version_number (there is no `version` attribute); read
+            # the right one so the active version can be surfaced. Keep a `version`
+            # alias for any back-compat readers.
+            version_number=getattr(row, "version_number", None),
+            version=getattr(row, "version_number", None),
+        )
+    tool_context._report_cache_key = cid
+    tool_context._report = report
+    return report
+
+
+def _invalidate_report_cache():
+    """Drop the cached report after a write so later tools re-read fresh."""
+    tool_context._report_cache_key = None
+    tool_context._report = None
+
+
+def _report_markdown(report) -> str:
+    """Best-effort markdown for the report. report_content is a markdown string
+    on the contract pipeline; legacy rows may store a dict, which we json-encode
+    only as a last resort (diagram/section extraction needs the markdown)."""
+    content = getattr(report, "report_content", None) if report else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        # Legacy dict: stitch string values so heading/diagram parsing still works.
+        parts = [v for v in content.values() if isinstance(v, str)]
+        return "\n\n".join(parts)
+    return ""
+
+
+def _clip(text, limit: int) -> str:
+    """Clip text to `limit` chars, appending an explicit notice when truncated so
+    the LLM never silently reasons over a partial report."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[...truncated: showing {limit} of {len(text)} characters. "
+        + "Call get_report_section for the full text of a specific section...]"
+    )
 
 
 # ============= READ-ONLY TOOLS =============
@@ -141,43 +219,141 @@ async def search_document(query: str, max_results: int = 5) -> str:
 @tool
 async def get_report_section(section_name: str) -> str:
     """
-    Get a specific section from the generated report.
+    Get the exact text of a section from the generated report, verbatim (no
+    paraphrasing). Use this for any "what does the report say about X" / "show me
+    the X section" question — it returns the real markdown (including tables and
+    diagrams) so you can quote it and cite the section heading.
 
     Args:
-        section_name: One of: executive_summary, tech_stack, team_structure,
-                      timeline, risks, recommendations, or full_report for everything
+        section_name: A friendly name (executive_summary, tech_stack,
+                      team_structure, timeline, risks, recommendations), a section
+                      id from list_report_sections, an exact heading, or
+                      "full_report" for the entire report.
     """
-    from database_scripts import get_summary_report
+    from utils.report_sections import parse_sections, find_section
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
-
-        if not report or not report.report_content:
+        report = await _load_report()
+        if not report or not getattr(report, "report_content", None):
             return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
 
+        markdown = _report_markdown(report)
         content = report.report_content
 
         if section_name == "full_report":
             return json.dumps({
                 "status": "success",
                 "section": "full_report",
-                "content": content
+                "content": markdown or content,
             })
-        elif isinstance(content, dict) and section_name in content:
+
+        # Legacy dict report: honor exact key access first.
+        if isinstance(content, dict) and section_name in content:
             return json.dumps({
                 "status": "success",
                 "section": section_name,
-                "content": content[section_name]
+                "content": content[section_name],
             })
-        else:
-            available = list(content.keys()) if isinstance(content, dict) else []
+
+        # Markdown report (contract pipeline): resolve the section deterministically.
+        sections = parse_sections(markdown)
+        match = find_section(sections, section_name)
+        if match:
             return json.dumps({
-                "status": "error",
-                "message": f"Section '{section_name}' not found",
-                "available_sections": available
+                "status": "success",
+                "section": match.heading_text,
+                "section_id": match.id,
+                "content": match.raw_markdown,
             })
+
+        # Fall back to the typed summary_report dict (tech/cost/timeline/...).
+        summary = getattr(report, "summary_report", None)
+        if isinstance(summary, dict):
+            if section_name in summary:
+                return json.dumps({"status": "success", "section": section_name, "content": summary[section_name]})
+            for key in summary:
+                if section_name.lower() in key.lower():
+                    return json.dumps({"status": "success", "section": key, "content": summary[key]})
+
+        available = [s.heading_text for s in sections] or (
+            list(content.keys()) if isinstance(content, dict) else []
+        )
+        return json.dumps({
+            "status": "not_found",
+            "message": f"Section '{section_name}' not found. Try one of the available sections, or call list_report_sections.",
+            "available_sections": available,
+        })
     except Exception as e:
         logger.error(f"Error in get_report_section tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@tool
+async def get_diagrams(kind: str = None) -> str:
+    """
+    Return the ACTUAL diagrams from the report, verbatim, as renderable code
+    fences (the chat renders mermaid/ascii diagrams). ALWAYS use this when the
+    user asks to see, show, or explain a diagram, the architecture diagram, a
+    flowchart, sequence/ER diagram, etc. — never describe a diagram in prose when
+    one exists. Return each diagram's `code` field exactly as given (keep the
+    ```mermaid fences) so it renders.
+
+    Args:
+        kind: Optional filter — "mermaid", "ascii", "plantuml". Omit for all.
+    """
+    from utils.report_sections import extract_diagrams
+    from agents.tools import repair_mermaid_blocks
+
+    try:
+        report = await _load_report()
+        markdown = _report_markdown(report)
+        if not markdown:
+            return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
+
+        diagrams = extract_diagrams(markdown, kind=kind)
+        if not diagrams:
+            return json.dumps({
+                "status": "empty",
+                "message": "The report does not contain any diagrams"
+                           + (f" of type '{kind}'." if kind else "."),
+                "diagrams": [],
+            })
+
+        # Repair mermaid the writer may have left invalid before returning it.
+        for d in diagrams:
+            d["code"] = repair_mermaid_blocks(d["code"])
+
+        return json.dumps({
+            "status": "success",
+            "count": len(diagrams),
+            "diagrams": diagrams,
+            "note": "Return each `code` block verbatim (keep the ``` fences) so it renders in chat. Label it with its `heading`.",
+        })
+    except Exception as e:
+        logger.error(f"Error in get_diagrams tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@tool
+async def list_report_sections() -> str:
+    """
+    List the report's sections (a table of contents): id, heading, level, and
+    whether each section contains a diagram. Use this to orient yourself before
+    answering, to find the right section_name for get_report_section, or when the
+    user asks "what's in the report?".
+    """
+    from utils.report_sections import list_sections
+
+    try:
+        report = await _load_report()
+        markdown = _report_markdown(report)
+        if not markdown:
+            return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
+
+        toc = list_sections(markdown)
+        return json.dumps({"status": "success", "count": len(toc), "sections": toc})
+    except Exception as e:
+        logger.error(f"Error in list_report_sections tool: {str(e)}")
         return json.dumps({"status": "error", "message": str(e)})
 
 
@@ -205,7 +381,7 @@ async def search_report_section(query: str, section: str = None) -> str:
 
         # Get report section directly if specified
         if section:
-            report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+            report = await _load_report()
             if report and report.summary_report:
                 summary = report.summary_report
                 if isinstance(summary, dict) and section in summary:
@@ -250,7 +426,7 @@ async def get_risks_and_mitigations() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         results = {
             "status": "success"
@@ -306,7 +482,7 @@ async def suggest_optimization(constraint_type: str, constraint_details: str) ->
 
     try:
         # Get relevant report sections
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -330,7 +506,7 @@ async def suggest_optimization(constraint_type: str, constraint_details: str) ->
                 elif constraint_type == "scope" and any(k in key.lower() for k in ["requirement", "feature", "scope", "mvp"]):
                     relevant_sections.append(f"**{key}**:\n{value}")
 
-        context = "\n\n".join(relevant_sections) if relevant_sections else str(summary)[:3000]
+        context = "\n\n".join(relevant_sections) if relevant_sections else _clip(summary, 3000)
 
         # Generate optimization suggestion using LLM
         llm = ChatOpenAI(
@@ -395,7 +571,7 @@ async def analyze_cost_reduction() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -416,7 +592,7 @@ async def analyze_cost_reduction() -> str:
         analysis_prompt = f"""Analyze this project report and identify cost reduction opportunities.
 
 REPORT CONTENT:
-{str(report_content)[:6000]}
+{_clip(report_content, 6000)}
 
 Identify 3-5 specific cost reduction opportunities. For each, provide:
 1. The current recommendation and estimated cost impact
@@ -453,7 +629,7 @@ async def analyze_timeline_acceleration() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -474,7 +650,7 @@ async def analyze_timeline_acceleration() -> str:
         analysis_prompt = f"""Analyze this project report and identify timeline acceleration opportunities.
 
 REPORT CONTENT:
-{str(report_content)[:6000]}
+{_clip(report_content, 6000)}
 
 Identify 3-5 specific ways to accelerate the project timeline. For each, provide:
 1. The current timeline element or phase
@@ -522,7 +698,7 @@ async def prepare_client_meeting_brief(focus_areas: str = None) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -620,7 +796,7 @@ async def prepare_executive_summary(include_recommendation: bool = True) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -646,7 +822,7 @@ async def prepare_executive_summary(include_recommendation: bool = True) -> str:
         exec_prompt = f"""Create an executive decision brief based on this project analysis.
 
 REPORT CONTENT (for estimates and details):
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 STRUCTURED DATA:
 - Critical Assumptions: {json.dumps(critical_assumptions)}
@@ -701,7 +877,7 @@ async def get_technical_deep_dive(component: str = None) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -728,7 +904,7 @@ async def get_technical_deep_dive(component: str = None) -> str:
         tech_prompt = f"""Create a technical deep-dive analysis for a Solution Architect.
 
 REPORT CONTENT:
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 ARCHITECTURE DATA:
 - Recommended: {json.dumps(recommended_arch)}
@@ -787,7 +963,7 @@ async def get_implementation_gotchas() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -823,7 +999,7 @@ async def get_implementation_gotchas() -> str:
         gotcha_prompt = f"""Create a developer onboarding brief with implementation gotchas.
 
 REPORT CONTENT:
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 STRUCTURED DATA:
 - Assumptions (may affect implementation): {json.dumps(critical_assumptions)}
@@ -902,7 +1078,7 @@ async def get_project_blind_spots() -> str:
             pass
 
         # Also get from main report
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report and not presales_data:
             return json.dumps({
@@ -958,7 +1134,7 @@ async def get_project_insights(insight_type: str) -> str:
         })
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -1087,6 +1263,7 @@ async def detect_conflicts() -> str:
     """
     from database_scripts import get_pending_changes as db_get_pending
     from database_scripts import detect_conflicts as db_detect_conflicts
+    from starlette.concurrency import run_in_threadpool
 
     try:
         # Get pending changes first
@@ -1099,8 +1276,9 @@ async def detect_conflicts() -> str:
                 "conflicts": []
             })
 
-        # detect_conflicts is sync and takes the list
-        conflicts = db_detect_conflicts(changes)
+        # detect_conflicts is sync and takes the list — run off the event loop so
+        # it can't block other concurrent streams.
+        conflicts = await run_in_threadpool(db_detect_conflicts, changes)
 
         if not conflicts:
             return json.dumps({
@@ -1140,6 +1318,13 @@ async def get_report_versions(limit: int = 10) -> str:
                 "versions": []
             })
 
+        # The active/current version is the one flagged default (get_summary_report's
+        # source of truth), NOT the newest — surface it explicitly so the model never
+        # infers "current" from list order (versions come back newest-first).
+        active_version = next((v.get("version") for v in versions if v.get("is_default")), None)
+        if active_version is None and versions:
+            active_version = versions[0].get("version")  # legacy: no default flagged → newest
+
         # Limit and simplify version info with changelog data
         limited_versions = versions[:limit]
         simplified = []
@@ -1148,6 +1333,8 @@ async def get_report_versions(limit: int = 10) -> str:
                 "version_id": v.get("version_id") or v.get("id"),
                 "version_number": v.get("version"),
                 "created_at": str(v.get("created_at", "")),
+                "is_default": bool(v.get("is_default")),
+                "is_latest": bool(v.get("is_latest")),
                 "has_pending_changes": bool(v.get("pending_changes")),
                 # Changelog tracking fields
                 "changelog_summary": v.get("changelog_summary") or ("Initial report generation" if v.get("version") == 1 else "No changelog available"),
@@ -1157,6 +1344,8 @@ async def get_report_versions(limit: int = 10) -> str:
 
         return json.dumps({
             "status": "success",
+            "active_version": active_version,
+            "active_version_note": "active_version is the current/default version (is_default=true), NOT necessarily the newest.",
             "versions": simplified,
             "total_count": len(versions)
         })
@@ -1165,23 +1354,68 @@ async def get_report_versions(limit: int = 10) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _compare_section(section: str, va: int, rec_a: dict, vb: int, rec_b: dict) -> dict:
+    """Pull `section` (or its diagrams) from each version's markdown as labeled,
+    clipped blocks so the agent can render them side by side. Diagrams come back as
+    verbatim fences (the chat renders mermaid); prose comes back as raw markdown."""
+    from utils.report_sections import parse_sections, find_section, extract_diagrams
+
+    s_low = (section or "").lower()
+    want_diagram = any(k in s_low for k in ("diagram", "mermaid", "flow", "sequence", "deployment", "component"))
+
+    def _grab(rec: dict) -> str:
+        md = rec.get("report_content") or ""
+        if not isinstance(md, str) or not md:
+            return ""
+        if want_diagram:
+            diags = extract_diagrams(md)
+            if "architect" in s_low:
+                arch = [d for d in diags if "architect" in (d.get("heading") or "").lower()]
+                diags = arch or diags
+            if diags:
+                return "\n\n".join(d["code"] for d in diags)
+        sec = find_section(parse_sections(md), section)
+        if sec:
+            return sec.raw_markdown
+        diags = extract_diagrams(md)  # fall back to a diagram if the named section is absent
+        return diags[0]["code"] if diags else ""
+
+    return {
+        "section": section,
+        "version_a": {"version": va, "markdown": _clip(_grab(rec_a), 4000)},
+        "version_b": {"version": vb, "markdown": _clip(_grab(rec_b), 4000)},
+        "render_hint": (
+            f"Include both markdown blocks verbatim, labeled 'v{va}' and 'v{vb}', so any "
+            "diagrams render. Then explain what changed between them."
+        ),
+    }
+
+
 @tool
 async def compare_report_versions(
     version_a: int,
     version_b: int = None,
-    include_content: bool = False
+    include_content: bool = False,
+    section: str = None,
 ) -> str:
     """
     Compare two report versions to understand what changed between them.
-    Use when user asks about differences between versions, how architecture evolved,
-    or wants to understand why certain decisions changed.
+    Use when the user asks about differences between versions, how the architecture
+    evolved, or why decisions changed. The result carries a `decision_delta` (cost,
+    timeline, tech swaps, verdict) computed deterministically — present those numbers,
+    do not invent your own.
 
     Args:
         version_a: First version number to compare
         version_b: Second version number (defaults to latest if not provided)
         include_content: If True, includes full executive summaries. If False, just changelog info.
+        section: Optional section or diagram to drill into (e.g. "architecture diagram",
+            "tech_stack", "timeline", "cost", "risks"). When set, the SAME section is pulled
+            from BOTH versions as labeled markdown so the chat renders them side by side
+            (diagrams render). Use this for "diff the architecture diagram from v1 to v3".
     """
     from database_scripts import get_report_version_by_number, get_report_diff, get_all_report_versions
+    from utils.version_compare import compute_contract_delta
 
     try:
         chat_history_id = tool_context.chat_history_id
@@ -1249,6 +1483,19 @@ async def compare_report_versions(
             "diff_stats": diff_stats
         }
 
+        # Typed decision delta — cost / timeline / tech swaps / verdict, computed not
+        # narrated. None when neither version carries a contract (legacy rows).
+        comparison["decision_delta"] = compute_contract_delta(
+            ver_a_record.get("report_contract"),
+            ver_b_record.get("report_contract"),
+        )
+
+        # Section / diagram drill-in: same section from both versions, side by side.
+        if section:
+            comparison["section_comparison"] = _compare_section(
+                section, version_a, ver_a_record, version_b, ver_b_record
+            )
+
         # Include executive summaries if requested
         if include_content:
             summary_a = ver_a_record.get("summary_report", {})
@@ -1268,7 +1515,118 @@ async def compare_report_versions(
         return json.dumps({"status": "error", "message": str(e)})
 
 
+@tool
+async def rank_versions(metric: str = None, versions: str = None) -> str:
+    """
+    Compare report versions across cost, timeline, and verdict — over ALL versions or a
+    chosen subset. Use for "which version is cheapest / fastest?", "compare cost across
+    v1 and v3", "which has the best go/no-go verdict?".
+
+    Numbers are computed deterministically from each version's stored decisions; cite each
+    figure with its version (e.g. "v2: $241K"). Do not compute totals yourself.
+
+    Args:
+        metric: One of "cost", "timeline", or "verdict" to rank by (cheapest / fastest /
+            most favorable first). Omit to just return the metric matrix for the versions.
+        versions: Optional comma-separated subset, e.g. "1,3,4". Omit for all versions.
+    """
+    from utils.version_compare import version_metrics, rank_metrics
+
+    try:
+        subset = None
+        if versions:
+            try:
+                subset = [int(x) for x in str(versions).replace(" ", "").split(",") if x]
+            except Exception:
+                subset = None
+
+        metrics = await version_metrics(tool_context.chat_history_id, tool_context.db, subset)
+        if not metrics:
+            return json.dumps({"status": "error", "message": "No report versions found."})
+
+        priced = [m for m in metrics if m.get("has_contract")]
+        payload = {
+            "status": "success",
+            "metrics": metrics,
+            "versions_with_metrics": [m["version"] for m in priced],
+            "note": "All figures are computed from stored decisions. Cite each with its version (e.g. 'v2: $241K').",
+        }
+
+        if metric:
+            ranked = rank_metrics(metrics, metric)
+            if not ranked:
+                payload["ranking_error"] = (
+                    f"Could not rank by '{metric}'. Use cost, timeline, or verdict; note that "
+                    "versions without computed decisions (legacy) are excluded from ranking."
+                )
+            else:
+                payload["ranked_by"] = metric.lower()
+                payload["ranking"] = [m["version"] for m in ranked]
+                payload["best"] = ranked[0]["version"]
+        return json.dumps(payload)
+    except Exception as e:
+        logger.error(f"Error in rank_versions tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
 # ============= WRITE TOOLS =============
+
+
+@tool
+async def synthesize_version(instructions: str, source_versions: str = None) -> str:
+    """
+    Build a NEW unified version by merging the best of existing versions — e.g. "take v2's
+    datastore and v3's timeline". This does NOT rewrite the report directly: it QUEUES the
+    merge as a reviewable pending change (citing its source versions), then the user reviews
+    it in the Changes panel and clicks Regenerate to produce the new version.
+
+    Use when the user wants a single report combining strengths of multiple versions to show
+    a client. After queueing, tell the user it's queued and to review + Regenerate.
+
+    Args:
+        instructions: What to merge, in the user's words (e.g. "use v2's PostgreSQL datastore
+            but keep v3's 19-week phased timeline").
+        source_versions: Optional comma-separated versions the merge draws from, e.g. "2,3".
+    """
+    from database_scripts import add_pending_change as db_add_change, record_transaction
+
+    try:
+        srcs = ""
+        if source_versions:
+            nums = [x for x in str(source_versions).replace(" ", "").split(",") if x]
+            if nums:
+                srcs = " (source versions: " + ", ".join(f"v{n}" for n in nums) + ")"
+
+        request = f"Unify versions{srcs}: {instructions}"
+        change_data = {
+            "user_request": request,
+            "target_section": "general",
+            "type": "synthesize_versions",
+            "change_type": "modify",
+            "source_versions": source_versions or "",
+        }
+        result = await db_add_change(tool_context.chat_history_id, change_data, tool_context.db)
+
+        if result.get("status") == "success":
+            await record_transaction(
+                chat_history_id=tool_context.chat_history_id,
+                action_type="synthesize_version",
+                action_data={
+                    "change_id": result.get("change_id"),
+                    "instructions": instructions,
+                    "source_versions": source_versions,
+                },
+                description=f"Queued merge {result.get('change_id')}: {instructions[:50]}...",
+                db=tool_context.db,
+            )
+            result["next_step"] = (
+                "Queued as a pending change. Open the Changes panel to review, then Regenerate "
+                "to produce the unified version. Nothing is overwritten until you Regenerate."
+            )
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error in synthesize_version tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
 
 @tool
 async def add_pending_change(
@@ -1586,8 +1944,7 @@ async def regenerate_report(include_changes: bool = True) -> str:
     )
     from agents.agentic_workflow import run_pipeline_with_constraints, main_report_summary, generate_changelog_summary
     from utils.router_llm import generate_conflict_resolution
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
     import time
 
@@ -1753,15 +2110,15 @@ async def regenerate_report(include_changes: bool = True) -> str:
                 "report_content": regenerated_report  # Include report even if save failed
             })
 
-        # Step 7: UPDATE VECTOR DB (non-fatal if fails)
+        # Step 7: UPDATE VECTOR DB (non-fatal if fails). Section-aware + metadata.
         try:
-            report_chunks = await chunk_text(regenerated_report, chunk_size=1000, chunk_overlap=200)
-            await create_embeddings(
-                texts=report_chunks,
+            _invalidate_report_cache()  # new version persisted above — serve fresh
+            await embed_report(
+                markdown=regenerated_report,
                 model=settings.EMBEDDING_MODEL,
-                chat_history_id=chat_history_id
+                chat_history_id=chat_history_id,
             )
-            logger.info(f"Updated vector DB with {len(report_chunks)} chunks")
+            logger.info("Updated vector DB (section-aware) after regeneration")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1833,8 +2190,7 @@ async def rollback_report(version_number: int) -> str:
         set_default_version,
         record_transaction
     )
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
 
     try:
@@ -1874,20 +2230,14 @@ async def rollback_report(version_number: int) -> str:
         # This deletes existing embeddings and creates new ones
         try:
             if report_content:
-                # Chunk the report content
-                report_chunks = await chunk_text(
-                    text=report_content,
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-
-                # Create embeddings (this deletes old embeddings first)
-                await create_embeddings(
-                    texts=report_chunks,
+                _invalidate_report_cache()  # rolled-back version is now default
+                # Section-aware embed (deletes old embeddings first)
+                await embed_report(
+                    markdown=report_content,
                     model=settings.EMBEDDING_MODEL,
-                    chat_history_id=tool_context.chat_history_id
+                    chat_history_id=tool_context.chat_history_id,
                 )
-                logger.info(f"Updated vector DB with {len(report_chunks)} chunks for rollback")
+                logger.info("Updated vector DB (section-aware) for rollback")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1936,8 +2286,7 @@ async def set_default_report(version_number: int) -> str:
         version_number: The version number to set as default
     """
     from database_scripts import set_default_version, get_report_version_by_number
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
 
     try:
@@ -1969,17 +2318,13 @@ async def set_default_report(version_number: int) -> str:
 
             # Step 3: Update vector DB with new default's content
             if report_content:
-                report_chunks = await chunk_text(
-                    text=report_content,
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-                await create_embeddings(
-                    texts=report_chunks,
+                _invalidate_report_cache()  # default switched — serve fresh
+                await embed_report(
+                    markdown=report_content,
                     model=settings.EMBEDDING_MODEL,
-                    chat_history_id=tool_context.chat_history_id
+                    chat_history_id=tool_context.chat_history_id,
                 )
-                logger.info(f"Updated vector DB for new default version {version_number}")
+                logger.info(f"Updated vector DB (section-aware) for new default version {version_number}")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -2007,12 +2352,19 @@ def get_all_tools() -> list:
         get_pending_changes,
         search_document,
         get_report_section,
+        get_diagrams,            # deterministic diagram retrieval (renders in chat)
+        list_report_sections,    # report table-of-contents / navigation
         search_report_section,
         get_risks_and_mitigations,
         find_duplicate_changes,
         detect_conflicts,
         get_report_versions,
         compare_report_versions,
+        rank_versions,           # cross-version cost/timeline/verdict ranking (all or a subset)
+        # Firm delivery history (grounds estimates/architecture in past projects)
+        firm_project_search,
+        # Delivery handoff — turn the report into Jira tickets
+        push_to_jira,
         # Optimization & Analysis tools
         suggest_optimization,
         analyze_cost_reduction,
@@ -2031,6 +2383,7 @@ def get_all_tools() -> list:
         clear_all_pending_changes,
         merge_pending_changes,
         update_pending_change,
+        synthesize_version,      # merge best-of versions into a queued change -> regenerate
         # Report tools
         regenerate_report,
         rollback_report,
@@ -2092,8 +2445,14 @@ When answering ANY question, automatically include relevant:
 - **search_report_section(query, section)**: Search within a specific report section for detailed information
 - **get_report_section(section)**: Retrieve report sections (executive_summary, tech_stack, team_structure, timeline, risks, recommendations, full_report)
 - **get_risks_and_mitigations()**: Get all identified risks with their mitigation strategies
-- **get_report_versions()**: View report version history with changelog summaries showing what changed
-- **compare_report_versions(version_a, version_b)**: Compare two versions to see detailed differences, changes applied, and implications
+- **get_report_versions()**: View report version history with changelog summaries showing what changed. Its response includes `active_version` — the current/default version (the one with `is_default=true`) that the chat answers from; use this to answer "which version is active/current/default" (do NOT assume the highest-numbered/newest version is active)
+- **compare_report_versions(version_a, version_b, section=None)**: Compare two versions. Returns a computed `decision_delta` (cost / timeline / tech swaps / verdict). Pass `section` (e.g. "architecture diagram", "cost", "timeline") to pull that section from BOTH versions side by side — include the returned markdown blocks verbatim so diagrams render.
+- **rank_versions(metric, versions=None)**: Rank versions by "cost", "timeline", or "verdict" across ALL versions or a subset like "1,3". Use for "which version is cheapest / fastest?".
+- **synthesize_version(instructions, source_versions)**: Merge the best of multiple versions into a NEW unified version — queues a reviewable pending change, then the user Regenerates.
+
+**CROSS-VERSION RULE:** never compute cost/timeline numbers yourself. Call `rank_versions` / `compare_report_versions` and cite every figure with its source version (e.g. "v2: $241K").
+
+**ACTIVE-VERSION RULE:** the current / active / default version is the one flagged `is_default` — surfaced as `active_version` by `get_report_versions` and named in CURRENT REPORT above — NOT necessarily the newest. When the user asks which version is current/active/default, answer with that one; never assume the highest-numbered version is active.
 
 ### Optimization & Analysis Tools
 - **suggest_optimization(constraint_type, details)**: Generate optimization suggestions based on user constraints (budget, timeline, resource, scope)
@@ -2142,12 +2501,13 @@ Examples:
 - User: "What about Redis?" → Search document for Redis mentions, then answer based on context
 
 ### 3. Handle Visual/Diagram Requests
-When users ask for diagrams or visual representations:
-- Acknowledge that visual diagram generation isn't available in chat
-- Offer text-based alternatives (ASCII diagrams, structured descriptions, component lists)
-- Suggest they can find diagrams in the full report if applicable
-
-Example response: "I can't generate visual diagrams directly, but I can describe the architecture in detail. The system follows a 3-tier architecture: [detailed description]. Would you like me to format this as a component breakdown you can use to create a diagram?"
+The report contains real, renderable diagrams (mermaid/ASCII), and THIS CHAT
+RENDERS THEM. When users ask to see/show/explain a diagram, the architecture
+diagram, a flowchart, sequence/ER diagram, etc.:
+- ALWAYS call `get_diagrams` (optionally filtered by kind) to fetch the actual diagram(s).
+- Return each diagram's `code` field VERBATIM, keeping the ```mermaid (or ```ascii) fences intact, so it renders. Do NOT paraphrase a diagram into prose when one exists.
+- Label each diagram with its `heading`, then add any explanation the user asked for below it.
+- Only if `get_diagrams` returns empty should you describe the architecture in text (and say no diagram exists in the report).
 
 ### 4. Change Management Best Practices
 - Always reference changes by ID (CHG-001, CHG-002)
@@ -2292,12 +2652,26 @@ Response: [Uses get_implementation_gotchas()]
 
 Want me to generate acceptance criteria for any specific requirement?"
 
+## Tool Selection Policy (how to retrieve — in priority order)
+
+The report is a structured document and is the source of truth. Retrieve from it
+STRUCTURALLY before falling back to fuzzy search:
+1. **Diagrams** → `get_diagrams` (returns the actual renderable fences — never describe instead).
+2. **A named section** ("show me the tech stack / timeline / risks") → `get_report_section` (returns the verbatim section). Use `list_report_sections` first if unsure what exists.
+3. **Cross-cutting synthesis** ("is this feasible given the timeline and team?") → pull the relevant sections with `get_report_section` (or `full_report`) and reason over them.
+4. **Needle / fuzzy lookup** ("where does it mention HIPAA?") → `search_document` / `search_report_section` (semantic fallback).
+5. **Firm delivery history** (past-project evidence for estimates/architecture) → `firm_project_search`.
+
+Always cite the section heading you answered from. Prefer verbatim report text
+over paraphrase for factual asks.
+
 ## CRITICAL: Report-Only Answers
 
 You MUST answer questions ONLY using information from:
-1. The generated report (via get_report_section or search_document)
+1. The generated report (via get_report_section, get_diagrams, list_report_sections, or search_document)
 2. The uploaded document (via search_document)
 3. Pending changes and version history
+4. The firm's past projects (via firm_project_search), clearly attributed as past-project evidence
 
 You MUST NOT:
 - Use general knowledge to answer questions about the project
@@ -2401,3 +2775,67 @@ async def firm_project_search(query: str, max_results: int = 3) -> str:
     except Exception as e:
         logger.warning(f"firm_project_search failed: {e}")
         return json.dumps({"hits": [], "error": str(e)})
+
+
+@tool
+async def push_to_jira(scope: str = "risks", project_key: str = None) -> str:
+    """
+    Push the report's risks or sections to Jira as an epic + child stories — the
+    report -> delivery handoff. Use when the user wants to turn the analysis into
+    actionable Jira tickets. If project_key is omitted, this returns the available
+    Jira projects so you can ask the user which one to use, then call again with
+    the chosen key.
+
+    Args:
+        scope: 'risks' (export the risk register) or 'sections' (export report sections as stories).
+        project_key: Target Jira project key (e.g. 'PROJ'). Omit to list projects first.
+    """
+    token = getattr(tool_context, "jira_token", None)
+    if not token:
+        return json.dumps({
+            "status": "not_connected",
+            "message": "Jira isn't connected. Tell the user to connect Jira in Settings, then retry.",
+        })
+    try:
+        from utils.integrations import Integrations
+        from utils.report_sections import report_delivery_items
+
+        integ = Integrations(token)
+        if not project_key:
+            projects = integ.get_projects()
+            return json.dumps({
+                "status": "need_project",
+                "message": "Ask the user which Jira project to push to (give the project key).",
+                "projects": projects,
+            })
+
+        report = await _load_report()
+        if not report or not getattr(report, "report_content", None):
+            return json.dumps({"status": "error", "message": "No report found yet."})
+        summary = report.summary_report if isinstance(getattr(report, "summary_report", None), dict) else {}
+        project_title = summary.get("project_summary") or summary.get("title") or "AlignIQ Project"
+        markdown = _report_markdown(report)
+
+        exec_summary, items = report_delivery_items(markdown, summary, scope=scope)
+        if not items:
+            return json.dumps({"status": "empty", "message": f"Nothing to push for scope '{scope}'."})
+
+        labels = ["aligniq"]
+        epic = integ.create_epic(project_key, f"{project_title} — AlignIQ"[:250], exec_summary, labels=labels)
+        epic_key = epic.get("key")
+        issue_keys = []
+        for it in items[:50]:
+            created = integ.create_issue(
+                project_key, it["summary"], it["description"],
+                issue_type="Task", parent_key=epic_key, labels=labels,
+            )
+            if created.get("key"):
+                issue_keys.append(created["key"])
+
+        return json.dumps({
+            "status": "success", "epic_key": epic_key, "issue_keys": issue_keys,
+            "count": len(issue_keys), "scope": scope,
+        })
+    except Exception as e:
+        logger.warning(f"push_to_jira failed: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
