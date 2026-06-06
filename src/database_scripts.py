@@ -41,6 +41,7 @@ async def create_user(user_data:dict,provider:str, db:Session):
             full_name = user_data["name"],
             picture = user_data["picture"],
             provider = provider,
+            company = user_data.get("company"),
             subscription_tier = "free",
             subscription_status = "active",
         )

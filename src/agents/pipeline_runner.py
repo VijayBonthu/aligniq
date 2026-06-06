@@ -39,6 +39,7 @@ from database_scripts import (
     fail_pipeline_run,
     persist_state_snapshot,
     get_resumable_run,
+    get_summary_report,
     update_analysis_link_with_full_report,
 )
 
@@ -476,6 +477,19 @@ async def _run_contract_pipeline_path(
     from utils.chat_tools import set_firm_id_context, _firm_id_ctx
     _firm_id_token = set_firm_id_context(firm_id)
 
+    # On a regeneration, evolve the prior contract instead of redesigning from
+    # scratch: load the active version's stored contract and pass it + the
+    # requested changes to the planner/decider. applied_changes is the regen signal.
+    prior_contract = None
+    if applied_changes:
+        try:
+            prior = await get_summary_report(chat_history_id, db)
+            prior_contract = getattr(prior, "report_contract", None) if prior else None
+            if prior_contract:
+                logger.info(f"pipeline_runner: contract regen for {chat_history_id} — evolving prior contract")
+        except Exception as e:  # noqa: BLE001 — a missing prior contract just means a fresh run
+            logger.warning(f"pipeline_runner: could not load prior contract for regen {chat_history_id}: {e}")
+
     try:
         with use_recorder(recorder):
             result = await asyncio.wait_for(
@@ -483,6 +497,8 @@ async def _run_contract_pipeline_path(
                     document=[document_blob],
                     crd=document_blob,
                     firm_context=firm_context,
+                    prior_contract=prior_contract,
+                    applied_changes=applied_changes,
                     on_stage_started=_on_started,
                     on_stage_completed=_on_completed,
                 ),

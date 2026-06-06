@@ -84,7 +84,7 @@ class Integrations:
             
             # Validate attachments
             if not attachments:
-                print(f"No matching attachments found for issue {issue_key}")
+                logger.debug("No matching attachments found for issue %s", issue_key)
                 return None
 
             
@@ -117,10 +117,10 @@ class Integrations:
                         'attachment_id': attachment['id']
                     })
                     
-                    print(f"Downloaded: {issue['key']} - {filename}")
-                
+                    logger.debug("Downloaded: %s - %s", issue['key'], filename)
+
                 except Exception as e:
-                    print(f"Error downloading {filename}: {e}")
+                    logger.error("Error downloading %s: %s", filename, e)
         
         return downloaded_files
     

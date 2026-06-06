@@ -1,10 +1,12 @@
-name: Frontend deploy (staging)
+name: Frontend deploy
 
+# Branch → environment (same model as backend-deploy):
+#   push to `staging` → staging bucket; push to `main` → production bucket (gated).
 on:
   push:
-    branches: [main]
+    branches: [staging, main]
     paths:
-      - "frontend_orange/**"
+      - "frontend_green/**"
       - ".github/workflows/frontend-deploy.yml"
   workflow_dispatch:
 
@@ -15,12 +17,17 @@ permissions:
 env:
   AWS_REGION: us-east-1
 
+concurrency:
+  group: frontend-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
     defaults:
       run:
-        working-directory: frontend_orange
+        working-directory: frontend_green
 
     steps:
       - uses: actions/checkout@v4
@@ -29,17 +36,16 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: frontend_orange/package-lock.json
+          cache-dependency-path: frontend_green/package-lock.json
 
       - run: npm ci
 
-      # Vite inlines VITE_* vars at build time, so the API URL must be set here.
-      # Trim whitespace from the secret to defend against a trailing space/newline
-      # in the GitHub Secret value — Vite would otherwise bake it in and produce
-      # URLs like "https://.../api/v1%20/registration".
+      # Vite inlines VITE_* at build time, so the API URL must be set here.
+      # VITE_API_URL is an environment variable (staging vs production). Trim any
+      # stray whitespace/newline so Vite doesn't bake in ".../api/v1%20/...".
       - name: Build
         env:
-          VITE_API_URL_RAW: ${{ secrets.VITE_API_URL }}
+          VITE_API_URL_RAW: ${{ vars.VITE_API_URL }}
         run: |
           export VITE_API_URL="$(printf '%s' "$VITE_API_URL_RAW" | tr -d '[:space:]')"
           npm run build
@@ -50,20 +56,19 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Pass the bucket name via env and trim any stray whitespace/newlines
-      # from the secret value before interpolating into the command. A trailing
-      # newline in the secret would otherwise split the command across two
-      # bash lines and cause "/: Is a directory" exit-126 failures.
+      # FRONTEND_BUCKET is an environment variable (staging.grounded-iq.com /
+      # grounded-iq.com). Hashed assets get a 1-year immutable cache; index.html
+      # is no-cache so a deploy is visible immediately (Cloudflare honours these).
       - name: Upload hashed assets to S3
         env:
-          FRONTEND_BUCKET: ${{ secrets.FRONTEND_BUCKET }}
+          FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
         run: |
           BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
           aws s3 sync dist/ "s3://${BUCKET}/" --delete --cache-control "public,max-age=31536000,immutable" --exclude "index.html"
 
       - name: Upload index.html (no cache, correct content-type)
         env:
-          FRONTEND_BUCKET: ${{ secrets.FRONTEND_BUCKET }}
+          FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
         run: |
           BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
           aws s3 cp dist/index.html "s3://${BUCKET}/index.html" --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"

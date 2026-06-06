@@ -14,7 +14,7 @@ output "ecr_repo_url" {
 }
 
 output "rds_endpoint" {
-  description = "Postgres host. Set /aligniq/staging/POSTGRES_HOSTNAME to this value."
+  description = "Postgres host. Set /groundediq/staging/POSTGRES_HOSTNAME to this value."
   value       = aws_db_instance.main.address
 }
 
@@ -24,7 +24,7 @@ output "frontend_bucket" {
 }
 
 output "docs_bucket" {
-  description = "S3 bucket for uploaded user documents. Set /aligniq/staging/S3_BUCKET_NAME to this."
+  description = "S3 bucket for uploaded user documents. Set /groundediq/staging/S3_BUCKET_NAME to this."
   value       = aws_s3_bucket.docs.bucket
 }
 

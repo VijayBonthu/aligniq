@@ -180,7 +180,7 @@ function PushTab({ chatHistoryId, projectKey }: { chatHistoryId: string; project
   const [epicMode, setEpicMode] = useState<'new' | 'existing'>('new');
   const [epics, setEpics] = useState<JiraIssue[]>([]);
   const [epicKey, setEpicKey] = useState('');
-  const [labels, setLabels] = useState<string[]>(['aligniq']);
+  const [labels, setLabels] = useState<string[]>(['groundediq']);
   const [pushing, setPushing] = useState(false);
   const [result, setResult] = useState<JiraPushResult | null>(null);
 

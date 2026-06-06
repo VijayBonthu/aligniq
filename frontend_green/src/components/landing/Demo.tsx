@@ -168,7 +168,7 @@ export const Demo: React.FC = () => {
   return (
     <div className="demo">
       <div className="demo-topbar">
-        <span>alignIQ / scope</span>
+        <span>groundedIQ / scope</span>
         <span>{analyzing ? 'analyzing…' : 'analysis complete · 0.24s'}</span>
       </div>
 

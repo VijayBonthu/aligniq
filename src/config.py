@@ -71,8 +71,24 @@ class Settings:
     STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET")
     STRIPE_BASIC_PRICE_ID  = os.getenv("STRIPE_BASIC_PRICE_ID")
     STRIPE_PLUS_PRICE_ID   = os.getenv("STRIPE_PLUS_PRICE_ID")
+    # Pin the Stripe API version so request/response shapes are stable. Kept at a
+    # version where `current_period_end` still lives on the Subscription object
+    # (it moved onto subscription *items* in 2025-03-31+). Webhook payloads use the
+    # account/endpoint version, so handlers still read the field defensively.
+    STRIPE_API_VERSION     = os.getenv("STRIPE_API_VERSION", "2024-06-20")
     ADMIN_SECRET_KEY       = os.getenv("ADMIN_SECRET_KEY")
     FRONTEND_URL           = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+    # Transactional email (password reset, etc.) via Resend — a single HTTPS POST,
+    # wrapped in utils/email.py so the provider is swappable. If RESEND_API_KEY is
+    # unset, utils/email logs the message (including any reset link) at WARNING and
+    # does NOT send, so the flow stays testable locally without provisioning email.
+    RESEND_API_KEY         = os.getenv("RESEND_API_KEY", "")
+    EMAIL_FROM             = os.getenv("EMAIL_FROM", "GroundedIQ <noreply@grounded-iq.com>")
+
+    # Schema management. Local dev lets SQLAlchemy create tables from models.
+    # Staging/prod set AUTO_CREATE_TABLES=false and rely solely on `alembic upgrade head`.
+    AUTO_CREATE_TABLES     = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
 
     # Feature flags
     USE_TOOL_BASED_CHAT = os.getenv("USE_TOOL_BASED_CHAT", "false").lower() == "true"
@@ -107,6 +123,15 @@ class Settings:
     TAVILY_API_KEY             = os.getenv("TAVILY_API_KEY", "")
     KNOWN_ISSUES_MAX_QUERIES   = int(os.getenv("KNOWN_ISSUES_MAX_QUERIES", "6"))
     KNOWN_ISSUES_RESULTS_PER_QUERY = int(os.getenv("KNOWN_ISSUES_RESULTS_PER_QUERY", "3"))
+
+    # Cut 2 — retrieval-as-spine. The planner emits crux-targeted research_queries;
+    # the research stage runs them (before decide) so approaches/feasibility are
+    # grounded in the current real world, not just the client doc. Reuses the
+    # Tavily key. Inert without the key, like known-issues. Default ON so full
+    # reports get grounded substance; flip off to fall back to doc-only behavior.
+    ENABLE_RESEARCH            = os.getenv("ENABLE_RESEARCH", "true").lower() == "true"
+    RESEARCH_MAX_QUERIES       = int(os.getenv("RESEARCH_MAX_QUERIES", "6"))
+    RESEARCH_RESULTS_PER_QUERY = int(os.getenv("RESEARCH_RESULTS_PER_QUERY", "3"))
 
 
 settings = Settings()

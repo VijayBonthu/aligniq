@@ -7,7 +7,7 @@ variable "aws_region" {
 variable "project" {
   description = "Project name used as a prefix on most resources."
   type        = string
-  default     = "aligniq"
+  default     = "groundediq"
 }
 
 variable "environment" {
@@ -53,7 +53,7 @@ variable "instance_type" {
 variable "db_username" {
   description = "Postgres master username."
   type        = string
-  default     = "aligniq"
+  default     = "groundediq"
 }
 
 variable "db_password" {

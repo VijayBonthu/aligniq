@@ -22,12 +22,12 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Only allow workflows from this specific repo's main branch to assume.
-    # Tighten further with `:ref:refs/tags/*` if you cut from tags instead.
+    # Only a workflow job running in the GitHub `staging` Environment can assume
+    # this role (staging deploys from the `staging` branch with environment:staging).
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_repo}:environment:staging"]
     }
   }
 }
@@ -40,8 +40,8 @@ resource "aws_iam_role" "github_deploy" {
 data "aws_iam_policy_document" "github_deploy" {
   # Push to ECR
   statement {
-    sid     = "ECRAuth"
-    actions = ["ecr:GetAuthorizationToken"]
+    sid       = "ECRAuth"
+    actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"]
   }
   statement {

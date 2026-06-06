@@ -8,5 +8,10 @@ export default defineConfig({
   server: {
     port: 3002,
     open: true
-  }
+  },
+  // Strip all console.* and debugger statements from the production bundle.
+  // We don't ship client-side logging (no Sentry); dev builds keep them.
+  esbuild: {
+    drop: ['console', 'debugger'],
+  },
 })

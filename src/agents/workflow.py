@@ -113,7 +113,7 @@ class ProjectScopingAgent:
             chain = prompt | llm.with_structured_output(ProjectDefinition)
             response= await chain.ainvoke({"document": input_str})
             # response = await self._safe_json_parse(response)
-            print(f"response: {response}")
+            logger.debug("requirements response: %s", response)
             return response.to_markdown()
             # print(f"type: {type(response)}")
             # self.requirements.append(response)
@@ -132,8 +132,8 @@ class ProjectScopingAgent:
         """)
         
         chain = prompt | llm | StrOutputParser()
-        response = chain.invoke({"input": json.dumps(self.requirements)}) 
-        print("RAW Ambiguity response:", response)
+        response = chain.invoke({"input": json.dumps(self.requirements)})
+        logger.debug("RAW Ambiguity response: %s", response)
         self.ambiguities = self._safe_json_parse(response)
         return self.ambiguities
 
@@ -166,7 +166,7 @@ class ProjectScopingAgent:
         
         chain = prompt | llm | StrOutputParser()
         response = chain.invoke({"input": json.dumps(self.requirements)})
-        print("generate_tech_recommendations:", response)
+        logger.debug("generate_tech_recommendations: %s", response)
         self.tech_stack = self._safe_json_parse(response)
         return self.tech_stack
     
@@ -179,8 +179,7 @@ class ProjectScopingAgent:
             cleaned = json_str.replace('```json', '').replace('```', '').strip()
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
-            print(f"Failed to parse JSON: {json_str}")
-            print(f"Error: {e}")
+            logger.error("Failed to parse JSON from LLM: %s", e)
             return {"error": "Invalid JSON response from LLM"}
         
     def generate_pdf_report(self, filename: str):

@@ -17,7 +17,7 @@ from utils.logger import logger
 # (or any caller that binds the tool) BEFORE the agent runs; the tool reads from
 # this contextvar so the LLM cannot influence tenant scope by passing
 # untrusted args. Empty/None means no firm scope → tool returns empty.
-_firm_id_ctx: ContextVar[Optional[str]] = ContextVar("aligniq_firm_id", default=None)
+_firm_id_ctx: ContextVar[Optional[str]] = ContextVar("groundediq_firm_id", default=None)
 
 
 def set_firm_id_context(firm_id: Optional[str]):
@@ -2813,15 +2813,15 @@ async def push_to_jira(scope: str = "risks", project_key: str = None) -> str:
         if not report or not getattr(report, "report_content", None):
             return json.dumps({"status": "error", "message": "No report found yet."})
         summary = report.summary_report if isinstance(getattr(report, "summary_report", None), dict) else {}
-        project_title = summary.get("project_summary") or summary.get("title") or "AlignIQ Project"
+        project_title = summary.get("project_summary") or summary.get("title") or "GroundedIQ Project"
         markdown = _report_markdown(report)
 
         exec_summary, items = report_delivery_items(markdown, summary, scope=scope)
         if not items:
             return json.dumps({"status": "empty", "message": f"Nothing to push for scope '{scope}'."})
 
-        labels = ["aligniq"]
-        epic = integ.create_epic(project_key, f"{project_title} — AlignIQ"[:250], exec_summary, labels=labels)
+        labels = ["groundediq"]
+        epic = integ.create_epic(project_key, f"{project_title} — GroundedIQ"[:250], exec_summary, labels=labels)
         epic_key = epic.get("key")
         issue_keys = []
         for it in items[:50]:

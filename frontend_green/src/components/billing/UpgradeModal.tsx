@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { createCheckoutSession } from '../../services/billingService';
+import { startPlanChange } from '../../services/billingService';
 
 export type LimitType = 'max_chats' | 'messages_per_chat' | 'monthly_report_regen';
 
@@ -38,8 +38,14 @@ export default function UpgradeModal({ open, detail, onClose }: Props) {
   const handleUpgrade = async (tier: 'basic' | 'plus') => {
     setLoading(tier);
     try {
-      const { checkout_url } = await createCheckoutSession(tier);
-      window.location.href = checkout_url;
+      const { updated } = await startPlanChange(tier);
+      if (updated) {
+        // In-place upgrade applied (existing subscriber) — no redirect happened.
+        // Reload so the unlocked tier/limits take effect across the app.
+        window.location.reload();
+        return;
+      }
+      // Otherwise startPlanChange already navigated to Checkout / the Portal.
     } catch {
       setLoading(null);
     }

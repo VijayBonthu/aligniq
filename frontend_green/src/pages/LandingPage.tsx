@@ -199,7 +199,7 @@ const LandingPage: React.FC = () => {
               <div className="eyebrow section-eyebrow">FAQ</div>
               <h2 className="display section-h">Questions teams actually ask us.</h2>
               <p className="section-sub" style={{ margin: 0 }}>
-                Can't find it? <a href="mailto:hello@aligniq.io" style={{ color: 'var(--accent)' }}>Ask the team →</a>
+                Can't find it? <a href="mailto:hello@grounded-iq.com" style={{ color: 'var(--accent)' }}>Ask the team →</a>
               </p>
             </Reveal>
             <div className="faq-list">
@@ -246,7 +246,7 @@ const LandingPage: React.FC = () => {
                 <div className="footer-col-h">Company</div>
                 <a href="#">About</a>
                 <a href="#">Careers</a>
-                <a href="mailto:hello@aligniq.io">Contact</a>
+                <a href="mailto:hello@grounded-iq.com">Contact</a>
               </div>
               <div>
                 <div className="footer-col-h">Resources</div>

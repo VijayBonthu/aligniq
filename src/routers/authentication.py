@@ -4,10 +4,11 @@ from oauth import flow, auth_callback, JiraOAuth
 from config import settings
 from fastapi import Depends, HTTPException, Request, APIRouter, status, Header
 from sqlalchemy.orm import Session
-from models import get_db, User
+from models import get_db, User, LoginDetails
 from database_scripts import create_user,UserCreationError, get_user_details, save_jira_credentials, delete_jira_credentials, get_jira_credentials
-from utils.token_generation import create_token, verify_password, TokenDecoder, validate_app_user, validate_token_incoming_requests, token_validator, create_refresh_token, validate_refresh_token, revoke_refresh_token, rotate_refresh_token
-from p_model_type import Registration_login_password, login_details
+from utils.token_generation import create_token, verify_password, hash_passwords, create_password_reset_token, verify_password_reset_token, TokenDecoder, validate_app_user, validate_token_incoming_requests, token_validator, create_refresh_token, validate_refresh_token, revoke_refresh_token, rotate_refresh_token
+from utils.email import send_email, password_reset_email_html
+from p_model_type import Registration_login_password, login_details, PasswordResetRequest, PasswordResetConfirm
 from pydantic import BaseModel
 import logging
 from jira_logic.jira_components import get_jira_user_info
@@ -63,7 +64,7 @@ def _jira_popup_html(ok: bool, message: str) -> HTMLResponse:
     server-side) — it just tells the user the result and tries to auto-close. The SPA
     detects success by polling GET /jira/status."""
     title = "Jira connected" if ok else "Jira sign-in failed"
-    body = "You can close this window and return to AlignIQ." if ok else message
+    body = "You can close this window and return to GroundedIQ." if ok else message
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#1b1b20;color:#e8ecf2;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
 <div style="text-align:center;max-width:360px;padding:24px">
@@ -82,7 +83,7 @@ async def login():
 
     if state:
         auth_states[state] = True
-    print(auth_url)
+    logger.debug("Generated Google OAuth authorization URL")
     return RedirectResponse(url=auth_url)
 
 @router.get("/auth/callback", status_code=status.HTTP_200_OK)
@@ -216,7 +217,79 @@ def log_into_account(login_details:login_details, db:Session=Depends(get_db)):
         return {"access_token": token, "refresh_token": refresh_token_val, "token_type": "bearer"}
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    
+
+@router.post("/auth/forgot-password", status_code=status.HTTP_200_OK)
+async def forgot_password(body: PasswordResetRequest, db: Session = Depends(get_db)):
+    """Email a single-use password-reset link. Always returns 200 (no account
+    enumeration). The link carries a 15-min, hash-bound JWT that stops working the
+    moment the password changes. Local accounts only — Google users sign in with
+    Google, so there's nothing to reset here."""
+    email = (body.email or "").strip().lower()
+    if email:
+        user = db.query(User).filter(
+            User.email_address == email, User.provider == "Local"
+        ).first()
+        if user:
+            login_row = db.query(LoginDetails).filter(
+                LoginDetails.user_id == user.user_id
+            ).first()
+            if login_row:
+                token = create_password_reset_token(user.user_id, login_row.hashed_password)
+                reset_url = f"{FRONTEND_ORIGIN.rstrip('/')}/reset-password?token={token}"
+                try:
+                    await send_email(
+                        to=user.email_address,
+                        subject="Reset your GroundedIQ password",
+                        html=password_reset_email_html(user.first_name or "there", reset_url),
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send password reset email: {e}")
+    return {"message": "If an account exists for that email, a reset link is on its way."}
+
+@router.post("/auth/reset-password", status_code=status.HTTP_200_OK)
+async def reset_password(body: PasswordResetConfirm, db: Session = Depends(get_db)):
+    """Verify a reset token and set a new password. Single-use via the hash-bind in
+    the token (see verify_password_reset_token)."""
+    if not body.new_password or len(body.new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters.",
+        )
+    # Signature/expiry are checked again in verify_password_reset_token; here we just
+    # read `sub` so we can load the current hash the token is bound to.
+    try:
+        unverified = jose_jwt.decode(
+            body.token, settings.SECRET_KEY_J, algorithms=[settings.ALGORITHM]
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link is invalid or has expired.",
+        )
+    user_id = unverified.get("sub")
+    login_row = (
+        db.query(LoginDetails).filter(LoginDetails.user_id == user_id).first()
+        if user_id else None
+    )
+    if not login_row:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link is invalid or has expired.",
+        )
+    # Full verify: signature, expiry, purpose, and single-use hash-bind.
+    verify_password_reset_token(body.token, login_row.hashed_password)
+    login_row.hashed_password = hash_passwords(body.new_password)
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update password: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not update your password, please try again.",
+        )
+    return {"message": "Your password has been updated. You can now sign in."}
+
 @router.get("/auth/jira/login")
 async def jira_login(request: Request, current_user: dict = Depends(token_validator)):
     """Start the Jira OAuth flow. Authenticated via the app bearer so we can bind the

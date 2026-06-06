@@ -2112,7 +2112,7 @@ async def get_user_details(
         # Validate Jira token
         jira_token = auth_header.split("Bearer ")[1]
         jira_payload = token_validator(request=jira_token)
-        print(f"jira_payload: {jira_payload}")
+        logger.debug("Validated Jira token payload")
         
         # Use the access token stored in the Jira JWT
         user_info = await get_jira_user_info(jira_payload["jira_access_token"])
@@ -4174,7 +4174,7 @@ The report was likely generated directly from a document upload.
                 pending_count = len(await get_pending_changes(chat_context["chat_history_id"], db))
                 current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
 
-                llm_response = f"""**AlignIQ Report Assistant**
+                llm_response = f"""**GroundedIQ Report Assistant**
 
 I can help you with your technical report. Here's what I can do:
 
@@ -4221,7 +4221,7 @@ What would you like to do?
 """
             except Exception as e:
                 logger.error(f"Error in help_capabilities: {str(e)}")
-                llm_response = """**AlignIQ Report Assistant**
+                llm_response = """**GroundedIQ Report Assistant**
 
 I can help you with:
 - Answering questions about your report

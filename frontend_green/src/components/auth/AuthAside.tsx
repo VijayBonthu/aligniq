@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { Logo } from '../Logo';
 
 export const AuthAside: React.FC = () => (
+  <>
   <aside className="auth-side">
     <div className="auth-side-bg" aria-hidden />
 
@@ -20,7 +21,7 @@ export const AuthAside: React.FC = () => (
 
       <div className="auth-preview">
         <div className="auth-preview-head">
-          <span>alignIQ / sample scope</span>
+          <span>groundedIQ / sample scope</span>
           <span>0.24s</span>
         </div>
         <div className="auth-preview-row">
@@ -43,4 +44,9 @@ export const AuthAside: React.FC = () => (
       <span>SOC 2 · GDPR · ISO 27001</span>
     </div>
   </aside>
+
+  {/* Shown only on narrow screens (the editorial aside is hidden there); keeps the
+      brand + a route home reachable. See the ≤860px rule in globals.css. */}
+  <Link to="/" className="auth-mobile-brand" aria-label="GroundedIQ home"><Logo /></Link>
+  </>
 );

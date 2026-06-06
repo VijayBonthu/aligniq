@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { createCheckoutSession, getPortalUrl } from '../services/billingService';
+import { startPlanChange, getPortalUrl } from '../services/billingService';
 import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, PlanDescriptor, Tier } from '../data/plans';
 import { Logo } from '../components/Logo';
 
@@ -30,8 +30,13 @@ export default function PricingPage() {
 
     setLoading(plan.id);
     try {
-      const { checkout_url } = await createCheckoutSession(plan.id as 'basic' | 'plus');
-      window.location.href = checkout_url;
+      // startPlanChange handles all three outcomes: new-customer Checkout,
+      // downgrade → portal, or an in-place prorated upgrade (no redirect).
+      const { updated } = await startPlanChange(plan.id as 'basic' | 'plus');
+      if (updated) {
+        window.location.reload();
+        return;
+      }
     } catch {
       setLoading(null);
     }

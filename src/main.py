@@ -6,6 +6,7 @@ import uvicorn
 from dotenv import load_dotenv
 import models
 from models import engine
+from config import settings
 from fastapi.middleware.cors import CORSMiddleware
 from routers import authentication, services, third_party_integrations, billing, firm_admin
 from utils.logger import setup_logger
@@ -17,7 +18,14 @@ logger = setup_logger()
 
 load_dotenv()
 
-models.Base.metadata.create_all(bind=engine)
+# Local dev creates tables straight from the models. Staging/prod set
+# AUTO_CREATE_TABLES=false and manage schema exclusively via Alembic
+# (`alembic upgrade head` runs as a discrete deploy step before this serves traffic),
+# so create_all never races a migration or silently diverges from versioned history.
+if settings.AUTO_CREATE_TABLES:
+    models.Base.metadata.create_all(bind=engine)
+else:
+    logger.info("AUTO_CREATE_TABLES=false — schema managed by Alembic")
 
 
 # Threshold for reaping stuck `running` pipeline_runs after a backend restart.

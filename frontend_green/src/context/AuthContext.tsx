@@ -20,6 +20,10 @@ interface UserData {
 
 interface AuthContextType {
   isAuthenticated: boolean;
+  // False until the on-mount session check (decode + silent refresh) has resolved.
+  // Public pages gate their "already signed in → /projects" redirect on this so a
+  // dead session doesn't bounce /login → /projects → 401 → /login.
+  authReady: boolean;
   user: UserData | null;
   subscription: SubscriptionData | null;
   login: (accessToken: string, refreshToken?: string) => Promise<boolean>;
@@ -32,6 +36,7 @@ interface AuthContextType {
 
 const defaultValue: AuthContextType = {
   isAuthenticated: false,
+  authReady: false,
   user: null,
   subscription: null,
   login: async () => false,
@@ -57,6 +62,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [user, setUser] = useState<UserData | null>(null);
   const [subscription, setSubscription] = useState<SubscriptionData | null>(null);
   const [limitHit, setLimitHit] = useState<LimitHitDetail | null>(null);
+  const [authReady, setAuthReady] = useState(false);
 
   const showLimitHit = useCallback((detail: LimitHitDetail) => setLimitHit(detail), []);
   const clearLimitHit = useCallback(() => setLimitHit(null), []);
@@ -125,16 +131,50 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   useEffect(() => {
-    const token =
-      localStorage.getItem('access_token') ||
-      localStorage.getItem('regular_token') ||
-      localStorage.getItem('google_auth_token');
+    const init = async () => {
+      const token =
+        localStorage.getItem('access_token') ||
+        localStorage.getItem('regular_token') ||
+        localStorage.getItem('google_auth_token');
 
-    if (token) {
-      decodeAndStoreUserData(token).then(userData => {
-        if (userData) getSubscription().then(setSubscription).catch(() => {});
-      });
-    }
+      if (!token) {
+        setAuthReady(true);
+        return;
+      }
+
+      try {
+        const userData = await decodeAndStoreUserData(token);
+        const expMs = userData?.exp ? userData.exp * 1000 : 0;
+        if (userData && expMs > Date.now()) {
+          // Access token still valid — good to go.
+          getSubscription().then(setSubscription).catch(() => {});
+        } else {
+          // Access token is missing/expired (they're short-lived). Try ONE silent
+          // refresh so a returning user with a live refresh token stays signed in,
+          // and a truly dead session resolves to logged-out instead of a 401 loop.
+          const refreshToken = localStorage.getItem('refresh_token');
+          if (!refreshToken) throw new Error('no refresh token');
+          const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
+          localStorage.setItem('access_token', data.access_token);
+          localStorage.setItem('refresh_token', data.refresh_token);
+          localStorage.setItem('regular_token', data.access_token);
+          api.defaults.headers.common['Authorization'] = `Bearer ${data.access_token}`;
+          const refreshed = await decodeAndStoreUserData(data.access_token);
+          if (!refreshed) throw new Error('decode after refresh failed');
+          getSubscription().then(setSubscription).catch(() => {});
+        }
+      } catch {
+        // Dead session — clear everything so public pages don't redirect into a loop.
+        ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
+         'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
+        delete api.defaults.headers.common['Authorization'];
+        setUser(null);
+        setIsAuthenticated(false);
+      } finally {
+        setAuthReady(true);
+      }
+    };
+    init();
   }, []);
 
   const logout = () => {
@@ -155,7 +195,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   return (
     <AuthContext.Provider value={{
-      isAuthenticated, user, subscription, login, logout, refreshSubscription,
+      isAuthenticated, authReady, user, subscription, login, logout, refreshSubscription,
       limitHit, showLimitHit, clearLimitHit,
     }}>
       {children}

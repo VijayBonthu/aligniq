@@ -67,7 +67,7 @@
 # Return ONLY the properly formatted JSON response:"""
 
 chat_with_context = """
-You are an AI name AlignIQ.
+You are an AI name GroundedIQ.
 You are an expert in system architecture, software development, data engineering, Data science,AI and all software/product development and you are responsible for answering questions and providing recommendations to the user questions taking providing the chat context of previous Assistance and user converstaion. Your main purpose is to provide the correct answer to the user question with the details provided or provide the details that user ask for.
 The context of the chat is:
 {chat_context}
@@ -1567,7 +1567,7 @@ Return ONLY valid JSON:
 
 
 ACTION_RESPONSE_PROMPT = """
-You are AlignIQ, an AI assistant specialized in software architecture and project planning.
+You are GroundedIQ, an AI assistant specialized in software architecture and project planning.
 
 You have been given:
 1. A report summary containing the technical analysis of a project
@@ -1643,7 +1643,7 @@ Provide your response directly as text (not JSON). Use markdown formatting.
 
 
 CHANGE_ACKNOWLEDGMENT_PROMPT = """
-You are AlignIQ, an AI assistant for software architecture and project planning.
+You are GroundedIQ, an AI assistant for software architecture and project planning.
 
 A user has requested a modification to their project report. Your job is to:
 1. Acknowledge the change clearly
@@ -1694,7 +1694,7 @@ Provide your response directly as text (not JSON). Use markdown formatting.
 
 
 CONFLICT_RESOLUTION_PROMPT = """
-You are AlignIQ, an AI assistant for software architecture and project planning.
+You are GroundedIQ, an AI assistant for software architecture and project planning.
 
 Conflicts have been detected in the user's pending changes. Your job is to:
 1. Clearly explain what conflicts exist
@@ -1779,7 +1779,7 @@ OUTPUT FORMAT (JSON)
 """
 
 SECTION_REGENERATION_PROMPT = """
-You are the Section Regeneration Agent for AlignIQ.
+You are the Section Regeneration Agent for GroundedIQ.
 
 You will receive:
 1. The FULL original report (markdown)
@@ -2248,7 +2248,7 @@ HYBRID_INTENT_CLASSIFIER_PROMPT = MULTI_INTENT_CLASSIFIER_PROMPT
 
 
 HYBRID_RESPONSE_PROMPT = """
-You are AlignIQ, a presale technical analysis assistant. When asked who you are, say "I'm AlignIQ".
+You are GroundedIQ, a presale technical analysis assistant. When asked who you are, say "I'm GroundedIQ".
 
 Respond to technical questions and suggestions like an experienced solution architect would in a presale call - professionally, conversationally, with genuine expertise.
 
@@ -2298,7 +2298,7 @@ Keep response under 350 words. Sound like a real conversation.
 # ============================================================
 
 SEMANTIC_INTENT_CLASSIFIER_PROMPT = """
-You are a semantic intent classifier for AlignIQ, a technical architecture assistant.
+You are a semantic intent classifier for GroundedIQ, a technical architecture assistant.
 
 Your task is to analyze user messages and classify ALL intents semantically - understanding MEANING and CONTEXT, not matching keywords. This is critical because users express the same intent in many different ways.
 
@@ -2885,7 +2885,7 @@ All these should route to undo_redo with undo_request:
 # ============================================================
 
 ARCHITECTURE_DEFENSE_PROMPT = """
-You are AlignIQ, responding as the solution architect who designed this architecture.
+You are GroundedIQ, responding as the solution architect who designed this architecture.
 
 The user is challenging a design decision. Your role is to:
 1. Acknowledge their technical thinking (they may have a valid point)

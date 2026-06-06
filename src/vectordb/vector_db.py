@@ -15,7 +15,7 @@ client = chromadb.CloudClient(
 
 client_oa = OpenAI(api_key=settings.OPENAI_CHATGPT)
 embedding_function = OpenAIEmbeddings(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_CHATGPT)
-collection = client.get_or_create_collection(name="AlignIQ")
+collection = client.get_or_create_collection(name="GroundedIQ")
 
 def _embed_batched(texts: list[str], model: str, batch_size: int = 100) -> list[list[float]]:
   """Embed `texts` in batches (the OpenAI embeddings API accepts a list input and

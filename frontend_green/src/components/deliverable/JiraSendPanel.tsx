@@ -167,7 +167,7 @@ export default function JiraSendPanel({ open, onClose, defaultTitle, buildBlob }
           project_key: projectKey,
           summary: summary.trim(),
           issue_type: newType,
-          description: 'Deliverable generated in AlignIQ.',
+          description: 'Deliverable generated in GroundedIQ.',
           parent_key: newType !== 'Epic' && parentEpic ? parentEpic : undefined,
         });
         key = created.key;

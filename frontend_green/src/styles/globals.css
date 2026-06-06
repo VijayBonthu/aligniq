@@ -833,6 +833,11 @@ button { font-family: inherit; }
   justify-content: center; align-items: center;
 }
 .auth-form-wrap { width: 100%; max-width: 420px; }
+.auth-eyebrow {
+  font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--accent); margin: 0 0 12px;
+}
 .auth-title {
   font-family: var(--font-display);
   font-size: 40px; letter-spacing: -0.02em;
@@ -911,6 +916,26 @@ button { font-family: inherit; }
 @keyframes pop {
   from { transform: scale(0.5); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
+}
+
+/* Compact brand shown above the form on narrow screens (the editorial aside is
+   hidden there). Removed from the grid on desktop so the 1fr/1fr split is intact. */
+.auth-mobile-brand { display: none; }
+
+/* The auth split is 1fr/1fr on desktop; on phones/small tablets the editorial
+   aside would crush the form into a half column, so stack to one column, drop the
+   aside, and surface the compact brand instead. */
+@media (max-width: 860px) {
+  .auth-wrap { grid-template-columns: 1fr; }
+  .auth-side { display: none; }
+  .auth-mobile-brand {
+    display: flex; justify-content: center;
+    padding: 30px 22px 0;
+  }
+  .auth-main {
+    padding: 28px 22px 48px;
+    justify-content: flex-start;
+  }
 }
 
 /* ──────── Dashboard utility: prose ──────── */

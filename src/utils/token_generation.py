@@ -136,6 +136,44 @@ def hash_passwords(password:str):
 def verify_password(password:str, hashed_password:str):
     return pwd_context.verify(password,hashed_password)
 
+def _password_reset_bind(password_hash: str) -> str:
+    """Short fingerprint of the user's CURRENT password hash, salted with the app
+    secret. Embedded in the reset token so a link stops working the moment the
+    password changes — i.e. single-use — without needing a reset-token table."""
+    return hashlib.sha256((password_hash + settings.SECRET_KEY_J).encode()).hexdigest()[:32]
+
+def create_password_reset_token(user_id: str, password_hash: str) -> str:
+    """Short-lived (15 min), hash-bound JWT used as the password-reset link token."""
+    payload = {
+        "sub": user_id,
+        "purpose": "pw_reset",
+        "pwb": _password_reset_bind(password_hash),
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY_J, algorithm=settings.ALGORITHM)
+
+def verify_password_reset_token(token: str, password_hash: str) -> str:
+    """Return the user_id if `token` is a valid, unused reset token for the user
+    whose current password hash is `password_hash`; else raise HTTPException(400).
+    Pure (no DB) so it's unit-testable; the caller resolves `password_hash`."""
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="This reset link is invalid or has expired.",
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY_J, algorithms=[settings.ALGORITHM])
+    except JWTError:
+        raise invalid
+    if payload.get("purpose") != "pw_reset" or not payload.get("sub"):
+        raise invalid
+    if payload.get("pwb") != _password_reset_bind(password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link has already been used.",
+        )
+    return payload["sub"]
+
 def validate_jira_token(token: str):
     """Validate Jira-specific JWT token"""
     try:
@@ -184,7 +222,7 @@ class TokenDecoder:
 
 async def validate_app_user(token:str):
     """Validate the app's JWT token"""
-    print("inside validate app user")
+    logger.debug("Validating app user token")
     credential_exception = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
     try:
         # token = credentials.credentials

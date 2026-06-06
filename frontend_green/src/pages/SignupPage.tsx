@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../services/api';
+import { useGoogleAuth } from '../hooks/useGoogleAuth';
+import { passwordStrength } from '../utils/passwordStrength';
 import { AuthAside } from '../components/auth/AuthAside';
 import { SSORow } from '../components/auth/SSORow';
 
@@ -12,19 +14,8 @@ const ROLES: { label: string; desc: string }[] = [
   { label: 'Client',             desc: 'I commission work from agencies.' },
 ];
 
-const passwordStrength = (pw: string): { score: 0 | 1 | 2 | 3 | 4; label: string } => {
-  if (!pw) return { score: 0, label: 'Empty' };
-  let s = 0;
-  if (pw.length >= 8) s++;
-  if (pw.length >= 12) s++;
-  if (/[A-Z]/.test(pw) && /[a-z]/.test(pw)) s++;
-  if (/\d/.test(pw) && /[^A-Za-z0-9]/.test(pw)) s++;
-  const label = ['Weak', 'Weak', 'Fair', 'Strong', 'Excellent'][s] || 'Weak';
-  return { score: s as 0 | 1 | 2 | 3 | 4, label };
-};
-
 const SignupPage: React.FC = () => {
-  const { isAuthenticated, login } = useAuth();
+  const { isAuthenticated, authReady, login } = useAuth();
   const navigate = useNavigate();
 
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -37,28 +28,13 @@ const SignupPage: React.FC = () => {
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  const startGoogleAuth = useGoogleAuth(setError);
+
   useEffect(() => {
-    if (isAuthenticated && step !== 3) navigate('/projects', { replace: true });
-  }, [isAuthenticated, navigate, step]);
+    if (authReady && isAuthenticated && step !== 3) navigate('/projects', { replace: true });
+  }, [authReady, isAuthenticated, navigate, step]);
 
   const strength = passwordStrength(password);
-
-  const handleGoogleLogin = () => {
-    const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/api\/v1\/?$/, '') || 'http://localhost:8080';
-    const popup = window.open(`${API_BASE}/api/v1/auth/login`, 'google-auth', 'width=500,height=600,left=200,top=100');
-    const handler = async (event: MessageEvent) => {
-      if (event.data?.type !== 'google_auth_success') return;
-      window.removeEventListener('message', handler);
-      popup?.close();
-      const success = await login(event.data.access_token, event.data.refresh_token);
-      if (success) navigate('/projects');
-      else setError('Authentication failed.');
-    };
-    window.addEventListener('message', handler);
-    const t = setInterval(() => {
-      if (popup?.closed) { clearInterval(t); window.removeEventListener('message', handler); }
-    }, 500);
-  };
 
   const handleStep1 = (e: React.FormEvent) => {
     e.preventDefault();
@@ -87,6 +63,7 @@ const SignupPage: React.FC = () => {
         password,
         username: username.trim(),
         role: selectedRole,
+        company: company.trim() || undefined,
       });
       const success = await login(res.data.access_token, res.data.refresh_token);
       if (!success) throw new Error('Login after signup failed');
@@ -116,10 +93,11 @@ const SignupPage: React.FC = () => {
 
           {step === 1 && (
             <form onSubmit={handleStep1} className="animate-fade-up">
+              <div className="auth-eyebrow">Get started</div>
               <h1 className="auth-title">Create your account.</h1>
-              <p className="auth-sub">Start aligning your next project in under a minute.</p>
+              <p className="auth-sub">Start scoping your next project in under a minute.</p>
 
-              <SSORow onGoogle={handleGoogleLogin} />
+              <SSORow onGoogle={startGoogleAuth} />
               <div className="divider">or with email</div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>

@@ -49,8 +49,22 @@ def _get_user(user_id: str, db: Session) -> models.User:
     return user
 
 
+def get_effective_tier(user: models.User) -> str:
+    """The tier whose limits currently apply.
+
+    An unexpired backend comp (comp_tier + comp_expires_at) overrides the real
+    subscription_tier. Once the comp lapses we fall back automatically — the check
+    is evaluated lazily on every limit check, so no cron/cleanup job is needed.
+    """
+    comp_tier = getattr(user, "comp_tier", None)
+    comp_expires_at = getattr(user, "comp_expires_at", None)
+    if comp_tier and comp_expires_at and comp_expires_at > datetime.now(timezone.utc):
+        return comp_tier
+    return user.subscription_tier or "free"
+
+
 def _limits_for(user: models.User) -> dict:
-    tier = user.subscription_tier or "free"
+    tier = get_effective_tier(user)
     return TIER_LIMITS.get(tier, TIER_LIMITS["free"])
 
 
@@ -255,10 +269,19 @@ def get_usage_summary(user_id: str, db: Session) -> dict:
     )
     usage = get_or_create_usage_period(user_id, db)
     limits = _limits_for(user)
+    effective_tier = get_effective_tier(user)
+    base_tier = user.subscription_tier or "free"
+    comp_active = effective_tier != base_tier
     return {
-        "tier": user.subscription_tier or "free",
+        "tier": effective_tier,            # the tier whose limits apply right now
+        "base_tier": base_tier,            # the real paid/free tier underneath any comp
         "status": user.subscription_status or "active",
         "period_end": user.subscription_period_end.isoformat() if user.subscription_period_end else None,
+        "comp": {
+            "active": comp_active,
+            "tier": user.comp_tier if comp_active else None,
+            "expires_at": user.comp_expires_at.isoformat() if (comp_active and user.comp_expires_at) else None,
+        },
         "usage": {
             "chats": chat_count,
             "report_regenerations_used": usage.report_regenerations_used,

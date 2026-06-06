@@ -12,6 +12,8 @@ non-determinism in the final markdown means a bug in a writer, not in stitching.
 from typing import Optional
 
 from agents.contract import (
+    ApproachOption,
+    ClientQA,
     CostLine,
     FeasibilityVerdict,
     KnownIssue,
@@ -303,6 +305,144 @@ def _orphan_decision_blocks(contract: ReportContract, rendered_section_ids: set[
     return "## Solution & Estimate\n\n" + "\n".join(b for b in blocks if b)
 
 
+# ---------------------------------------------------------------------------
+# Answer-first lead (Minto): the report opens with the recommendation, the
+# headline numbers, and the verdict — not with prose that builds to a conclusion.
+# ---------------------------------------------------------------------------
+
+
+def _timeline_span_weeks(milestones: list[Milestone]) -> tuple[int, int]:
+    """End-to-end duration as the critical path through the milestone DAG.
+
+    Longest dependency chain (not a naive sum, which double-counts parallel
+    phases). Cycle-safe via the `seen` set. Returns (low_weeks, high_weeks).
+    """
+    by_name = {m.name: m for m in milestones}
+
+    def finish(name: str, hi: bool, seen: frozenset[str]) -> int:
+        m = by_name.get(name)
+        if m is None or name in seen:
+            return 0
+        seen = seen | {name}
+        dep_finishes = [finish(d, hi, seen) for d in m.depends_on if d in by_name]
+        return max(dep_finishes or [0]) + (m.weeks_high if hi else m.weeks_low)
+
+    low = max((finish(m.name, False, frozenset()) for m in milestones), default=0)
+    high = max((finish(m.name, True, frozenset()) for m in milestones), default=0)
+    return low, high
+
+
+def _headline_line(contract: ReportContract) -> str:
+    """One line with the numbers a stakeholder challenges first: cost and time."""
+    bits: list[str] = []
+    if contract.cost_lines:
+        cost = compute_cost(contract.cost_lines, contract.cost_sensitivity, contract.contingency_pct)
+        bits.append(f"**Estimate:** {_money(cost['grand_low'])} – {_money(cost['grand_high'])}")
+    if contract.timeline:
+        low, high = _timeline_span_weeks(contract.timeline)
+        if high:
+            span = f"{low}–{high}" if low != high else f"{high}"
+            bits.append(f"**Timeline (end-to-end):** {span} weeks")
+    return " · ".join(bits)
+
+
+def _bottom_line_block(contract: ReportContract) -> str:
+    """Recommendation up front: commit-line + headline numbers + verdict."""
+    brief = (contract.executive_summary_brief or "").strip()
+    headline = _headline_line(contract)
+    if not brief and not headline and not contract.feasibility:
+        return ""
+    lines = ["## Bottom Line", ""]
+    if brief:
+        lines.append(brief)
+        lines.append("")
+    if headline:
+        lines.append(headline)
+        lines.append("")
+    if contract.feasibility:
+        lines.append(_feasibility_block(contract.feasibility).rstrip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _engagement_brief_block(contract: ReportContract) -> str:
+    """The engagement story up front: the problem, what we asked, what they told us.
+
+    Pure render of typed fields the planner lifts from the CRD's confirmed Q&A —
+    so the deliverable shows the problem and the client's own answers in context,
+    instead of burying them in inline quotes. Open (unanswered) items stay in the
+    Open Questions appendix at the end.
+    """
+    problem = (contract.problem_statement or "").strip()
+    answered = [q for q in contract.client_qa if (q.question or "").strip() and (q.answer or "").strip()]
+    if not problem and not answered:
+        return ""
+    lines = ["## Engagement Brief", ""]
+    if problem:
+        lines.append("### The Problem")
+        lines.append("")
+        lines.append(problem)
+        lines.append("")
+    if answered:
+        lines.append("### What We Asked / What You Told Us")
+        lines.append("")
+        lines.append("| Question | What the client told us | Ref |")
+        lines.append("|----------|-------------------------|-----|")
+        for q in answered:
+            ques = q.question.replace("|", "\\|").replace("\n", " ")
+            ans = q.answer.replace("|", "\\|").replace("\n", " ")
+            ref = (q.source or "—").replace("|", "\\|")
+            lines.append(f"| {ques} | {ans} | {ref} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# The crux + the approaches — the spine of a specialist's answer. These lead the
+# report so it reads as "here is the hard problem and the 2-3 real ways to solve
+# it", not as a generic scope doc.
+# ---------------------------------------------------------------------------
+
+
+def _core_challenge_block(core_challenge: str) -> str:
+    text = (core_challenge or "").strip()
+    if not text:
+        return ""
+    return "## The Core Challenge\n\n" + text + "\n"
+
+
+def _approaches_block(approaches: list[ApproachOption]) -> str:
+    if not approaches:
+        return ""
+    lines = ["## Approaches Considered", ""]
+    # Recommended first, so the lead is the answer; then the alternatives.
+    ordered = sorted(approaches, key=lambda a: (not a.recommended))
+    for a in ordered:
+        tag = " — **Recommended**" if a.recommended else ""
+        lines.append(f"### {a.name}{tag}")
+        lines.append("")
+        if a.summary:
+            lines.append(a.summary)
+            lines.append("")
+        if a.how_it_works:
+            lines.append("**How it works:** " + a.how_it_works.strip())
+            lines.append("")
+        if a.best_when:
+            lines.append(f"**Best when:** {a.best_when}")
+        if a.tradeoffs:
+            lines.append("**Tradeoffs:**")
+            for t in a.tradeoffs:
+                lines.append(f"- {t}")
+        meta = f"_Risk: {a.risk_level} · Confidence: {a.confidence}_"
+        lines.append(meta)
+        if a.sources:
+            srcs = ", ".join(f"[source]({u})" for u in a.sources if u)
+            if srcs:
+                lines.append(f"_Sources: {srcs}_")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def render_report(
     contract: ReportContract,
     sections_md: dict[str, str],
@@ -328,11 +468,16 @@ def render_report(
 
     parts.append(f"# {contract.report_title}\n")
 
-    # Lead with the headline call so the report opens with direction, not prose.
-    if contract.feasibility:
-        parts.append(_feasibility_block(contract.feasibility))
+    # Lead with the recommendation (Minto answer-first): commit-line, headline
+    # numbers, and the verdict — so the report opens with direction, not prose.
+    parts.append(_bottom_line_block(contract))
 
-    parts.append(f"_{contract.executive_summary_brief}_\n")
+    # The engagement story up front: the problem, what we asked, what they told us.
+    parts.append(_engagement_brief_block(contract))
+
+    # The crux and the 2-3 real approaches to it — the spine of a specialist's answer.
+    parts.append(_core_challenge_block(contract.core_challenge))
+    parts.append(_approaches_block(contract.approaches))
 
     if contract.global_assumptions:
         parts.append(_global_assumptions_block(contract.global_assumptions))

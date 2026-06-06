@@ -226,10 +226,10 @@ async def create_single_jira_issue(payload: dict = Body(...),
     parent_key = (payload or {}).get("parent_key")  # e.g. create a Story under an Epic
     integ = await _integ(current_user, db)
     if issue_type.lower() == "epic":
-        created = integ.create_epic(project_key, summary, description, labels=["aligniq"])
+        created = integ.create_epic(project_key, summary, description, labels=["groundediq"])
     else:
         created = integ.create_issue(project_key, summary, description, issue_type=issue_type,
-                                     parent_key=parent_key, labels=["aligniq"])
+                                     parent_key=parent_key, labels=["groundediq"])
     return {"key": created.get("key"), "browse_url": created.get("browse_url")}
 
 
@@ -309,7 +309,7 @@ async def create_jira_from_report(
         raise HTTPException(status_code=404, detail="No report found for this chat")
 
     summary = report.summary_report if isinstance(getattr(report, "summary_report", None), dict) else {}
-    project_title = summary.get("project_summary") or summary.get("title") or "AlignIQ Project"
+    project_title = summary.get("project_summary") or summary.get("title") or "GroundedIQ Project"
     markdown = report.report_content if isinstance(report.report_content, str) else ""
 
     # Items: use the user-edited override verbatim when present, else derive from the report.
@@ -317,21 +317,21 @@ async def create_jira_from_report(
         items = [{"summary": (it or {}).get("summary") or "Untitled",
                   "description": (it or {}).get("description") or ""}
                  for it in override_items if (it or {}).get("summary")]
-        exec_summary = "Delivery work breakdown selected from the AlignIQ analysis report."
+        exec_summary = "Delivery work breakdown selected from the GroundedIQ analysis report."
     else:
         section_ids = set((payload or {}).get("section_ids") or [])
         exec_summary, items = report_delivery_items(markdown, summary, scope=scope, section_ids=section_ids)
     if not items:
         raise HTTPException(status_code=400, detail=f"Nothing to push for scope '{scope}'.")
 
-    labels = ["aligniq"] + [l for l in extra_labels if l and l != "aligniq"]
+    labels = ["groundediq"] + [l for l in extra_labels if l and l != "groundediq"]
 
     # Epic: attach to an existing one, or create a fresh epic for this push.
     if epic_key_in:
         epic_key = epic_key_in
         epic = {"key": epic_key, "browse_url": integ._browse_url(epic_key)}
     else:
-        epic = integ.create_epic(project_key, f"{project_title} — AlignIQ"[:250], exec_summary, labels=labels)
+        epic = integ.create_epic(project_key, f"{project_title} — GroundedIQ"[:250], exec_summary, labels=labels)
         epic_key = epic.get("key")
 
     issues = []

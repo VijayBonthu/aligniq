@@ -44,8 +44,6 @@ class AccessLLM:
 
 
 
-        print(self.last_prompt)
-
         return response
 
 

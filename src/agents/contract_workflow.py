@@ -63,6 +63,15 @@ _writer_llm = ChatOpenAI(
     model=settings.GENERATING_REPORT_MODEL,
     reasoning_effort="low",
 )
+# Higher-effort writer for the substance-heavy sections (the recommended approach
+# and the feasibility/cost narrative) — these carry the report's actual thinking,
+# so they get more reasoning budget. Bulk sections stay on the cheap _writer_llm.
+_writer_llm_high = ChatOpenAI(
+    api_key=settings.OPENAI_CHATGPT,
+    model=settings.GENERATING_REPORT_MODEL,
+    reasoning_effort="high",
+)
+_DEEP_REASONING_SECTIONS = {"recommended-approach", "feasibility-and-cost"}
 _smart_json_parser = OutputFixingParser.from_llm(parser=JsonOutputParser(), llm=llm_parser)
 
 
@@ -124,6 +133,49 @@ def _evidence_block_for_section(
     return "\n\n".join(lines) if lines else "(planner pointed at chunks that do not exist)"
 
 
+def _format_research_block(findings: list[dict]) -> str:
+    """Format the research findings pool for the decider/writer prompts.
+
+    Each finding is {query, url, title, snippet}. The url is the only thing the
+    model may cite as a source — it is real (came from Tavily), so links are
+    grounded, never invented.
+    """
+    if not findings:
+        return "(no external research available — rely on the document + your expertise, and label expert claims as assumptions)"
+    blocks: list[str] = []
+    for f in findings:
+        url = f.get("url", "")
+        title = f.get("title", "")
+        snippet = (f.get("content") or f.get("snippet") or "")[:500]
+        blocks.append(f"[{title}]({url})\n{snippet}")
+    return "\n\n".join(blocks)
+
+
+def _format_prior_context(prior_contract: Optional[dict], applied_changes: Optional[list]) -> str:
+    """Build the regeneration block: the prior contract + the requested changes.
+
+    Present only on a regen. When absent, returns a first-run sentinel so the
+    planner/decider prompts always have a concrete value to interpolate.
+    """
+    if not prior_contract and not applied_changes:
+        return "(none — this is a first run; design from scratch)"
+    parts: list[str] = []
+    if applied_changes:
+        parts.append("REQUESTED CHANGES (apply these; re-open only what they touch):")
+        for c in applied_changes:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id", "CHG")
+            target = c.get("target_section", "general")
+            req = c.get("user_request", "")
+            parts.append(f"- [{cid}] ({target}) {req}")
+    if prior_contract:
+        # The prior contract grounds "carry forward what the changes don't touch".
+        parts.append("\nPRIOR CONTRACT (evolve this; do not restart):")
+        parts.append(json.dumps(prior_contract, ensure_ascii=False)[:12000])
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Node 1 — planner
 # ---------------------------------------------------------------------------
@@ -133,6 +185,7 @@ async def plan_node(
     firm_context: str,
     document_chunks_block: str,
     evidence_index_block: str,
+    prior_context: str = "(none — this is a first run; design from scratch)",
 ) -> ReportContract:
     """Smart model emits a ReportContract (structure only — decisions come later)."""
     logger.info("contract_pipeline: plan_node starting")
@@ -145,6 +198,7 @@ async def plan_node(
             "crd": crd or "(no CRD provided)",
             "document_chunks": document_chunks_block,
             "evidence_index": evidence_index_block,
+            "prior_context": prior_context,
         },
         agent_name="contract_planner",
         model=settings.SMART_MODEL_NAME,
@@ -165,6 +219,7 @@ async def plan_node(
 # cost, timeline, team, feasibility verdict) as typed data. The arithmetic is
 # the stitcher's job — this node only picks hours and rates.
 _DECISION_FIELDS = (
+    "approaches",
     "tech_decisions", "cost_lines", "cost_sensitivity",
     "contingency_pct", "timeline", "team", "feasibility",
     # Slice 2 — service_options ride inside tech_decisions (no separate key).
@@ -177,6 +232,8 @@ async def decide_node(
     contract: ReportContract,
     firm_context: str,
     document_chunks_block: str,
+    research_block: str = "(no external research available)",
+    prior_context: str = "(none — this is a first run; design from scratch)",
 ) -> ReportContract:
     """Smart model fills the contract's decision artifacts. Returns the merged contract."""
     logger.info("contract_pipeline: decide_node starting")
@@ -188,6 +245,8 @@ async def decide_node(
             "firm_context": firm_context or "(none)",
             "contract_json": contract.model_dump_json(),
             "document_chunks": document_chunks_block,
+            "research_block": research_block,
+            "prior_context": prior_context,
         },
         agent_name="contract_decider",
         model=settings.SMART_MODEL_NAME,
@@ -247,6 +306,53 @@ def _decision_context_for_section(contract: ReportContract, section_id: str) -> 
         if payload:
             return json.dumps(payload, indent=2)
     return "(none)"
+
+
+# ---------------------------------------------------------------------------
+# Node 1.4 — research (Tavily-backed; flag-gated; runs after plan, before decide)
+# ---------------------------------------------------------------------------
+# Generalizes the known_issues retrieval from a post-decide appendix into a spine
+# that grounds the WHOLE report: the planner emits research_queries aimed at the
+# core_challenge, this runs them, and the findings feed the decider (approaches +
+# feasibility) and the section writers. This is what lets the report speak to the
+# current real world instead of only the client's document.
+async def research_node(*, contract: ReportContract) -> list[dict]:
+    """Run the planner's research_queries through Tavily; return a findings pool.
+
+    Each finding is {query, url, title, content}. Inert (returns []) unless
+    ENABLE_RESEARCH and a Tavily key are set. Never raises — enrichment only.
+    """
+    if not (settings.ENABLE_RESEARCH and settings.TAVILY_API_KEY):
+        return []
+    queries = [q.strip() for q in (contract.research_queries or []) if q and q.strip()]
+    if not queries:
+        return []
+    queries = queries[: settings.RESEARCH_MAX_QUERIES]
+
+    try:
+        logger.info(f"contract_pipeline: research_node running {len(queries)} Tavily queries")
+        result_lists = await asyncio.gather(*[
+            tavily_search(q, max_results=settings.RESEARCH_RESULTS_PER_QUERY) for q in queries
+        ])
+        findings: list[dict] = []
+        seen_urls: set[str] = set()
+        for q, results in zip(queries, result_lists):
+            for r in results:
+                url = r.get("url")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                findings.append({
+                    "query": q,
+                    "url": url,
+                    "title": r.get("title", ""),
+                    "content": (r.get("content") or "")[:600],
+                })
+        logger.info(f"contract_pipeline: research_node gathered {len(findings)} unique findings")
+        return findings
+    except Exception as e:  # noqa: BLE001 — research must never sink the run
+        logger.warning(f"contract_pipeline: research_node error (skipping): {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +465,7 @@ async def _write_one_section(
     section_id: str,
     evidence_by_id: dict[str, str],
     firm_context: str,
+    research_block: str = "(no external research available)",
     judge_note: str = "",
     previous_draft: str = "",
 ) -> tuple[str, str]:
@@ -367,7 +474,9 @@ async def _write_one_section(
     if section is None:
         raise KeyError(f"contract_pipeline: section_id '{section_id}' not in contract")
 
-    chain = ChatPromptTemplate.from_template(SECTION_WRITER_PROMPT) | _writer_llm | StrOutputParser()
+    # Substance-heavy sections get the higher-reasoning writer; bulk sections stay cheap.
+    llm = _writer_llm_high if section_id in _DEEP_REASONING_SECTIONS else _writer_llm
+    chain = ChatPromptTemplate.from_template(SECTION_WRITER_PROMPT) | llm | StrOutputParser()
     body = await invoke_with_timeout(
         chain,
         {
@@ -379,6 +488,7 @@ async def _write_one_section(
             "diagrams_required":   json.dumps(section.diagrams_required),
             "rate_card_required":  str(section.rate_card_required),
             "evidence_block":      _evidence_block_for_section(section.evidence_pointers, evidence_by_id),
+            "research_block":      research_block,
             "global_assumptions":  "\n".join(f"- {a}" for a in contract.global_assumptions) or "(none)",
             "firm_context":        firm_context or "(none)",
             "decision_context":    _decision_context_for_section(contract, section.id),
@@ -397,6 +507,7 @@ async def write_sections_node(
     contract: ReportContract,
     evidence_by_id: dict[str, str],
     firm_context: str,
+    research_block: str = "(no external research available)",
 ) -> dict[str, str]:
     """Run one writer per section in parallel. Returns {section_id: markdown}."""
     logger.info(f"contract_pipeline: write_sections_node fanning out {len(contract.sections)} writers")
@@ -406,6 +517,7 @@ async def write_sections_node(
             section_id=section.id,
             evidence_by_id=evidence_by_id,
             firm_context=firm_context,
+            research_block=research_block,
         )
         for section in contract.sections
     ])
@@ -424,6 +536,7 @@ async def judge_node(
     evidence_by_id: dict[str, str],
     firm_context: str,
     prechecks_context: str = "",
+    research_block: str = "(no external research available)",
 ) -> tuple[dict[str, str], dict[str, str], dict]:
     """Smart-model judge scores sections; revise flagged ones once.
 
@@ -480,6 +593,7 @@ async def judge_node(
             section_id=sid,
             evidence_by_id=evidence_by_id,
             firm_context=firm_context,
+            research_block=research_block,
             judge_note=note,
             previous_draft=sections_md[sid],
         )
@@ -501,13 +615,19 @@ async def run_contract_pipeline(
     document: list[str],
     crd: str,
     firm_context: str,
+    prior_contract: Optional[dict] = None,
+    applied_changes: Optional[list] = None,
     on_stage_started: Optional[callable] = None,
     on_stage_completed: Optional[callable] = None,
 ) -> dict:
-    """Run all three stages and stitch the final report.
+    """Run all stages and stitch the final report.
 
     Stage callbacks are how pipeline_runner.py records progress to pipeline_runs.
     They are optional so this function is independently testable.
+
+    `prior_contract` + `applied_changes` are present only on a regeneration: the
+    planner/decider evolve the prior contract by applying the requested changes
+    instead of redesigning from scratch (the "feed new answers → converge" loop).
 
     Returns:
         {
@@ -519,8 +639,9 @@ async def run_contract_pipeline(
     # Evidence index is built once and shared by the planner, the decider, and
     # the per-section writers (deterministic lookup, no Chroma round-trip).
     evidence_by_id, document_chunks_block, evidence_index_block = await _build_evidence_index(document)
+    prior_context = _format_prior_context(prior_contract, applied_changes)
 
-    # Stage 1 — plan (structure)
+    # Stage 1 — plan (structure + the core challenge + research queries)
     if on_stage_started:
         await on_stage_started("plan")
     contract = await plan_node(
@@ -528,32 +649,39 @@ async def run_contract_pipeline(
         firm_context=firm_context,
         document_chunks_block=document_chunks_block,
         evidence_index_block=evidence_index_block,
+        prior_context=prior_context,
     )
     if on_stage_completed:
         await on_stage_completed("plan")
 
-    # Stage 2 — decide (tech stack, cost, timeline, team, feasibility verdict).
-    # The Tavily known-issues research is a sub-step of this stage: it depends on
-    # the decider's tech_decisions + integration_points and is inert when the
-    # ENABLE_KNOWN_ISSUES flag / key are absent, so it adds no UI stage.
+    # Stage 2 — research + decide. Research runs first (over the planner's
+    # crux-targeted research_queries) so the decider can ground its approaches and
+    # feasibility in the current real world. Both the crux research and the
+    # post-decide known-issues research are inert without ENABLE_* + a Tavily key,
+    # so the report renders normally when they are absent. They fold into one UI stage.
     if on_stage_started:
         await on_stage_started("decide")
+    research_findings = await research_node(contract=contract)
+    research_block = _format_research_block(research_findings)
     contract = await decide_node(
         contract=contract,
         firm_context=firm_context,
         document_chunks_block=document_chunks_block,
+        research_block=research_block,
+        prior_context=prior_context,
     )
     contract = await known_issues_node(contract=contract)
     if on_stage_completed:
         await on_stage_completed("decide")
 
-    # Stage 3 — write sections
+    # Stage 3 — write sections (writers may cite the research findings as real links)
     if on_stage_started:
         await on_stage_started("write_sections")
     sections_md = await write_sections_node(
         contract=contract,
         evidence_by_id=evidence_by_id,
         firm_context=firm_context,
+        research_block=research_block,
     )
     if on_stage_completed:
         await on_stage_completed("write_sections")
@@ -584,8 +712,16 @@ async def run_contract_pipeline(
         evidence_by_id=evidence_by_id,
         firm_context=firm_context,
         prechecks_context=prechecks_context,
+        research_block=research_block,
     )
-    report_markdown = render_report(contract, final_sections_md, judge_notes=judge_notes)
+    # Judge notes are a debugging aid, not client content. Only embed them (as
+    # HTML comments) when DEBUG_MODE is on; otherwise they would leak into the
+    # client-facing PDF. The PDF generator also strips HTML comments as a backstop.
+    report_markdown = render_report(
+        contract,
+        final_sections_md,
+        judge_notes=judge_notes if settings.DEBUG_MODE else None,
+    )
     if on_stage_completed:
         await on_stage_completed("judge_and_finalize")
 

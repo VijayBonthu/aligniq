@@ -8,6 +8,7 @@ import ThemeToggle from './components/layout/ThemeToggle';
 import LandingPage from './pages/LandingPage';
 import SignupPage from './pages/SignupPage';
 import LoginPage from './pages/LoginPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 import Dashboard from './pages/Dashboard';
 import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
@@ -63,7 +64,7 @@ function GlobalUpgradeModal() {
 // the corner. Landing carries its own toggle in the nav, hence it's excluded.
 function PublicThemeToggle() {
   const { pathname } = useLocation();
-  const onPublic = pathname === '/login' || pathname === '/signup' || pathname === '/pricing';
+  const onPublic = pathname === '/login' || pathname === '/signup' || pathname === '/reset-password' || pathname === '/pricing';
   return onPublic ? <ThemeToggle floating /> : null;
 }
 
@@ -125,6 +126,7 @@ function App() {
             <Route path="/" element={<LandingPage />} />
             <Route path="/login" element={<LoginPage />} />
             <Route path="/signup" element={<SignupPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
             <Route path="/pricing" element={<PricingPage />} />
             <Route
               path="/projects"

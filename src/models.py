@@ -68,12 +68,19 @@ class User(Base):
     # Extended profile fields (migration 010)
     username                 = Column(String(50), nullable=True, unique=True)
     role                     = Column(String(50), nullable=True)
+    # Company / organization captured at signup (migration 0004)
+    company                  = Column(String(120), nullable=True)
     # Subscription fields (migration 009)
     stripe_customer_id      = Column(String, nullable=True, unique=True, index=True)
     subscription_tier       = Column(String(50), nullable=False, server_default=text("'free'"))
     subscription_status     = Column(String(50), nullable=False, server_default=text("'active'"))
     stripe_subscription_id  = Column(String, nullable=True)
     subscription_period_end = Column(TIMESTAMP(timezone=True), nullable=True)
+    # Backend comp/gift grants (no Stripe). An admin can grant any tier for N days;
+    # get_effective_tier() in utils/subscription.py honors comp_tier while
+    # comp_expires_at is in the future, then lazily reverts to subscription_tier.
+    comp_tier               = Column(String(50), nullable=True)
+    comp_expires_at         = Column(TIMESTAMP(timezone=True), nullable=True)
     # Firm membership (migration 019, Bet 3)
     firm_id                 = Column(String, ForeignKey("firms.firm_id"), nullable=True, index=True)
     firm_role               = Column(String(32), nullable=True)  # 'firm_admin' | 'member'
@@ -119,6 +126,15 @@ class UsageTracking(Base):
     report_regenerations_used = Column(Integer, nullable=False, default=0)
     created_at                = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at                = Column(TIMESTAMP(timezone=True), nullable=True)
+
+class ProcessedStripeEvent(Base):
+    __tablename__ = "processed_stripe_events"
+    # Stripe webhook idempotency. We record every event.id we have handled so a
+    # redelivered/duplicated event is ignored. Handlers also set absolute state
+    # (not increments), so reprocessing would be harmless even without this.
+    event_id    = Column(String, primary_key=True, index=True)
+    event_type  = Column(String(100), nullable=True)
+    received_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
 class UserDocuments(Base):
     __tablename__ = "user_documents"

@@ -396,7 +396,7 @@ def report_delivery_items(markdown: str, summary_report, scope: str = "risks",
             if ids and s.id not in ids:
                 continue
             items.append({"summary": s.heading_text, "description": s.raw_markdown})
-        return ("Delivery work breakdown generated from the AlignIQ analysis report.", items)
+        return ("Delivery work breakdown generated from the GroundedIQ analysis report.", items)
 
     risks = summary.get("key_risks") or summary.get("risks") or []
     if isinstance(risks, list):
@@ -407,7 +407,7 @@ def report_delivery_items(markdown: str, summary_report, scope: str = "risks",
                 items.append({"summary": str(title), "description": str(desc)})
             elif r:
                 items.append({"summary": str(r), "description": ""})
-    return ("Risk register exported from the AlignIQ analysis report.", items)
+    return ("Risk register exported from the GroundedIQ analysis report.", items)
 
 
 def list_sections(markdown: str) -> List[dict]:

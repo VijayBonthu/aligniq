@@ -48,7 +48,6 @@ checking_json.json
 client_secret_g.json
 output/
 CLAUDE.md
-project.md
 
 .claude
 
@@ -68,8 +67,8 @@ terraform/**/*.auto.tfvars
 terraform/**/tf.plan
 terraform/**/crash.log
 
+
 client_secret_g(1).json
-project.md
 .pytest_cache
 frontend_orange\.env.production
 frontend_orange/.env.production
@@ -82,3 +81,6 @@ HANDOFF.md
 frontend_green\.env.production
 frontend_green/.env.production
 frontend_orange
+PRODUCTION_RUNBOOK.md
+project.md
+tests

@@ -23,6 +23,8 @@ AUTH_PATHS = {
     "/api/v1/auth/refresh",
     "/api/v1/auth/callback",
     "/api/v1/auth/jira/callback",
+    "/api/v1/auth/forgot-password",
+    "/api/v1/auth/reset-password",
 }
 
 # Expensive: anything that triggers the LLM pipeline, document upload, or report
@@ -104,8 +106,10 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             csrf_cookie = request.cookies.get(self.csrf_token_cookie_name)
             csrf_header = request.headers.get(self.csrf_token_header_name)
             
-            # Skip validation for authentication endpoints (login, registration)
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/refresh"]:
+            # Skip validation for authentication endpoints (login, registration).
+            # Forgot/reset are unauthenticated POSTs from users who may not hold a
+            # CSRF cookie yet; the reset token in the URL is the unforgeable secret.
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password"]:
                 return await call_next(request)
             
             # Validate CSRF token

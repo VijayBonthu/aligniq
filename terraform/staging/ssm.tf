@@ -1,7 +1,7 @@
 # SSM Parameter Store — every secret the app reads at boot. Terraform creates
 # them with placeholder values; you fill them via the console or:
 #
-#   aws ssm put-parameter --name "/aligniq/staging/OPENAI_CHATGPT" \
+#   aws ssm put-parameter --name "/groundediq/staging/OPENAI_CHATGPT" \
 #     --value "sk-..." --type SecureString --overwrite
 #
 # `lifecycle.ignore_changes = [value]` means Terraform won't clobber what you
@@ -72,7 +72,7 @@ locals {
 resource "aws_ssm_parameter" "staging" {
   for_each = toset(local.staging_param_keys)
 
-  name  = "/aligniq/staging/${each.value}"
+  name  = "/groundediq/staging/${each.value}"
   type  = "SecureString"
   value = "REPLACE_ME"
 

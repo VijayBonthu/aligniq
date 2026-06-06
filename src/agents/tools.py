@@ -225,11 +225,24 @@ def repair_mermaid_blocks(markdown: str) -> str:
 
 # Money ($1,200 / $1.2) or a percentage (30% / 12.5 %).
 _NUMERIC_CLAIM_RE = re.compile(r"\$\s?[\d,]+(?:\.\d+)?|\b\d+(?:\.\d+)?\s?%")
-_MD_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
+# A *valid* citation link: a real http(s) URL or a real internal anchor. This
+# deliberately rejects placeholder links the writers fall back to when they have
+# nothing to cite — `[x](#)`, `[x](undefined)`, `[Confirmed Q&A (quoted)](#)` —
+# which is exactly the opaque-citation failure mode we are stamping out.
+_MD_LINK_RE = re.compile(r"\[[^\]]+\]\((?:https?://[^)\s]+|#[\w-]+)\)")
 
 # Phrases that count as a valid in-prose basis even without a markdown link:
-# an explicit assumption, or a reference to the firm rate card the cost lines cite.
-_BASIS_CUES = ("assumption", "rate card", "rate-card")
+# an explicit assumption, a reference to the firm rate card the cost lines cite,
+# or a plain-prose reference to the client's own document (the citation model is:
+# client-doc facts are stated in prose, external/industry facts get a real link).
+_BASIS_CUES = (
+    "assumption",
+    "rate card", "rate-card",
+    # Explicit plain-prose references to the client's own document. Deliberately
+    # specific — generic words like "q&a" or "client" are NOT cues, because an
+    # opaque label like "(Confirmed Q&A (quoted))" must still be rejected.
+    "per the rfp", "the rfp", "per the brief", "the brief", "per the document", "the document",
+)
 
 
 @dataclass(frozen=True)
