@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
 import { isAxiosError } from 'axios';
-import api from '../services/api';
+import api, { getAccessToken } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import useStreamingChat from '../hooks/useStreamingChat';
 import useMediaQuery from '../hooks/useMediaQuery';
@@ -285,7 +285,7 @@ export default function ChatView() {
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
-    const token = localStorage.getItem('access_token') || localStorage.getItem('regular_token') || '';
+    const token = getAccessToken() || '';
 
     const payload = [...messages, userMsg].map((m) => ({
       role: m.role,

@@ -26,23 +26,23 @@ const GitHubIcon = () => (
 
 interface SSORowProps {
   onGoogle: () => void;
+  onMicrosoft: () => void;
+  onGithub: () => void;
 }
 
-export const SSORow: React.FC<SSORowProps> = ({ onGoogle }) => (
+export const SSORow: React.FC<SSORowProps> = ({ onGoogle, onMicrosoft, onGithub }) => (
   <div className="sso-grid">
     <button type="button" className="sso-btn" onClick={onGoogle}>
       <GoogleIcon />
       <span>Google</span>
     </button>
-    <button type="button" className="sso-btn" disabled>
+    <button type="button" className="sso-btn" onClick={onMicrosoft}>
       <MicrosoftIcon />
       <span>Microsoft</span>
-      <span className="sso-btn-soon">SOON</span>
     </button>
-    <button type="button" className="sso-btn" disabled>
+    <button type="button" className="sso-btn" onClick={onGithub}>
       <GitHubIcon />
       <span>GitHub</span>
-      <span className="sso-btn-soon">SOON</span>
     </button>
   </div>
 );

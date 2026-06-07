@@ -1,15 +1,11 @@
 import { useState, useCallback, useRef } from 'react';
-import api from '../services/api';
+import api, { setAccessToken } from '../services/api';
 
 async function attemptTokenRefresh(): Promise<string | null> {
-  const refreshToken = localStorage.getItem('refresh_token');
-  if (!refreshToken) return null;
+  // The refresh token is an httpOnly cookie sent automatically — no body needed.
   try {
-    const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
-    localStorage.setItem('regular_token', data.access_token);
-    api.defaults.headers.common['Authorization'] = `Bearer ${data.access_token}`;
+    const { data } = await api.post('/auth/refresh');
+    setAccessToken(data.access_token);
     return data.access_token;
   } catch {
     return null;
@@ -17,9 +13,8 @@ async function attemptTokenRefresh(): Promise<string | null> {
 }
 
 function clearAllAuthTokens() {
-  ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
-   'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
-  delete (api.defaults.headers.common as Record<string, string>)['Authorization'];
+  setAccessToken(null);
+  ['user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
 }
 
 function getCsrfToken(): string {

@@ -70,18 +70,52 @@ def password_reset_email_html(name: str, reset_url: str) -> str:
         Click below to choose a new one. This link expires in 15 minutes and can
         be used once.
       </p>
-      <a href="{safe_url}"
+      <a href="{safe_url}" target="_blank" rel="noopener noreferrer"
          style="display:inline-block;background:#34a37b;color:#ffffff;text-decoration:none;
                 font-weight:600;font-size:15px;padding:12px 22px;border-radius:10px;">
         Reset password →
       </a>
       <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:28px 0 0;">
         If the button doesn't work, paste this link into your browser:<br/>
-        <a href="{safe_url}" style="color:#5fc69a;word-break:break-all;">{safe_url}</a>
+        <a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="color:#5fc69a;word-break:break-all;">{safe_url}</a>
       </p>
       <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
         Didn't request this? You can safely ignore this email — your password
         won't change.
+      </p>
+    </div>
+  </body>
+</html>"""
+
+
+def email_verification_email_html(name: str, verify_url: str) -> str:
+    """On-brand HTML for the signup email-verification message."""
+    safe_name = _html.escape(name or "there")
+    safe_url = _html.escape(verify_url, quote=True)
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
+    <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
+      <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
+        Grounded<span style="color:#34a37b;">IQ</span>
+      </div>
+      <h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;">Confirm your email</h1>
+      <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 24px;">
+        Hi {safe_name}, welcome to GroundedIQ. Confirm this is your email to
+        secure your account. This link expires in 24 hours.
+      </p>
+      <a href="{safe_url}" target="_blank" rel="noopener noreferrer"
+         style="display:inline-block;background:#34a37b;color:#ffffff;text-decoration:none;
+                font-weight:600;font-size:15px;padding:12px 22px;border-radius:10px;">
+        Confirm email →
+      </a>
+      <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:28px 0 0;">
+        If the button doesn't work, paste this link into your browser:<br/>
+        <a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="color:#5fc69a;word-break:break-all;">{safe_url}</a>
+      </p>
+      <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
+        Didn't create a GroundedIQ account? You can safely ignore this email.
       </p>
     </div>
   </body>

@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 import os
 import json
-from utils.token_generation import token_validator
+from utils.token_generation import token_validator, require_verified_email
 from utils.subscription import check_chat_limit, check_message_limit, check_regen_limit, increment_message_count, increment_regen_count, get_usage_summary
 from utils.chat_history import save_chat_history, delete_chat_history, get_user_chat_history_details,get_single_user_chat_history, save_chat_with_doc, save_report_version
 from getdata import ExtractText
@@ -251,7 +251,7 @@ async def process_document_task(file_path: str, user_id: str, document_id: str, 
 @router.post("/upload")
 async def upload_file(
     background_tasks: BackgroundTasks,
-    current_token: dict = Depends(token_validator),
+    current_token: dict = Depends(require_verified_email),
     file: list[UploadFile] = File(...),
     analysis_mode: str = Form(default="presales"),  # "presales" (fast) or "full" (comprehensive)
     db: Session = Depends(get_db)
@@ -747,7 +747,7 @@ async def generate_presales_report(
     user_answers: Optional[str] = Form(default=None),       # JSON string of answers to kickstart questions
     assumptions: Optional[str] = Form(default=None),        # JSON string of assumptions from readiness analysis
     additional_context: Optional[str] = Form(default=None), # Free-form additional context from user
-    current_token: dict = Depends(token_validator),
+    current_token: dict = Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """
@@ -978,7 +978,7 @@ async def update_presales_report(
 async def start_full_pipeline(
     background_tasks: BackgroundTasks,
     chat_history_id: str = Form(...),
-    current_token: dict = Depends(token_validator),
+    current_token: dict = Depends(require_verified_email),
     db: Session = Depends(get_db),
 ):
     """
@@ -1431,7 +1431,7 @@ async def submit_risk_feedback(
 async def presales_chat(
     presales_id: str,
     message: str = Form(...),
-    current_token: dict = Depends(token_validator),
+    current_token: dict = Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """
@@ -2208,7 +2208,7 @@ async def task_status_page(task_id: str, token: str = None):
 
 
 @router.post('/chat')
-async def add_chat_history(request: ChatHistoryDetails, current_user: dict = Depends(token_validator), db:Session=Depends(get_db)):
+async def add_chat_history(request: ChatHistoryDetails, current_user: dict = Depends(require_verified_email), db:Session=Depends(get_db)):
     try:
         chat = request.model_dump()
         user_id = chat['user_id']
@@ -2312,7 +2312,7 @@ async def get_user_chat_history_by_id(chat_history_id:str,current_user = Depends
 
 
 @router.get('/projects/overview')
-async def get_projects_overview(current_user = Depends(token_validator), db: Session = Depends(get_db)):
+async def get_projects_overview(current_user = Depends(require_verified_email), db: Session = Depends(get_db)):
     """
     Aggregated data for the Projects Overview page.
 
@@ -2861,7 +2861,7 @@ async def compose_multi_intent_response(
 @router.post('/chat-with-doc-v3')
 async def conversation_with_doc_v2(
     request: ChatHistoryDetails,
-    current_user = Depends(token_validator),
+    current_user = Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """
@@ -5107,7 +5107,7 @@ async def add_pending_change_endpoint(
 async def regenerate_report_endpoint(
     chat_history_id: str,
     background_tasks: BackgroundTasks,
-    current_user=Depends(token_validator),
+    current_user=Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """
@@ -5839,7 +5839,7 @@ async def delete_deliverable_polish(
 @router.post('/chat-with-doc')
 async def conversation_with_doc_v3(
     request: ChatHistoryDetails,
-    current_user=Depends(token_validator),
+    current_user=Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """
@@ -6122,7 +6122,7 @@ from utils.streaming import StreamEventType
 @router.post('/chat-with-doc-stream')
 async def conversation_with_doc_stream(
     request: ChatHistoryDetails,
-    current_user=Depends(token_validator),
+    current_user=Depends(require_verified_email),
     db: Session = Depends(get_db)
 ):
     """

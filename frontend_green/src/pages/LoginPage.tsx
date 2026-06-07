@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../services/api';
-import { useGoogleAuth } from '../hooks/useGoogleAuth';
+import { useOAuthPopup } from '../hooks/useOAuthPopup';
 import { AuthAside } from '../components/auth/AuthAside';
 import { SSORow } from '../components/auth/SSORow';
 
@@ -18,7 +18,9 @@ const LoginPage: React.FC = () => {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const startGoogleAuth = useGoogleAuth(setError);
+  const startGoogleAuth = useOAuthPopup('google', setError);
+  const startGithubAuth = useOAuthPopup('github', setError);
+  const startMicrosoftAuth = useOAuthPopup('microsoft', setError);
 
   useEffect(() => {
     if (authReady && isAuthenticated) navigate('/projects', { replace: true });
@@ -31,7 +33,7 @@ const LoginPage: React.FC = () => {
     setError('');
     try {
       const res = await api.post('/login', { email_address: email.trim(), password });
-      const success = await login(res.data.access_token, res.data.refresh_token);
+      const success = await login(res.data.access_token);
       if (success) navigate('/projects');
       else setError('Login failed.');
     } catch (err: unknown) {
@@ -102,7 +104,7 @@ const LoginPage: React.FC = () => {
 
               {!showForgot && (
                 <>
-                  <SSORow onGoogle={startGoogleAuth} />
+                  <SSORow onGoogle={startGoogleAuth} onGithub={startGithubAuth} onMicrosoft={startMicrosoftAuth} />
                   <div className="divider">or with credentials</div>
                 </>
               )}

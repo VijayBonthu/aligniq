@@ -1,7 +1,7 @@
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, timezone
 from config import settings
-from fastapi import status, HTTPException,Security, Request
+from fastapi import status, HTTPException, Security, Request, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from typing import Dict
@@ -130,6 +130,20 @@ async def token_validator(request: Request,token: HTTPAuthorizationCredentials =
     regular_token = await validate_app_user(token = token.credentials)
     return {"regular_login_token": regular_token}
 
+async def require_verified_email(current: dict = Depends(token_validator)) -> dict:
+    """Like token_validator, but rejects users whose email isn't verified. SSO logins are
+    provider-verified (verified_email=True) so this only blocks unverified Local accounts.
+    Applied to compute-spending + projects endpoints so an unverified account (incl. one
+    on a fake domain that never received the link) can't use the app. Returns the same
+    shape as token_validator, so handlers can swap the dependency unchanged."""
+    tok = current.get("regular_login_token") or {}
+    if tok.get("verified_email") is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "Please verify your email to continue.", "code": "EMAIL_NOT_VERIFIED"},
+        )
+    return current
+
 def hash_passwords(password:str):
     return pwd_context.hash(password)
 
@@ -173,6 +187,34 @@ def verify_password_reset_token(token: str, password_hash: str) -> str:
             detail="This reset link has already been used.",
         )
     return payload["sub"]
+
+def create_email_verification_token(user_id: str) -> str:
+    """Signed, 24h email-verification token. Not hash-bound (unlike password reset) —
+    re-verifying an already-verified account is a harmless no-op, so expiry + purpose
+    are enough."""
+    payload = {
+        "sub": user_id,
+        "purpose": "email_verify",
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY_J, algorithm=settings.ALGORITHM)
+
+
+def verify_email_verification_token(token: str) -> str:
+    """Return the user_id for a valid email-verification token, else raise HTTP 400."""
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="This verification link is invalid or has expired.",
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY_J, algorithms=[settings.ALGORITHM])
+    except JWTError:
+        raise invalid
+    if payload.get("purpose") != "email_verify" or not payload.get("sub"):
+        raise invalid
+    return payload["sub"]
+
 
 def validate_jira_token(token: str):
     """Validate Jira-specific JWT token"""

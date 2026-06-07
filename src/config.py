@@ -16,8 +16,11 @@ class Settings:
     ALGORITHM=os.getenv("ALGORITHM")
     SECRET_KEY_J=os.getenv("SECRET_KEY_J")
     TOKEN_EXPIRED_TIME_IN_DAYS=os.getenv("TOKEN_EXPIRED_TIME_IN_DAYS")
-    ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1"))
-    REFRESH_TOKEN_EXPIRE_DAYS=int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "2"))
+    # Access token is short-lived and kept in browser memory (Authorization header);
+    # the refresh token (httpOnly cookie) silently re-mints it. 30 min balances
+    # security vs. refresh chattiness. Refresh token is long so sessions persist.
+    ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    REFRESH_TOKEN_EXPIRE_DAYS=int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
     FILE_SIZE = os.getenv("FILE_SIZE")
     OPENAI_CHATGPT = os.getenv("OPENAI_CHATGPT")
     IMAGE_TEXT_LANGUAGE=['en']
@@ -29,6 +32,21 @@ class Settings:
     JIRA_TOKEN_ENC_KEY=os.getenv("JIRA_TOKEN_ENC_KEY")
     GOOGLE_JWKS = os.getenv("GOOGLE_JWKS_URL")
     JIRA_JWKS = os.getenv("JIRA_JWKS_URL")
+
+    # GitHub OAuth ("Sign in with GitHub"). Create an OAuth App at
+    # github.com/settings/developers; the registered callback must equal GITHUB_REDIRECT_URI.
+    GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+    GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+    GITHUB_REDIRECT_URI = os.getenv("GITHUB_REDIRECT_URI")
+
+    # Microsoft OAuth ("Sign in with Microsoft" via the Microsoft identity platform /
+    # Entra ID). Register an app at entra.microsoft.com → App registrations. TENANT:
+    # "common" = personal + any work/school account (broadest); "organizations" =
+    # work/school only; a tenant GUID = a single company (enterprise SSO entry point).
+    MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID")
+    MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
+    MICROSOFT_REDIRECT_URI = os.getenv("MICROSOFT_REDIRECT_URI")
+    MICROSOFT_TENANT = os.getenv("MICROSOFT_TENANT", "common")
     S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -78,6 +96,36 @@ class Settings:
     STRIPE_API_VERSION     = os.getenv("STRIPE_API_VERSION", "2024-06-20")
     ADMIN_SECRET_KEY       = os.getenv("ADMIN_SECRET_KEY")
     FRONTEND_URL           = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    # The API's own public origin (no trailing path). Used to build email links that hit
+    # the backend directly — e.g. the email-verification link is a server-rendered GET so
+    # it works even in JS-blocked/sandboxed email previews & link scanners. Set to the api
+    # subdomain in prod (e.g. https://api.grounded-iq.com).
+    BACKEND_URL            = os.getenv("BACKEND_URL", "http://localhost:8080")
+
+    # Session cookie flags for the httpOnly refresh-token cookie (and the CSRF cookie,
+    # which the middleware reads directly). COOKIE_DOMAIN scopes the cookie across
+    # sub-domains (e.g. ".grounded-iq.com" so app.* sends it to api.*); leave unset in
+    # local dev. SameSite=lax blocks the cross-site POST that CSRF needs while still
+    # riding cross-subdomain XHR, so it doubles as CSRF protection for /auth/refresh —
+    # valid only while the SPA and API share a registrable domain. COOKIE_SECURE must
+    # be true wherever the site is HTTPS (staging/prod); false on http://localhost.
+    COOKIE_SECURE          = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+    COOKIE_SAMESITE        = os.getenv("COOKIE_SAMESITE", "lax")
+    COOKIE_DOMAIN          = os.getenv("COOKIE_DOMAIN") or None
+
+    # Anti-abuse at signup. Cloudflare Turnstile (free bot challenge) — if
+    # TURNSTILE_SECRET_KEY is unset, verification is SKIPPED so local dev works without
+    # keys (mirrors RESEND fallback). Frontend uses VITE_TURNSTILE_SITE_KEY.
+    TURNSTILE_SECRET_KEY        = os.getenv("TURNSTILE_SECRET_KEY", "")
+    # Device/IP velocity soft-flag thresholds (signups per identity per 24h). Exceeding
+    # these only FLAGS the signup_events row for review — it never blocks (the signal is
+    # spoofable). Disposable email + failed captcha are the hard blocks.
+    SIGNUP_MAX_PER_DEVICE_PER_DAY = int(os.getenv("SIGNUP_MAX_PER_DEVICE_PER_DAY", "3"))
+    SIGNUP_MAX_PER_IP_PER_DAY     = int(os.getenv("SIGNUP_MAX_PER_IP_PER_DAY", "5"))
+    # Verification-email resend throttle (per user, Redis-backed, fail-open): a cooldown
+    # between sends + an hourly cap, so a user can't spam "resend" and run up email cost.
+    VERIFY_RESEND_COOLDOWN_SECONDS = int(os.getenv("VERIFY_RESEND_COOLDOWN_SECONDS", "60"))
+    VERIFY_RESEND_HOURLY_CAP       = int(os.getenv("VERIFY_RESEND_HOURLY_CAP", "5"))
 
     # Transactional email (password reset, etc.) via Resend — a single HTTPS POST,
     # wrapped in utils/email.py so the provider is swappable. If RESEND_API_KEY is

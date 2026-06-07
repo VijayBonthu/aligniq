@@ -6,7 +6,7 @@ import * as marked from 'marked';
 import DOMPurify from 'dompurify';
 import { useAuth } from '../context/AuthContext';
 import { useStreamingChat } from '../hooks/useStreamingChat';
-import api from '../services/api';
+import api, { getAccessToken } from '../services/api';
 import * as conversationService from '../services/conversationService';
 import * as presalesService from '../services/presalesService';
 import type {
@@ -556,7 +556,7 @@ const Dashboard: React.FC = () => {
 
     const userMsg: Message = { role: 'user', content: message.trim(), timestamp: new Date().toISOString(), selected: true };
     const userId = localStorage.getItem('user_id') || '';
-    const token = localStorage.getItem('access_token') || localStorage.getItem('regular_token') || '';
+    const token = getAccessToken() || '';
 
     setActiveConversation(prev => prev ? { ...prev, messages: [...prev.messages, userMsg] } : prev);
     setMessage('');

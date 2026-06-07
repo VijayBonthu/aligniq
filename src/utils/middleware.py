@@ -23,8 +23,14 @@ AUTH_PATHS = {
     "/api/v1/auth/refresh",
     "/api/v1/auth/callback",
     "/api/v1/auth/jira/callback",
+    "/api/v1/auth/github/login",
+    "/api/v1/auth/github/callback",
+    "/api/v1/auth/microsoft/login",
+    "/api/v1/auth/microsoft/callback",
     "/api/v1/auth/forgot-password",
     "/api/v1/auth/reset-password",
+    "/api/v1/auth/verify-email",
+    "/api/v1/auth/resend-verification",
 }
 
 # Expensive: anything that triggers the LLM pipeline, document upload, or report
@@ -109,7 +115,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # Skip validation for authentication endpoints (login, registration).
             # Forgot/reset are unauthenticated POSTs from users who may not hold a
             # CSRF cookie yet; the reset token in the URL is the unforgeable secret.
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password"]:
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email"]:
                 return await call_next(request)
             
             # Validate CSRF token

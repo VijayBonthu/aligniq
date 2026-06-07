@@ -1,5 +1,5 @@
-import React, { createContext, useState, useContext, useEffect, useCallback, ReactNode } from 'react';
-import api from '../services/api';
+import React, { createContext, useState, useContext, useEffect, useCallback, useRef, ReactNode } from 'react';
+import api, { setAccessToken, refreshAccessToken } from '../services/api';
 import { getSubscription, SubscriptionData } from '../services/billingService';
 import type { LimitHitDetail } from '../components/billing/UpgradeModal';
 
@@ -20,13 +20,15 @@ interface UserData {
 
 interface AuthContextType {
   isAuthenticated: boolean;
-  // False until the on-mount session check (decode + silent refresh) has resolved.
-  // Public pages gate their "already signed in → /projects" redirect on this so a
-  // dead session doesn't bounce /login → /projects → 401 → /login.
+  // False until the on-mount session check (silent cookie refresh) has resolved.
+  // Public pages gate their "already signed in → /projects" redirect on this, and
+  // ProtectedRoute waits on it, so a hard reload doesn't bounce a live session to
+  // /login before the refresh completes.
   authReady: boolean;
   user: UserData | null;
   subscription: SubscriptionData | null;
-  login: (accessToken: string, refreshToken?: string) => Promise<boolean>;
+  // Only the access token — the refresh token is an httpOnly cookie set by the backend.
+  login: (accessToken: string) => Promise<boolean>;
   logout: () => void;
   refreshSubscription: () => Promise<void>;
   limitHit: LimitHitDetail | null;
@@ -52,13 +54,9 @@ const AuthContext = createContext<AuthContextType>(defaultValue);
 export const useAuth = () => useContext(AuthContext);
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    const token =
-      localStorage.getItem('access_token') ||
-      localStorage.getItem('regular_token') ||
-      localStorage.getItem('google_auth_token');
-    return !!token;
-  });
+  // No synchronous token any more (it's in memory + httpOnly cookie), so we start
+  // unauthenticated and resolve the real state in the on-mount effect below.
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [user, setUser] = useState<UserData | null>(null);
   const [subscription, setSubscription] = useState<SubscriptionData | null>(null);
   const [limitHit, setLimitHit] = useState<LimitHitDetail | null>(null);
@@ -101,28 +99,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  const login = async (accessToken: string, refreshToken?: string): Promise<boolean> => {
+  const login = async (accessToken: string): Promise<boolean> => {
     try {
-      localStorage.removeItem('regular_token');
-      localStorage.removeItem('google_auth_token');
-      localStorage.removeItem('access_token');
-
-      localStorage.setItem('access_token', accessToken);
-      localStorage.setItem('regular_token', accessToken);
-
-      if (refreshToken) {
-        localStorage.setItem('refresh_token', refreshToken);
-      }
-
-      api.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
-
+      setAccessToken(accessToken);
       const userData = await decodeAndStoreUserData(accessToken);
       const success = !!userData;
-
       if (success) {
         getSubscription().then(setSubscription).catch(() => {});
       }
-
       return success;
     } catch {
       setIsAuthenticated(false);
@@ -130,44 +114,25 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
+  const initRan = useRef(false);
   useEffect(() => {
+    // Guard against React StrictMode's double-invoke (dev): two inits would fire two
+    // concurrent refreshes. The shared single-flight refreshAccessToken() dedupes them,
+    // and this ref makes init itself run exactly once.
+    if (initRan.current) return;
+    initRan.current = true;
     const init = async () => {
-      const token =
-        localStorage.getItem('access_token') ||
-        localStorage.getItem('regular_token') ||
-        localStorage.getItem('google_auth_token');
-
-      if (!token) {
-        setAuthReady(true);
-        return;
-      }
-
       try {
+        // The access token lives in memory and is gone after a reload, so mint a fresh
+        // one from the httpOnly refresh cookie. Success → signed in; failure (no/expired
+        // cookie) → signed out, no redirect loop.
+        const token = await refreshAccessToken();
         const userData = await decodeAndStoreUserData(token);
-        const expMs = userData?.exp ? userData.exp * 1000 : 0;
-        if (userData && expMs > Date.now()) {
-          // Access token still valid — good to go.
-          getSubscription().then(setSubscription).catch(() => {});
-        } else {
-          // Access token is missing/expired (they're short-lived). Try ONE silent
-          // refresh so a returning user with a live refresh token stays signed in,
-          // and a truly dead session resolves to logged-out instead of a 401 loop.
-          const refreshToken = localStorage.getItem('refresh_token');
-          if (!refreshToken) throw new Error('no refresh token');
-          const { data } = await api.post('/auth/refresh', { refresh_token: refreshToken });
-          localStorage.setItem('access_token', data.access_token);
-          localStorage.setItem('refresh_token', data.refresh_token);
-          localStorage.setItem('regular_token', data.access_token);
-          api.defaults.headers.common['Authorization'] = `Bearer ${data.access_token}`;
-          const refreshed = await decodeAndStoreUserData(data.access_token);
-          if (!refreshed) throw new Error('decode after refresh failed');
-          getSubscription().then(setSubscription).catch(() => {});
-        }
+        if (!userData) throw new Error('decode after refresh failed');
+        getSubscription().then(setSubscription).catch(() => {});
       } catch {
-        // Dead session — clear everything so public pages don't redirect into a loop.
-        ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
-         'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
-        delete api.defaults.headers.common['Authorization'];
+        setAccessToken(null);
+        ['user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
         setUser(null);
         setIsAuthenticated(false);
       } finally {
@@ -178,19 +143,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   }, []);
 
   const logout = () => {
-    const refreshToken = localStorage.getItem('refresh_token');
-
-    ['access_token', 'refresh_token', 'regular_token', 'google_auth_token',
-     'user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
-
-    delete api.defaults.headers.common['Authorization'];
+    setAccessToken(null);
+    ['user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
     setIsAuthenticated(false);
     setUser(null);
     setSubscription(null);
-
-    if (refreshToken) {
-      api.post('/auth/logout', { refresh_token: refreshToken }).catch(() => {});
-    }
+    // Server-side: revoke the refresh token + clear the httpOnly cookie (cookie sent
+    // automatically). Fire-and-forget.
+    api.post('/auth/logout').catch(() => {});
   };
 
   return (

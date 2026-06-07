@@ -8,24 +8,33 @@ const API_BASE =
   (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/api\/v1\/?$/, '') ||
   'http://localhost:8080';
 
+export type OAuthProvider = 'google' | 'github' | 'microsoft';
+
+// Google keeps its original /auth/login endpoint; the newer providers are namespaced.
+const LOGIN_PATH: Record<OAuthProvider, string> = {
+  google: '/api/v1/auth/login',
+  github: '/api/v1/auth/github/login',
+  microsoft: '/api/v1/auth/microsoft/login',
+};
+
 /**
- * Shared Google-OAuth popup flow for Login + Signup.
+ * Shared "Sign in with X" popup flow for Google / GitHub / Microsoft.
  *
- * Hardened over the old inline copies (which both pages duplicated verbatim):
- *  - rejects messages whose `event.origin` isn't the API origin (don't trust any
- *    page that can postMessage into the opener);
- *  - surfaces an error when the pop-up is blocked (`window.open` returns null);
- *  - surfaces an error when the user closes the pop-up before it completes,
- *    instead of hanging silently (the old code just cleared its listener).
+ *  - opens the backend login endpoint in a popup (the backend redirects to the
+ *    provider and serves the callback page that postMessages the result back);
+ *  - only trusts messages whose `event.origin` is the API origin;
+ *  - the backend posts ONLY the access token (the refresh token is set as an
+ *    httpOnly cookie on the callback response), which we hand to AuthContext.login;
+ *  - surfaces pop-up-blocked, provider-reported errors, and closed-early cancels
+ *    instead of hanging silently.
  *
- * NOTE: the backend posts the result with `targetOrigin = FRONTEND_URL`. If that
- * env var doesn't match the origin actually serving the SPA, the browser drops
- * the message and the user only ever sees the "cancelled" path here — so keep
- * FRONTEND_URL in sync with the frontend origin (e.g. http://localhost:3002 in dev).
+ * NOTE: the backend posts with `targetOrigin = FRONTEND_URL`. Keep that env var in
+ * sync with the origin actually serving the SPA, or the browser drops the message
+ * and the user only ever sees the "cancelled" path here.
  *
  * Pass a stable `onError` (e.g. a useState setter) to receive failure messages.
  */
-export function useGoogleAuth(onError?: (msg: string) => void) {
+export function useOAuthPopup(provider: OAuthProvider, onError?: (msg: string) => void) {
   const { login } = useAuth();
   const navigate = useNavigate();
   const cleanupRef = useRef<(() => void) | null>(null);
@@ -35,8 +44,8 @@ export function useGoogleAuth(onError?: (msg: string) => void) {
 
   return useCallback(() => {
     const popup = window.open(
-      `${API_BASE}/api/v1/auth/login`,
-      'google-auth',
+      `${API_BASE}${LOGIN_PATH[provider]}`,
+      `${provider}-auth`,
       'width=500,height=600,left=200,top=100',
     );
     if (!popup) {
@@ -56,11 +65,19 @@ export function useGoogleAuth(onError?: (msg: string) => void) {
 
     const handler = async (event: MessageEvent) => {
       if (event.origin !== API_BASE) return; // only trust the API origin
-      if (event.data?.type !== 'google_auth_success') return;
+      const data = event.data || {};
+      if (data.type === `${provider}_auth_error`) {
+        settled = true;
+        cleanup();
+        popup.close();
+        onError?.(data.message || 'Sign-in failed. Please try again.');
+        return;
+      }
+      if (data.type !== `${provider}_auth_success`) return;
       settled = true;
       cleanup();
       popup.close();
-      const ok = await login(event.data.access_token, event.data.refresh_token);
+      const ok = await login(data.access_token);
       if (ok) navigate('/projects');
       else onError?.('Authentication failed. Please try again.');
     };
@@ -74,5 +91,5 @@ export function useGoogleAuth(onError?: (msg: string) => void) {
 
     cleanupRef.current = cleanup;
     window.addEventListener('message', handler);
-  }, [login, navigate, onError]);
+  }, [provider, login, navigate, onError]);
 }

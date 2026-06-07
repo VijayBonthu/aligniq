@@ -9,6 +9,8 @@ import LandingPage from './pages/LandingPage';
 import SignupPage from './pages/SignupPage';
 import LoginPage from './pages/LoginPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
+import VerifyEmailPage from './pages/VerifyEmailPage';
+import VerifyEmailRequiredPage from './pages/VerifyEmailRequiredPage';
 import Dashboard from './pages/Dashboard';
 import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
@@ -21,6 +23,7 @@ import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
 import AppShell from './components/layout/AppShell';
+import ErrorBoundary from './components/ErrorBoundary';
 import UpgradeModal from './components/billing/UpgradeModal';
 import FirmAdminRoute from './components/auth/FirmAdminRoute';
 import FirmSettings from './pages/firm/FirmSettings';
@@ -64,7 +67,7 @@ function GlobalUpgradeModal() {
 // the corner. Landing carries its own toggle in the nav, hence it's excluded.
 function PublicThemeToggle() {
   const { pathname } = useLocation();
-  const onPublic = pathname === '/login' || pathname === '/signup' || pathname === '/reset-password' || pathname === '/pricing';
+  const onPublic = pathname === '/login' || pathname === '/signup' || pathname === '/reset-password' || pathname === '/verify-email' || pathname === '/verify-email-required' || pathname === '/pricing';
   return onPublic ? <ThemeToggle floating /> : null;
 }
 
@@ -93,12 +96,20 @@ function UpgradeReturnRefresher() {
 const queryClient = new QueryClient();
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuth();
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
+  const { isAuthenticated, authReady, user } = useAuth();
+  // Wait for the on-mount silent refresh (httpOnly cookie → access token) to resolve;
+  // otherwise a hard reload of a protected page would redirect a live session to /login.
+  if (!authReady) return null;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  // Unverified (Local) users can't use the app until they confirm their email. SSO logins
+  // are provider-verified (verified_email=true), so only unverified Local accounts hit this.
+  if (user && user.verified_email === false) return <Navigate to="/verify-email-required" replace />;
+  return <>{children}</>;
 }
 
 function App() {
   return (
+    <ErrorBoundary>
     <BrowserRouter>
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
@@ -127,6 +138,8 @@ function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/signup" element={<SignupPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage />} />
+            <Route path="/verify-email" element={<VerifyEmailPage />} />
+            <Route path="/verify-email-required" element={<VerifyEmailRequiredPage />} />
             <Route path="/pricing" element={<PricingPage />} />
             <Route
               path="/projects"
@@ -320,6 +333,7 @@ function App() {
         </ThemeProvider>
       </QueryClientProvider>
     </BrowserRouter>
+    </ErrorBoundary>
   );
 }
 

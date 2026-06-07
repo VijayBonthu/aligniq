@@ -4,12 +4,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from p_model_type import Registration_login
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from utils.token_generation import hash_passwords
 from utils.report_sections import parse_sections
+from utils.email_validation import is_disposable_email
+from config import settings
 from fastapi import HTTPException, status
 from utils.logger import logger
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import copy
 import json
 import uuid
@@ -78,7 +80,167 @@ async def create_user(user_data:dict,provider:str, db:Session):
         return user_details
     return user_details
 
-def get_user_details(email_address:str, db:Session): 
+async def get_or_create_oauth_user(user_data: dict, provider: str, db: Session, *, ip=None, user_agent=None, device_id=None):
+    """Login path for social providers (Google/GitHub/Microsoft): one human = one
+    account, keyed by VERIFIED email. If a user already exists for this email — under
+    ANY provider, including a Local password account — we sign them into THAT account
+    (link by verified email) instead of spawning a duplicate row with its own firm/
+    projects. Only when no account exists for the email do we create one (reusing
+    create_user, so firm auto-assignment etc. stay identical).
+
+    Safe because every caller passes a provider-verified email (the OAuth classes reject
+    accounts without one). create_user still owns the Local /registration path unchanged."""
+    if not user_data or not user_data.get("email"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Required details not provided")
+    email = user_data["email"].strip().lower()
+    try:
+        # Case-insensitive match: Local signup stores the email as typed (e.g.
+        # "Ada@Acme.com"), so an exact == on the lowercased OAuth email would miss it
+        # and spawn a duplicate account instead of linking. Email is the identity.
+        existing = db.query(models.User).filter(func.lower(models.User.email_address) == email).first()
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"unable to connect to DB {e}")
+    if existing:
+        # Pre-hijack guard, then record this provider as a linked identity.
+        _neutralize_unverified_local(existing, db)
+        record_identity(existing.user_id, provider, user_data.get("id"), email, db)
+        return existing
+    # Creating a NEW account → block disposable/throwaway emails. Matters most for GitHub,
+    # where a user can attach an arbitrary verified email (Google/Microsoft are their own
+    # domains). Existing-account links above are never blocked.
+    if is_disposable_email(email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please sign up with a permanent (non-disposable) email address.",
+        )
+    # create_user's (email, provider) duplicate guard can't fire here — no row has this email.
+    new_user = await create_user(user_data=user_data, provider=provider, db=db)
+    record_identity(new_user.user_id, provider, user_data.get("id"), email, db)
+    record_signup_event(new_user, email, ip, device_id, user_agent, provider, db)
+    return new_user
+
+
+def record_signup_event(user, email, ip, device_id, user_agent, provider, db):
+    """Audit-log an account creation and soft-flag it when device/IP signup velocity over
+    the last 24h exceeds the configured thresholds. Flag-only — NEVER blocks (the device/IP
+    signal is spoofable). Best-effort: failures are logged, not raised, so abuse tracking
+    can't break signup."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        flagged = False
+        if device_id:
+            dev_count = db.query(models.SignupEvent).filter(
+                models.SignupEvent.device_id == device_id,
+                models.SignupEvent.created_at >= since,
+            ).count()
+            if dev_count >= settings.SIGNUP_MAX_PER_DEVICE_PER_DAY:
+                flagged = True
+        if ip:
+            ip_count = db.query(models.SignupEvent).filter(
+                models.SignupEvent.ip == ip,
+                models.SignupEvent.created_at >= since,
+            ).count()
+            if ip_count >= settings.SIGNUP_MAX_PER_IP_PER_DAY:
+                flagged = True
+        event = models.SignupEvent(
+            user_id=getattr(user, "user_id", None),
+            email=email,
+            ip=ip,
+            device_id=device_id,
+            user_agent=((user_agent or "")[:500] or None),
+            provider=provider,
+            flagged=flagged,
+        )
+        db.add(event)
+        db.commit()
+        if flagged:
+            logger.warning(
+                f"Flagged signup (velocity): user={getattr(user, 'user_id', None)} "
+                f"ip={ip} device={device_id} provider={provider}"
+            )
+        return event
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"record_signup_event failed: {e}")
+        return None
+
+
+def _neutralize_unverified_local(user, db) -> None:
+    """Account pre-hijacking guard. A verified OAuth login matched an EXISTING account;
+    if that account was never verified, the OAuth owner (who proved control of the
+    mailbox) is the rightful owner. Mark it verified and revoke any unverified local
+    password, so a password an attacker pre-registered on the victim's email can't
+    survive the real owner signing in. Verified accounts are left untouched — a
+    legitimate user who confirmed their email keeps their password when they link OAuth."""
+    if user.verified_email:
+        return
+    try:
+        login_row = db.query(models.LoginDetails).filter(
+            models.LoginDetails.user_id == user.user_id
+        ).first()
+        if login_row:
+            db.delete(login_row)
+            logger.warning(
+                f"Revoked unverified local password for user {user.user_id} on verified OAuth takeover"
+            )
+        user.verified_email = True
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"_neutralize_unverified_local failed for {user.user_id}: {e}")
+
+
+def record_identity(user_id: str, provider: str, provider_user_id, email, db) -> Optional[object]:
+    """Upsert the (user, provider) login identity — one row per provider per user. Best
+    effort: identity tracking must never block a login, so failures are logged, not raised."""
+    try:
+        existing = db.query(models.UserIdentity).filter(
+            models.UserIdentity.user_id == user_id,
+            models.UserIdentity.provider == provider,
+        ).first()
+        if existing:
+            changed = False
+            if provider_user_id and existing.provider_user_id != str(provider_user_id):
+                existing.provider_user_id = str(provider_user_id); changed = True
+            if email and existing.email != email:
+                existing.email = email; changed = True
+            if changed:
+                db.commit()
+            return existing
+        ident = models.UserIdentity(
+            user_id=user_id,
+            provider=provider,
+            provider_user_id=str(provider_user_id) if provider_user_id else None,
+            email=(email or None),
+        )
+        db.add(ident)
+        db.commit()
+        return ident
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"record_identity failed for {user_id}/{provider}: {e}")
+        return None
+
+
+def get_linked_identities(user_id: str, db) -> list:
+    """Linked login methods for a user (for a Connected-accounts surface)."""
+    try:
+        rows = db.query(models.UserIdentity).filter(
+            models.UserIdentity.user_id == user_id
+        ).order_by(models.UserIdentity.created_at).all()
+    except SQLAlchemyError as e:
+        logger.error(f"get_linked_identities failed for {user_id}: {e}")
+        return []
+    return [
+        {
+            "provider": r.provider,
+            "email": r.email,
+            "linked_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+def get_user_details(email_address:str, db:Session):
     try:
         query = db.query(models.User.email_address,
                         models.User.user_id,
@@ -91,8 +253,13 @@ def get_user_details(email_address:str, db:Session):
                         ).join(
                             models.LoginDetails,
                             models.User.user_id == models.LoginDetails.user_id) 
+        # Match Local accounts case-insensitively, REGARDLESS of verification status.
+        # (The old `verified_email == "False"` clause excluded verified users, so once the
+        # email-verification gate flipped verified_email=true, login could no longer find
+        # them. Verification is enforced by require_verified_email/ProtectedRoute, not here.)
         record = query.filter(and_(
-            models.User.provider=="Local", models.User.verified_email == "False", models.User.email_address == email_address
+            models.User.provider == "Local",
+            func.lower(models.User.email_address) == (email_address or "").strip().lower(),
         )).first()
     except SQLAlchemyError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Something wrong with our service, please try again later")

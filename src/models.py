@@ -101,6 +101,36 @@ class RefreshToken(Base):
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
+class UserIdentity(Base):
+    """One row per external login method linked to a user — Google / GitHub / Microsoft /
+    Local. Lets the backend know which methods unlock an account, distinguish the login
+    method per session, and power a future Connected-accounts / unlink UI. Enforced
+    one-per-(user, provider) in code (record_identity). `provider_user_id` is the OAuth
+    `sub`/id (or the user_id for Local)."""
+    __tablename__ = "user_identities"
+    id = Column(Integer, primary_key=True, nullable=False, index=True)
+    user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
+    provider = Column(String(32), nullable=False, index=True)
+    provider_user_id = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+class SignupEvent(Base):
+    """One row per account creation — the anti-abuse audit trail. Captures the signup
+    IP (cf-connecting-ip), the FingerprintJS device id (null for OAuth popups), UA and
+    provider. `flagged` is set when device/IP velocity over 24h exceeds the soft-flag
+    thresholds (review signal only — never blocks)."""
+    __tablename__ = "signup_events"
+    id = Column(Integer, primary_key=True, nullable=False, index=True)
+    user_id = Column(String, ForeignKey(User.user_id), nullable=True, index=True)
+    email = Column(String, nullable=True, index=True)
+    ip = Column(String, nullable=True, index=True)
+    device_id = Column(String, nullable=True, index=True)
+    user_agent = Column(String, nullable=True)
+    provider = Column(String(32), nullable=True)
+    flagged = Column(Boolean, nullable=False, default=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
 class JiraCredential(Base):
     """Server-side Jira OAuth tokens — one row per app user. The Atlassian access token
     is short-lived (~1h) and refreshed in place via the refresh token; no Jira token ever

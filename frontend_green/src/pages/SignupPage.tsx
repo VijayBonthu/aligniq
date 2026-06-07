@@ -2,10 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../services/api';
-import { useGoogleAuth } from '../hooks/useGoogleAuth';
+import { useOAuthPopup } from '../hooks/useOAuthPopup';
 import { passwordStrength } from '../utils/passwordStrength';
 import { AuthAside } from '../components/auth/AuthAside';
 import { SSORow } from '../components/auth/SSORow';
+import { TurnstileWidget } from '../components/auth/TurnstileWidget';
+import { getDeviceId } from '../utils/deviceId';
+
+const TURNSTILE_ENABLED = !!import.meta.env.VITE_TURNSTILE_SITE_KEY;
 
 const ROLES: { label: string; desc: string }[] = [
   { label: 'Product Manager',    desc: 'I scope and track projects.' },
@@ -27,8 +31,15 @@ const SignupPage: React.FC = () => {
   const [role, setRole] = useState<string>('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [deviceId, setDeviceId] = useState('');
 
-  const startGoogleAuth = useGoogleAuth(setError);
+  const startGoogleAuth = useOAuthPopup('google', setError);
+  const startGithubAuth = useOAuthPopup('github', setError);
+  const startMicrosoftAuth = useOAuthPopup('microsoft', setError);
+
+  // Resolve the (probabilistic) device id once so it's ready by the time they submit.
+  useEffect(() => { getDeviceId().then(setDeviceId).catch(() => {}); }, []);
 
   useEffect(() => {
     if (authReady && isAuthenticated && step !== 3) navigate('/projects', { replace: true });
@@ -46,6 +57,7 @@ const SignupPage: React.FC = () => {
     if (username.length < 3) return setError('Username must be at least 3 characters.');
     if (password.length < 8) return setError('Password must be at least 8 characters.');
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return setError('Please enter a valid email.');
+    if (TURNSTILE_ENABLED && !turnstileToken) return setError('Please complete the verification below.');
     setStep(2);
   };
 
@@ -64,8 +76,10 @@ const SignupPage: React.FC = () => {
         username: username.trim(),
         role: selectedRole,
         company: company.trim() || undefined,
+        turnstile_token: turnstileToken || undefined,
+        device_id: deviceId || undefined,
       });
-      const success = await login(res.data.access_token, res.data.refresh_token);
+      const success = await login(res.data.access_token);
       if (!success) throw new Error('Login after signup failed');
       setTimeout(() => setStep(3), 700);
     } catch (err: unknown) {
@@ -97,7 +111,7 @@ const SignupPage: React.FC = () => {
               <h1 className="auth-title">Create your account.</h1>
               <p className="auth-sub">Start scoping your next project in under a minute.</p>
 
-              <SSORow onGoogle={startGoogleAuth} />
+              <SSORow onGoogle={startGoogleAuth} onGithub={startGithubAuth} onMicrosoft={startMicrosoftAuth} />
               <div className="divider">or with email</div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
@@ -135,6 +149,8 @@ const SignupPage: React.FC = () => {
                 </div>
               </div>
 
+              <TurnstileWidget onVerify={setTurnstileToken} onExpire={() => setTurnstileToken('')} />
+
               <button type="submit" className="btn btn-primary auth-submit btn-lg">Continue →</button>
 
               <div className="auth-terms">
@@ -166,8 +182,17 @@ const SignupPage: React.FC = () => {
                 ))}
               </div>
 
-              <button type="button" onClick={() => setStep(1)} className="btn btn-ghost" style={{ marginTop: 8 }}>← Back</button>
-              {submitting && <p style={{ fontSize: 13, color: 'var(--fg-dim)', marginTop: 18 }}>Creating your account…</p>}
+              <button type="button" onClick={() => setStep(1)} disabled={submitting} className="btn btn-ghost" style={{ marginTop: 8 }}>← Back</button>
+              {submitting && (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, marginTop: 18, color: 'var(--fg-dim)', fontSize: 14 }}>
+                  <span
+                    className="animate-spin"
+                    aria-hidden
+                    style={{ display: 'inline-block', width: 18, height: 18, border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%' }}
+                  />
+                  Creating your account…
+                </div>
+              )}
             </div>
           )}
 
@@ -180,12 +205,15 @@ const SignupPage: React.FC = () => {
               <p className="auth-sub">
                 Welcome, <strong style={{ color: 'var(--fg)' }}>{fullName}</strong>. Your workspace is ready — let's align your first project.
               </p>
+              <p className="auth-sub" style={{ fontSize: 13, color: 'var(--fg-dim)' }}>
+                We've sent a confirmation link to <strong style={{ color: 'var(--fg)' }}>{email}</strong> — verify it to secure your account.
+              </p>
               <button
                 type="button"
                 className="btn btn-primary auth-submit btn-lg"
-                onClick={() => navigate('/projects')}
+                onClick={() => navigate('/verify-email-required')}
               >
-                Go to projects →
+                Verify your email to continue →
               </button>
             </div>
           )}
