@@ -17,6 +17,34 @@ from config import settings
 from utils.logger import logger
 
 _TAVILY_URL = "https://api.tavily.com/search"
+_TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+
+
+async def tavily_extract(url: str, *, timeout: int = 30) -> str:
+    """Extract clean page content (markdown/text) for a single URL via Tavily.
+
+    Returns '' (never raises) on missing key, blank url, non-200, or transport
+    error — the pricing refresh treats an empty result as "fetch failed" and
+    keeps the existing rates.
+    """
+    api_key = settings.TAVILY_API_KEY
+    if not api_key or not (url and url.strip()):
+        return ""
+    payload = {"api_key": api_key, "urls": [url.strip()], "extract_depth": "advanced"}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(_TAVILY_EXTRACT_URL, json=payload)
+        if resp.status_code != 200:
+            logger.warning(f"tavily_extract non-200 ({resp.status_code}) for {url}")
+            return ""
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001 — caller has a fallback
+        logger.warning(f"tavily_extract failed for {url}: {e}")
+        return ""
+    results = data.get("results") or []
+    if not results:
+        return ""
+    return results[0].get("raw_content") or ""
 
 
 async def tavily_search(query: str, max_results: int = 3, *, timeout: int = 15) -> list[dict]:

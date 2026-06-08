@@ -1,4 +1,5 @@
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Depends, Request
@@ -70,11 +71,54 @@ def _reconcile_stuck_pipeline_runs() -> None:
         db.close()
 
 
+async def _pricing_refresh_loop() -> None:
+    """Daily-ish refresh of model_pricing from the official OpenAI page.
+
+    Each worker checks staleness first (max updated_at of openai-sourced rows) so
+    redundant fetches across workers/restarts are avoided; the update itself is
+    idempotent. Re-ticks every <=6h so the cadence survives long-lived processes.
+    """
+    from utils.pricing_feed import refresh_openai_pricing, pricing_is_stale
+    from utils.llm_pricing import load_pricing_from_db
+    tick = min(settings.PRICING_REFRESH_HOURS, 6) * 3600
+    while True:
+        try:
+            if pricing_is_stale(settings.PRICING_REFRESH_HOURS):
+                await refresh_openai_pricing(apply=True)  # fetch + write + reload this worker
+            else:
+                # Fresh in the DB already — but another worker (or an external cron)
+                # may have written it. Reload this process's in-memory book so every
+                # worker converges to the same rates without a restart.
+                load_pricing_from_db()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"pricing refresh loop error: {e}")
+        await asyncio.sleep(tick)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _reconcile_stuck_pipeline_runs()
+    # Load the model price book from DB (seeding it from SEED_PRICES on first run),
+    # then surface any configured model still missing — otherwise its cost is
+    # silently billed at gpt-4o-mini rates (understated 10-40x).
+    try:
+        from utils.llm_pricing import load_pricing_from_db, assert_pricing_coverage
+        load_pricing_from_db()
+        assert_pricing_coverage()
+    except Exception as e:
+        logger.warning(f"pricing load/coverage check failed: {e}")
+
+    pricing_task = None
+    if settings.PRICING_AUTO_REFRESH and settings.TAVILY_API_KEY:
+        pricing_task = asyncio.create_task(_pricing_refresh_loop())
+        logger.info(f"pricing auto-refresh ON (every {settings.PRICING_REFRESH_HOURS}h from OpenAI page)")
+
     async with rate_limit_lifespan(app):
         yield
+        if pricing_task:
+            pricing_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)

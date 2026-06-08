@@ -4,11 +4,24 @@ export interface TierLimits {
   max_chats: number | null;
   messages_per_chat: number | null;
   monthly_report_regen: number | null;
+  report_generations_per_month?: number | null;
+  presales_per_month?: number | null;
+  model_tier?: 'lite' | 'frontier';
+  white_label?: boolean;
+  credit_overage?: boolean;
 }
 
 export interface SubscriptionUsage {
   chats: number;
   report_regenerations_used: number;
+  report_generations_used?: number;
+  presales_used?: number;
+}
+
+export interface SubscriptionCredits {
+  balance: number;
+  costs: Record<string, number>; // action -> credits (e.g. report_frontier: 74)
+  overage_enabled: boolean;
 }
 
 export interface SubscriptionData {
@@ -17,11 +30,20 @@ export interface SubscriptionData {
   period_end: string | null;
   usage: SubscriptionUsage;
   limits: TierLimits;
+  credits?: SubscriptionCredits;
 }
 
 export async function getSubscription(): Promise<SubscriptionData> {
   const res = await api.get<SubscriptionData>('/billing/subscription');
   return res.data;
+}
+
+export type CreditPackSize = '10' | '25' | '50' | '100';
+
+/** Start a one-time credit-pack purchase (prepaid top-up). Redirects to Stripe. */
+export async function buyCreditPack(pack: CreditPackSize): Promise<void> {
+  const res = await api.post<{ checkout_url?: string }>(`/billing/credit-checkout?pack=${pack}`);
+  if (res.data.checkout_url) window.location.href = res.data.checkout_url;
 }
 
 export interface CheckoutResponse {
@@ -35,7 +57,9 @@ export interface CheckoutResponse {
   portal_url?: string;
 }
 
-export async function createCheckoutSession(tier: 'basic' | 'plus'): Promise<CheckoutResponse> {
+export type PaidTier = 'basic' | 'plus' | 'pro';
+
+export async function createCheckoutSession(tier: PaidTier): Promise<CheckoutResponse> {
   const res = await api.post<CheckoutResponse>(`/billing/checkout-session?tier=${tier}`);
   return res.data;
 }
@@ -48,7 +72,7 @@ export async function createCheckoutSession(tier: 'basic' | 'plus'): Promise<Che
  *                          existing subscription with proration. Resolves
  *                          { updated: true } so the caller can refresh the UI.
  */
-export async function startPlanChange(tier: 'basic' | 'plus'): Promise<{ updated: boolean }> {
+export async function startPlanChange(tier: PaidTier): Promise<{ updated: boolean }> {
   const res = await createCheckoutSession(tier);
   if (res.requires_portal && res.portal_url) {
     window.location.href = res.portal_url;

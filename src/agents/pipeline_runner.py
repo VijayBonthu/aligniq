@@ -192,6 +192,17 @@ async def _persist_final_report(
         logger.error(f"pipeline_runner: update_analysis_link failed for {chat_history_id}: {e}")
 
 
+def _refund_failed_run(user_id: str, run_id: str, db) -> None:
+    """Give back the report unit (credits or allowance) consumed at enqueue for a
+    run that failed — so a user is never charged for a report they didn't get.
+    Best-effort and idempotent; must never mask the original failure."""
+    try:
+        from utils.subscription import refund_report_generation
+        refund_report_generation(user_id, run_id, db)
+    except Exception:  # noqa: BLE001 — a refund hiccup must not break the failure path
+        logger.warning(f"pipeline_runner: report refund failed for run {run_id}", exc_info=True)
+
+
 async def run_full_pipeline_async(
     *,
     run_id: str,
@@ -203,9 +214,14 @@ async def run_full_pipeline_async(
     title: str,
     resume_from_snapshot: Optional[dict] = None,
     applied_changes: Optional[list] = None,
+    model_tier: str = "frontier",
 ) -> None:
     """
     Top-level entry scheduled via BackgroundTasks. Owns its own DB session.
+
+    `model_tier` ('lite' free/basic | 'frontier' plus/pro) gates the report's
+    smart-model spend on the contract path — set by the caller from the user's
+    effective subscription tier (utils.subscription.get_model_tier).
 
     Streams per-node updates from the compiled LangGraph, persists progress to
     pipeline_runs, and on success persists the final report and marks the
@@ -253,6 +269,7 @@ async def run_full_pipeline_async(
             firm_id=firm_id_for_run,
             db=db,
             applied_changes=applied_changes,
+            model_tier=model_tier,
         )
         return
 
@@ -412,9 +429,11 @@ async def run_full_pipeline_async(
     except asyncio.TimeoutError:
         logger.error(f"pipeline_runner: timeout after {timeout}s for run {run_id}")
         await fail_pipeline_run(run_id, f"Pipeline timed out after {timeout}s", db)
+        _refund_failed_run(user_id, run_id, db)
     except Exception as e:
         logger.error(f"pipeline_runner: run {run_id} failed: {e}", exc_info=True)
         await fail_pipeline_run(run_id, str(e), db)
+        _refund_failed_run(user_id, run_id, db)
     finally:
         try:
             _firm_id_ctx.reset(_firm_id_token)
@@ -439,6 +458,7 @@ async def _run_contract_pipeline_path(
     firm_id: Optional[str],
     db,
     applied_changes: Optional[list] = None,
+    model_tier: str = "frontier",
 ) -> None:
     """Sibling of run_full_pipeline_async for USE_CONTRACT_PIPELINE=true.
 
@@ -501,6 +521,7 @@ async def _run_contract_pipeline_path(
                     applied_changes=applied_changes,
                     on_stage_started=_on_started,
                     on_stage_completed=_on_completed,
+                    model_tier=model_tier,
                 ),
                 timeout=timeout,
             )
@@ -527,9 +548,11 @@ async def _run_contract_pipeline_path(
     except asyncio.TimeoutError:
         logger.error(f"pipeline_runner: contract path timeout after {timeout}s for run {run_id}")
         await fail_pipeline_run(run_id, f"Pipeline timed out after {timeout}s", db)
+        _refund_failed_run(user_id, run_id, db)
     except Exception as e:
         logger.error(f"pipeline_runner: contract path run {run_id} failed: {e}", exc_info=True)
         await fail_pipeline_run(run_id, str(e), db)
+        _refund_failed_run(user_id, run_id, db)
     finally:
         try:
             _firm_id_ctx.reset(_firm_id_token)

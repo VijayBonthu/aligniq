@@ -17,9 +17,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import settings
-from models import get_db, User, ProcessedStripeEvent
+from models import get_db, User, ProcessedStripeEvent, CreditLedger
 from utils.token_generation import token_validator
-from utils.subscription import TIER_LIMITS, get_or_create_usage_period, get_usage_summary
+from utils.subscription import TIER_LIMITS, get_or_create_usage_period, get_usage_summary, grant_credits
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 # Pin the API version so request/response shapes are stable across stripe-python
@@ -57,8 +57,33 @@ def _build_price_maps():
     if settings.STRIPE_PLUS_PRICE_ID:
         PRICE_TO_TIER[settings.STRIPE_PLUS_PRICE_ID] = "plus"
         TIER_TO_PRICE["plus"] = settings.STRIPE_PLUS_PRICE_ID
+    # pro is self-serve when its price id is configured; otherwise contact-sales.
+    if settings.STRIPE_PRO_PRICE_ID:
+        PRICE_TO_TIER[settings.STRIPE_PRO_PRICE_ID] = "pro"
+        TIER_TO_PRICE["pro"] = settings.STRIPE_PRO_PRICE_ID
 
 _build_price_maps()
+
+
+# ------------------------------------------------------------------
+# Credit packs — one-time top-ups (Stripe mode=payment). price_id → credit grant.
+# ------------------------------------------------------------------
+CREDIT_PACK_PRICE_TO_CREDITS: dict[str, int] = {}
+CREDIT_PACK_SIZE_TO_PRICE: dict[str, str] = {}
+
+
+def _build_credit_pack_maps():
+    for size, price_id in (
+        ("10",  settings.STRIPE_CREDIT_PACK_10_PRICE_ID),
+        ("25",  settings.STRIPE_CREDIT_PACK_25_PRICE_ID),
+        ("50",  settings.STRIPE_CREDIT_PACK_50_PRICE_ID),
+        ("100", settings.STRIPE_CREDIT_PACK_100_PRICE_ID),
+    ):
+        if price_id:
+            CREDIT_PACK_PRICE_TO_CREDITS[price_id] = int(settings.CREDIT_PACK_GRANTS.get(size, 0))
+            CREDIT_PACK_SIZE_TO_PRICE[size] = price_id
+
+_build_credit_pack_maps()
 
 
 # ------------------------------------------------------------------
@@ -114,7 +139,10 @@ async def create_checkout_session(
       handles the downgrade (scheduled at period end / credited) in the portal.
     """
     if tier not in TIER_TO_PRICE:
-        raise HTTPException(status_code=400, detail="Invalid tier. Must be 'basic' or 'plus'.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tier not purchasable. Configured: {sorted(TIER_TO_PRICE) or 'none'}.",
+        )
 
     user_id = current_user["regular_login_token"]["id"]
     user = db.query(User).filter(User.user_id == user_id).first()
@@ -178,6 +206,45 @@ async def create_checkout_session(
         metadata={"user_id": user_id, "tier": tier},
     )
     return {"updated": False, "checkout_url": session.url}
+
+
+# ------------------------------------------------------------------
+# POST /billing/credit-checkout?pack=10|25|50|100
+# One-time credit-pack purchase (prepaid top-up; mode=payment). Every tier can
+# recharge. Credits are granted on the checkout.session.completed webhook.
+# ------------------------------------------------------------------
+@router.post("/billing/credit-checkout")
+async def create_credit_checkout(
+    pack: str,
+    current_user: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    price_id = CREDIT_PACK_SIZE_TO_PRICE.get(pack)
+    if not price_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid pack. Configured packs: {sorted(CREDIT_PACK_SIZE_TO_PRICE) or 'none'}",
+        )
+    credits = CREDIT_PACK_PRICE_TO_CREDITS.get(price_id, 0)
+
+    user_id = current_user["regular_login_token"]["id"]
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    customer_id = _get_or_create_customer(user, db)
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        mode="payment",
+        success_url=f"{settings.FRONTEND_URL}/pricing?credits=success",
+        cancel_url=f"{settings.FRONTEND_URL}/pricing?credits=cancelled",
+        # `kind` lets the webhook tell a credit-pack checkout from a subscription
+        # one; `credits` is the grant amount, frozen at purchase time.
+        metadata={"user_id": user_id, "kind": "credit_pack", "credits": str(credits), "pack": pack},
+    )
+    return {"checkout_url": session.url, "credits": credits}
 
 
 # ------------------------------------------------------------------
@@ -260,6 +327,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         _handle_payment_failed(data_obj, db)
     elif event_type == "invoice.payment_succeeded":
         _handle_payment_succeeded(data_obj, db)
+    elif event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        # `completed` covers synchronous methods (card → payment_status=paid).
+        # `async_payment_succeeded` covers delayed methods that settle later; the
+        # handler only grants on payment_status=paid and is idempotent on session
+        # id, so a paid `completed` + a later `async_payment_succeeded` won't double-grant.
+        _handle_checkout_completed(data_obj, db)
 
     # Record the event id AFTER handling. Handlers set absolute state, so even if we
     # crash before this commit a redelivery re-applies the same state safely.
@@ -318,6 +391,39 @@ def _handle_subscription_deleted(sub, db: Session):
     user.stripe_subscription_id = None
     user.subscription_period_end = None
     db.commit()
+
+
+def _handle_checkout_completed(session, db: Session):
+    """Grant credits when a credit-pack checkout completes. Subscription
+    checkouts are handled by customer.subscription.* and ignored here.
+
+    Idempotent on the Stripe session id: grant_credits is additive (not
+    absolute), so we guard against a redelivered event double-granting by
+    skipping if a ledger row already cites this session id. (The event-id
+    dedup runs before this, but real money warrants belt-and-braces.)"""
+    metadata = session.get("metadata") or {}
+    if metadata.get("kind") != "credit_pack":
+        return
+    if session.get("payment_status") not in (None, "paid", "no_payment_required"):
+        return
+    user_id = metadata.get("user_id")
+    try:
+        credits = int(metadata.get("credits") or 0)
+    except (TypeError, ValueError):
+        credits = 0
+    if not user_id or credits <= 0:
+        return
+    session_id = session.get("id")
+    already = (
+        db.query(CreditLedger)
+        .filter(CreditLedger.ref_id == session_id, CreditLedger.reason == "pack_purchase")
+        .first()
+    )
+    if already:
+        return
+    new_balance = grant_credits(user_id, credits, "pack_purchase", db, ref_id=session_id)
+    logger.info("credit pack: granted %s credits to user=%s (session=%s, balance=%s)",
+                credits, user_id, session_id, new_balance)
 
 
 def _handle_payment_failed(invoice, db: Session):

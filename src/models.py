@@ -10,6 +10,7 @@ from sqlalchemy import Column, String, DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 import uuid
+from utils.ids import new_id, new_hex, uuid7
 
 Base = declarative_base()
 engine = create_engine(settings.DATABASE_URL)
@@ -36,7 +37,7 @@ class SessionStatus:
 class Session(Base):
     __tablename__ = "sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid7)
     user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     status = Column(String(50), nullable=False, default=SessionStatus.CREATED, index=True)
     
@@ -55,7 +56,7 @@ class Session(Base):
 
 class User(Base):
     __tablename__= "users"
-    user_id = Column(String, primary_key=True, nullable=False, index=True,default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, primary_key=True, nullable=False, index=True,default=new_id)
     oauth_id = Column(String,unique=True, index=True)
     email_address = Column(String, nullable=False, unique=True, index=True)
     full_name = Column(String, nullable=False)
@@ -154,6 +155,12 @@ class UsageTracking(Base):
     period_start              = Column(TIMESTAMP(timezone=True), nullable=False)
     period_end                = Column(TIMESTAMP(timezone=True), nullable=False)
     report_regenerations_used = Column(Integer, nullable=False, default=0)
+    # report_generations_used counts ALL full-report generations this period — the
+    # initial generation AND every regeneration share one pool (closes the hole
+    # where the first, most expensive, generation was uncounted). presales_used
+    # meters the cheap presales brief separately. Both reset with the billing period.
+    report_generations_used   = Column(Integer, nullable=False, server_default=text("0"))
+    presales_used             = Column(Integer, nullable=False, server_default=text("0"))
     created_at                = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at                = Column(TIMESTAMP(timezone=True), nullable=True)
 
@@ -166,9 +173,35 @@ class ProcessedStripeEvent(Base):
     event_type  = Column(String(100), nullable=True)
     received_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
 
+class CreditWallet(Base):
+    """Prepaid credit balance — the universal top-up across all tiers. Credits are
+    spent when a tier's monthly allowance is exhausted (report generations,
+    presales briefs). 1 credit = $0.10 of list value (see config.CREDIT_VALUE_USD);
+    actions cost CREDIT_MULTIPLIER × COGS (see utils.subscription.CREDIT_COSTS).
+    One row per user, created lazily on first grant/debit."""
+    __tablename__ = "credit_wallet"
+    user_id        = Column(String, ForeignKey(User.user_id), primary_key=True, index=True)
+    balance_credits = Column(Integer, nullable=False, server_default=text("0"))
+    updated_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
+
+class CreditLedger(Base):
+    """Append-only audit trail of every credit movement. Like llm_call_log, the
+    scope refs are LOGICAL (no hard FK) so the ledger tolerates out-of-order
+    writes and OUTLIVES the rows it references — a credit history must survive
+    deletion of the project/report it paid for. delta is +grant / -debit."""
+    __tablename__ = "credit_ledger"
+    id          = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    user_id     = Column(String, nullable=False, index=True)
+    delta       = Column(Integer, nullable=False)            # + grant, - debit
+    balance_after = Column(Integer, nullable=True)           # balance immediately after this entry
+    reason      = Column(String(64), nullable=False)         # 'pack_purchase' | 'report' | 'presales' | 'admin_grant' | 'refund'
+    action      = Column(String(64), nullable=True)          # the billable action, when a debit
+    ref_id      = Column(String, nullable=True, index=True)  # chat_history_id / pipeline_run_id / stripe session id
+    created_at  = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
 class UserDocuments(Base):
     __tablename__ = "user_documents"
-    document_id = Column(String, primary_key=True, nullable=False,index=True,default=lambda: str(uuid.uuid4()))
+    document_id = Column(String, primary_key=True, nullable=False,index=True,default=new_id)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
     document_path = Column(String, nullable=False)
     active_tag = Column(Boolean, nullable=False, default=text("True"))
@@ -176,7 +209,7 @@ class UserDocuments(Base):
 
 class ChatHistory(Base):
     __tablename__ = "chat_history"
-    chat_history_id = Column(String, primary_key=True, nullable=False, index=True, default=lambda: str(uuid.uuid4()))
+    chat_history_id = Column(String, primary_key=True, nullable=False, index=True, default=new_id)
     user_id = Column(String,ForeignKey(User.user_id), nullable=False,index=True)
     document_id = Column(String, ForeignKey(UserDocuments.document_id), nullable=False, index=True)
     # active_tag is UX-only: hides archived chats from the list view.
@@ -193,7 +226,7 @@ class ChatHistory(Base):
 
 class SelectedChat(Base):
     __tablename__ = "selected_chat"
-    selected_chat_id = Column(String, primary_key=True, nullable=False, index=True, default=lambda: str(uuid.uuid4()))
+    selected_chat_id = Column(String, primary_key=True, nullable=False, index=True, default=new_id)
     chat_history_id = Column(String, ForeignKey(ChatHistory.chat_history_id), nullable=False, index=True)
     document_id = Column(String, ForeignKey(UserDocuments.document_id), nullable=False, index=True)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
@@ -204,7 +237,7 @@ class SelectedChat(Base):
 
 class ReportVersions(Base):
     __tablename__ = "report_version"
-    report_version_id = Column(String, primary_key=True, nullable=False, index=True, default=lambda:str(uuid.uuid4()))
+    report_version_id = Column(String, primary_key=True, nullable=False, index=True, default=new_id)
     chat_history_id = Column(String, ForeignKey(ChatHistory.chat_history_id), nullable=False, index=True)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
     version_number = Column(Integer, nullable=False, default=1, index=True)
@@ -302,7 +335,7 @@ class PresalesAnalysis(Base):
     __tablename__ = "presales_analysis"
 
     presales_id = Column(String, primary_key=True, nullable=False, index=True,
-                         default=lambda: str(uuid.uuid4()))
+                         default=new_id)
     document_id = Column(String, ForeignKey(UserDocuments.document_id),
                          nullable=False, index=True)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
@@ -321,6 +354,11 @@ class PresalesAnalysis(Base):
     status = Column(String(50), nullable=False, default=PresalesStatus.PROCESSING)
     model_used = Column(String(100), nullable=True)       # e.g., "gpt-4o-mini"
     processing_time_seconds = Column(Integer, nullable=True)
+
+    # Materialized COGS roll-up across this presales project (scan + brief + chat) —
+    # SUM(llm_call_log.cost_usd) / COUNT where llm_call_log.presales_id == this id.
+    total_cost_usd = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    total_calls = Column(Integer, nullable=False, server_default=text("0"), default=0)
 
     # Readiness tracking (populated after answer analysis)
     iteration_count = Column(Integer, default=1)
@@ -352,7 +390,7 @@ class RaisedTechnologyRisk(Base):
     __tablename__ = "raised_technology_risks"
 
     risk_id = Column(String, primary_key=True, nullable=False, index=True,
-                     default=lambda: str(uuid.uuid4()))
+                     default=new_id)
     presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
                          nullable=False, index=True)
     document_id = Column(String, ForeignKey(UserDocuments.document_id),
@@ -388,7 +426,7 @@ class AnalysisLink(Base):
     __tablename__ = "analysis_links"
 
     link_id = Column(String, primary_key=True, nullable=False, index=True,
-                     default=lambda: str(uuid.uuid4()))
+                     default=new_id)
     document_id = Column(String, ForeignKey(UserDocuments.document_id),
                          nullable=False, index=True)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
@@ -446,7 +484,7 @@ class PresalesQuestion(Base):
     __tablename__ = "presales_questions"
 
     question_id = Column(String, primary_key=True, nullable=False, index=True,
-                         default=lambda: str(uuid.uuid4()))
+                         default=new_id)
     presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
                          nullable=False, index=True)
     user_id = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
@@ -502,7 +540,7 @@ class PresalesAnswerHistory(Base):
     __tablename__ = "presales_answer_history"
 
     history_id = Column(String, primary_key=True, nullable=False, index=True,
-                        default=lambda: str(uuid.uuid4()))
+                        default=new_id)
     question_id = Column(String, ForeignKey(PresalesQuestion.question_id),
                          nullable=False, index=True)
     presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
@@ -530,7 +568,7 @@ class PresalesAnalysisHistory(Base):
     __tablename__ = "presales_analysis_history"
 
     analysis_history_id = Column(String, primary_key=True, nullable=False, index=True,
-                                  default=lambda: str(uuid.uuid4()))
+                                  default=new_id)
     presales_id = Column(String, ForeignKey(PresalesAnalysis.presales_id),
                          nullable=False, index=True)
 
@@ -592,7 +630,7 @@ class PipelineRun(Base):
     __tablename__ = "pipeline_runs"
 
     run_id           = Column(String, primary_key=True, nullable=False, index=True,
-                              default=lambda: str(uuid.uuid4()))
+                              default=new_id)
     chat_history_id  = Column(String, ForeignKey(ChatHistory.chat_history_id),
                               nullable=False, unique=True, index=True)
     user_id          = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
@@ -610,6 +648,12 @@ class PipelineRun(Base):
     state_snapshot      = Column(JSON, nullable=True)
     last_completed_node = Column(String(64), nullable=True)
 
+    # Materialized COGS roll-up — SUM(llm_call_log.cost_usd) / COUNT for this run,
+    # frozen on completion so billing reads don't re-aggregate and stay correct even
+    # if pricing changes later. Per-call detail lives in llm_call_log.
+    total_cost_usd      = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    total_calls         = Column(Integer, nullable=False, server_default=text("0"), default=0)
+
 
 class TransactionHistory(Base):
     """
@@ -621,7 +665,7 @@ class TransactionHistory(Base):
     __tablename__ = "transaction_history"
 
     id = Column(String, primary_key=True, nullable=False, index=True,
-                default=lambda: str(uuid.uuid4()))
+                default=new_id)
     chat_history_id = Column(String, ForeignKey(ChatHistory.chat_history_id),
                              nullable=False, index=True)
 
@@ -660,12 +704,14 @@ class LLMCallLog(Base):
     __tablename__ = "llm_call_log"
 
     id                  = Column(Integer, primary_key=True, autoincrement=True, index=True)
-    chat_history_id     = Column(String, ForeignKey(ChatHistory.chat_history_id),
-                                 nullable=True, index=True)
-    pipeline_run_id     = Column(String, ForeignKey("pipeline_runs.run_id"),
-                                 nullable=True, index=True)
-    presales_id         = Column(String, ForeignKey(PresalesAnalysis.presales_id),
-                                 nullable=True, index=True)
+    # Scope ids are LOGICAL references, NOT hard FKs. A cost/telemetry ledger must
+    # tolerate out-of-order writes (a call recorded before its parent row is saved —
+    # e.g. the initial presales scan) and must OUTLIVE the business rows it references
+    # (we still need the cost record for billing after a project/presales is deleted).
+    # A hard FK here silently dropped every initial-scan call on insert. Keep indexed.
+    chat_history_id     = Column(String, nullable=True, index=True)
+    pipeline_run_id     = Column(String, nullable=True, index=True)
+    presales_id         = Column(String, nullable=True, index=True)
     user_id             = Column(String, nullable=True, index=True)
 
     agent_name          = Column(String(64), nullable=False, index=True)
@@ -683,6 +729,28 @@ class LLMCallLog(Base):
                                  server_default=text("now()"))
 
 
+class ModelPricing(Base):
+    """Per-1M-token price book — the source of truth for COGS once seeded.
+
+    Mirrors utils.llm_pricing.SEED_PRICES into the DB so rates can be updated
+    without a deploy and refreshed by the daily LiteLLM-diff job. `model` is the
+    canonical family key (e.g. 'gpt-4o'); concrete dated snapshots are normalized
+    to it at lookup time. The in-code SEED_PRICES remains the bootstrap + the
+    last-resort fallback, so pricing never hard-depends on the DB being populated.
+    """
+    __tablename__ = "model_pricing"
+
+    model               = Column(String(64), primary_key=True, nullable=False, index=True)
+    provider            = Column(String(32), nullable=True)
+    input_per_1m        = Column(Float, nullable=False, default=0.0)
+    cached_input_per_1m = Column(Float, nullable=False, default=0.0)
+    output_per_1m       = Column(Float, nullable=False, default=0.0)
+    source              = Column(String(255), nullable=True)   # 'seed' | 'manual' | 'litellm:<date>'
+    effective_date      = Column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at          = Column(TIMESTAMP(timezone=True), nullable=False,
+                                 server_default=text("now()"), onupdate=text("now()"))
+
+
 # ============================================================================
 # FIRM CONTEXT MODELS (Bet 3 - migration 019)
 # ============================================================================
@@ -692,7 +760,7 @@ class Firm(Base):
     __tablename__ = "firms"
 
     firm_id        = Column(String, primary_key=True, nullable=False, index=True,
-                            default=lambda: "firm_" + uuid.uuid4().hex)
+                            default=lambda: new_hex("firm_"))
     name           = Column(String(255), nullable=False)
     logo_url       = Column(Text, nullable=True)
     primary_color  = Column(String(7), nullable=True)  # '#RRGGBB' for Bet 4 branded exports
@@ -705,7 +773,7 @@ class FirmRateCard(Base):
     __tablename__ = "firm_rate_cards"
 
     rate_id          = Column(String, primary_key=True, nullable=False, index=True,
-                              default=lambda: str(uuid.uuid4()))
+                              default=new_id)
     firm_id          = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
                               nullable=False, index=True)
     role             = Column(String(64), nullable=False)
@@ -721,7 +789,7 @@ class FirmTeamTemplate(Base):
     __tablename__ = "firm_team_templates"
 
     template_id     = Column(String, primary_key=True, nullable=False, index=True,
-                             default=lambda: str(uuid.uuid4()))
+                             default=new_id)
     firm_id         = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
                              nullable=False, index=True)
     template_name   = Column(String(128), nullable=False)
@@ -736,7 +804,7 @@ class FirmTechPreference(Base):
     __tablename__ = "firm_tech_preferences"
 
     pref_id        = Column(String, primary_key=True, nullable=False, index=True,
-                            default=lambda: str(uuid.uuid4()))
+                            default=new_id)
     firm_id        = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
                             nullable=False, index=True)
     category       = Column(String(64), nullable=False)
@@ -750,7 +818,7 @@ class FirmPastProject(Base):
     __tablename__ = "firm_past_projects"
 
     project_id              = Column(String, primary_key=True, nullable=False, index=True,
-                                     default=lambda: str(uuid.uuid4()))
+                                     default=new_id)
     firm_id                 = Column(String, ForeignKey(Firm.firm_id, ondelete="CASCADE"),
                                      nullable=False, index=True)
     project_name            = Column(String(255), nullable=False)

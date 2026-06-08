@@ -89,11 +89,38 @@ class Settings:
     STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET")
     STRIPE_BASIC_PRICE_ID  = os.getenv("STRIPE_BASIC_PRICE_ID")
     STRIPE_PLUS_PRICE_ID   = os.getenv("STRIPE_PLUS_PRICE_ID")
+    # pro is the enterprise CONTACT-SALES tier (SSO, unlimited fair-use) — leave
+    # this UNSET so pro stays contact-only (checkout-session rejects it and the UI
+    # shows "Contact sales"). Set it only if you ever want pro self-serve. The
+    # $70 self-serve tier is now `plus` (STRIPE_PLUS_PRICE_ID must point to $70/mo).
+    STRIPE_PRO_PRICE_ID    = os.getenv("STRIPE_PRO_PRICE_ID")
     # Pin the Stripe API version so request/response shapes are stable. Kept at a
     # version where `current_period_end` still lives on the Subscription object
     # (it moved onto subscription *items* in 2025-03-31+). Webhook payloads use the
     # account/endpoint version, so handlers still read the field defensively.
     STRIPE_API_VERSION     = os.getenv("STRIPE_API_VERSION", "2024-06-20")
+
+    # Credit packs — one-time top-ups (Stripe mode=payment). Each pack grants
+    # credits to the user's wallet on checkout.session.completed. Prices live in
+    # the Stripe dashboard; the price-id → credit-grant map is built in billing.py
+    # from these ids + CREDIT_PACK_GRANTS (falsy/unset ids are skipped).
+    STRIPE_CREDIT_PACK_10_PRICE_ID  = os.getenv("STRIPE_CREDIT_PACK_10_PRICE_ID")
+    STRIPE_CREDIT_PACK_25_PRICE_ID  = os.getenv("STRIPE_CREDIT_PACK_25_PRICE_ID")
+    STRIPE_CREDIT_PACK_50_PRICE_ID  = os.getenv("STRIPE_CREDIT_PACK_50_PRICE_ID")
+    STRIPE_CREDIT_PACK_100_PRICE_ID = os.getenv("STRIPE_CREDIT_PACK_100_PRICE_ID")
+    # Credits granted per pack ($-size key). Bonus on bigger packs amortizes the
+    # $0.30 Stripe fixed fee and lifts average top-up. At 1 credit = $0.10 list
+    # value: $10→100 (par), $25→275 (+10%), $50→575 (+15%), $100→1250 (+25%).
+    CREDIT_PACK_GRANTS = {"10": 100, "25": 275, "50": 575, "100": 1250}
+
+    # Credit economics. 1 credit = $0.10 of list value; à-la-carte actions cost
+    # CREDIT_MULTIPLIER × our measured COGS (see utils/subscription.CREDIT_COSTS).
+    # Prepaid → no bill shock, ~75% gross margin. The multiplier is a fair 4×
+    # (not a punitive 10×): upgrade pressure comes from model-gating + features,
+    # not credit price, so credits can be priced fairly without leaking upgrades.
+    CREDIT_VALUE_USD  = float(os.getenv("CREDIT_VALUE_USD", "0.10"))
+    CREDIT_MULTIPLIER = float(os.getenv("CREDIT_MULTIPLIER", "4"))
+
     ADMIN_SECRET_KEY       = os.getenv("ADMIN_SECRET_KEY")
     FRONTEND_URL           = os.getenv("FRONTEND_URL", "http://localhost:5173")
     # The API's own public origin (no trailing path). Used to build email links that hit
@@ -171,6 +198,19 @@ class Settings:
     TAVILY_API_KEY             = os.getenv("TAVILY_API_KEY", "")
     KNOWN_ISSUES_MAX_QUERIES   = int(os.getenv("KNOWN_ISSUES_MAX_QUERIES", "6"))
     KNOWN_ISSUES_RESULTS_PER_QUERY = int(os.getenv("KNOWN_ISSUES_RESULTS_PER_QUERY", "3"))
+
+    # Model-pricing auto-refresh — a daily job Tavily-extracts the official OpenAI
+    # pricing page, validates, and updates the model_pricing table. The cost path
+    # always reads the TABLE (deterministic, never the web). On fetch/parse failure
+    # the existing table/seed rates stay in force and an alert is sent. Reuses
+    # TAVILY_API_KEY; inert without it. Off by default — flip on once verified.
+    PRICING_PAGE_URL           = os.getenv("PRICING_PAGE_URL", "https://developers.openai.com/api/docs/pricing")
+    PRICING_AUTO_REFRESH       = os.getenv("PRICING_AUTO_REFRESH", "false").lower() == "true"
+    PRICING_REFRESH_HOURS      = int(os.getenv("PRICING_REFRESH_HOURS", "24"))
+    # A known model's rate changing by more than this fraction is NOT auto-applied
+    # (likely a parse error) — it is flagged + alerted for human review instead.
+    PRICING_CHANGE_FLAG_PCT    = float(os.getenv("PRICING_CHANGE_FLAG_PCT", "0.5"))
+    PRICING_ALERT_EMAIL        = os.getenv("PRICING_ALERT_EMAIL", "")
 
     # Cut 2 — retrieval-as-spine. The planner emits crux-targeted research_queries;
     # the research stage runs them (before decide) so approaches/feasibility are

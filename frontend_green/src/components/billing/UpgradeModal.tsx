@@ -2,13 +2,22 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { startPlanChange } from '../../services/billingService';
 
-export type LimitType = 'max_chats' | 'messages_per_chat' | 'monthly_report_regen';
+export type LimitType =
+  | 'max_chats'
+  | 'messages_per_chat'
+  | 'monthly_report_regen'
+  | 'report_generations_per_month'
+  | 'presales_per_month';
 
 export interface LimitHitDetail {
   limit_type: LimitType;
   current: number;
   limit: number;
   upgrade_url?: string;
+  // Set by the report/presales metering when credit top-up is available.
+  credit_overage?: boolean;
+  credit_cost?: number;
+  credit_balance?: number;
 }
 
 interface Props {
@@ -18,15 +27,19 @@ interface Props {
 }
 
 const LIMIT_HEADLINES: Record<LimitType, string> = {
-  max_chats: 'You have reached your active chat limit.',
+  max_chats: 'You have reached your active project limit.',
   messages_per_chat: 'You have reached the message limit for this chat.',
-  monthly_report_regen: 'You have used all your monthly report regenerations.',
+  monthly_report_regen: 'You have used all your monthly reports.',
+  report_generations_per_month: 'You have used all your monthly reports.',
+  presales_per_month: 'You have used all your monthly presales briefs.',
 };
 
 const LIMIT_SUB: Record<LimitType, string> = {
   max_chats: 'Upgrade to start more parallel projects.',
   messages_per_chat: 'Upgrade to keep the conversation going.',
-  monthly_report_regen: 'Upgrade for more report regenerations every month.',
+  monthly_report_regen: 'Recharge credits or upgrade for more reports.',
+  report_generations_per_month: 'Recharge credits or upgrade for more reports.',
+  presales_per_month: 'Recharge credits or upgrade to run more briefs.',
 };
 
 export default function UpgradeModal({ open, detail, onClose }: Props) {
@@ -116,12 +129,30 @@ export default function UpgradeModal({ open, detail, onClose }: Props) {
           fontSize: 11,
           color: 'var(--fg-muted)',
           margin: 0,
-          marginBottom: 20,
+          marginBottom: detail.credit_overage ? 8 : 20,
         }}>
           Usage: {detail.current} / {detail.limit}
         </p>
+        {detail.credit_overage && (
+          <p style={{ fontSize: 12.5, color: 'var(--fg-dim)', margin: 0, marginBottom: 20 }}>
+            {typeof detail.credit_cost === 'number'
+              ? `Or keep going with credits — ${detail.credit_cost} credits each`
+              : 'Or keep going with prepaid credits'}
+            {typeof detail.credit_balance === 'number' && ` (balance: ${detail.credit_balance}).`}
+          </p>
+        )}
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {detail.credit_overage && (
+            <button
+              className="btn btn-primary"
+              disabled={loading !== null}
+              onClick={handleViewAll}
+              style={{ width: '100%', justifyContent: 'center' }}
+            >
+              Recharge credits
+            </button>
+          )}
           <button
             className="btn btn-primary"
             disabled={loading !== null}
@@ -136,7 +167,7 @@ export default function UpgradeModal({ open, detail, onClose }: Props) {
             onClick={() => handleUpgrade('plus')}
             style={{ width: '100%', justifyContent: 'center' }}
           >
-            {loading === 'plus' ? 'Redirecting…' : 'Upgrade to Plus — $50/mo'}
+            {loading === 'plus' ? 'Redirecting…' : 'Upgrade to Plus — $70/mo'}
           </button>
           <button
             className="btn btn-ghost"

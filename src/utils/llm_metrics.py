@@ -98,7 +98,10 @@ class LLMCallRecorder:
     or chat session. Threaded through agent state for pipeline calls; built
     inline for chat-path calls from the request session.
     """
-    db: Any                                  # SQLAlchemy session
+    # `db` is retained for backwards-compatible construction but is NOT used for
+    # writing — see record(). Telemetry gets its own session so it can never commit
+    # or roll back the caller's (request) transaction.
+    db: Any = None
     pipeline_run_id: Optional[str] = None
     chat_history_id: Optional[str] = None
     presales_id: Optional[str] = None
@@ -131,15 +134,26 @@ class LLMCallRecorder:
                 latency_ms=latency_ms,
                 cost_usd=cost,
             )
-            self.db.add(row)
-            self.db.commit()
         except Exception as e:
-            # Telemetry must never break the request. Roll back and move on.
+            logger.warning(f"llm_metrics: failed to build call row for {agent_name}: {e}")
+            return
+
+        # Write on a dedicated short-lived session. The ledger is append-only and
+        # FK-free, so this insert is order-independent and isolated: a metrics
+        # outage (or a call recorded before its parent row exists) never touches
+        # the business transaction on the request session.
+        session = models.sessionlocal()
+        try:
+            session.add(row)
+            session.commit()
+        except Exception as e:
             try:
-                self.db.rollback()
+                session.rollback()
             except Exception:
                 pass
             logger.warning(f"llm_metrics: failed to record call for {agent_name}: {e}")
+        finally:
+            session.close()
 
 
 def record_from_response(

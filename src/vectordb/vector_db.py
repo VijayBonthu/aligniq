@@ -19,12 +19,30 @@ collection = client.get_or_create_collection(name="GroundedIQ")
 
 def _embed_batched(texts: list[str], model: str, batch_size: int = 100) -> list[list[float]]:
   """Embed `texts` in batches (the OpenAI embeddings API accepts a list input and
-  returns vectors in order). Replaces the previous one-call-per-chunk loop."""
+  returns vectors in order). Replaces the previous one-call-per-chunk loop.
+
+  Records embedding-token usage into llm_call_log via the bound recorder so the
+  project COGS total matches the OpenAI usage dashboard (embeddings are a separate
+  line item there). No-op when no recorder is bound."""
+  from utils.llm_metrics import get_recorder
+
   embeddings: list[list[float]] = []
+  total_tokens = 0
   for start in range(0, len(texts), batch_size):
     batch = texts[start:start + batch_size]
     resp = client_oa.embeddings.create(input=batch, model=model)
     embeddings.extend(item.embedding for item in resp.data)
+    try:
+      total_tokens += int(getattr(resp, "usage", None).total_tokens or 0)
+    except Exception:
+      pass
+
+  recorder = get_recorder()
+  if recorder is not None and total_tokens:
+    recorder.record(
+      agent_name="embedding", model=model,
+      input_tokens=total_tokens, cached_input_tokens=0, output_tokens=0, latency_ms=0,
+    )
   return embeddings
 
 
@@ -77,9 +95,17 @@ async def create_embeddings(
           meta[k] = v
     metadata.append(meta)
 
-  # Create embeddings via OpenAI client (batched).
+  # Create embeddings via OpenAI client (batched). Ensure a recorder is bound so
+  # the embedding cost is captured even when indexing runs outside a pipeline/chat
+  # context (which already bind a richer-scoped recorder).
+  from contextlib import nullcontext
+  from utils.llm_metrics import get_recorder, LLMCallRecorder, use_recorder
+  _embed_ctx = nullcontext() if get_recorder() is not None else use_recorder(
+    LLMCallRecorder(chat_history_id=chat_history_id)
+  )
   try:
-    resp = _embed_batched(texts, model)
+    with _embed_ctx:
+      resp = _embed_batched(texts, model)
     logger.info(f"created {len(resp)} embeddings for chat_history_id: {chat_history_id}")
   except Exception as e:
      logger.error(f'Error creating embedding for chat_history_id: {chat_history_id}, error: {e}')

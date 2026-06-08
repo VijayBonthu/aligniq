@@ -5,7 +5,12 @@ from pydantic import BaseModel
 import os
 import json
 from utils.token_generation import token_validator, require_verified_email
-from utils.subscription import check_chat_limit, check_message_limit, check_regen_limit, increment_message_count, increment_regen_count, get_usage_summary
+from utils.subscription import (
+    check_chat_limit, check_message_limit, check_regen_limit,
+    increment_message_count, increment_regen_count, get_usage_summary,
+    check_report_generation_limit, consume_report_generation,
+    check_presales_limit, consume_presales, get_model_tier, has_feature,
+)
 from utils.chat_history import save_chat_history, delete_chat_history, get_user_chat_history_details,get_single_user_chat_history, save_chat_with_doc, save_report_version
 from getdata import ExtractText
 from processdata import AccessLLM
@@ -19,6 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jira_logic.jira_components import get_jira_user_info
 from p_model_type import JiraTokenRequest, ChatHistoryDetails
 import uuid
+from utils.ids import new_id as gen_id
 from datetime import datetime
 from utils.document_save import get_s3_client,ensure_bucket_exists, upload_document_s3
 from agents.workflow_graph import run_agent_pipeline
@@ -99,6 +105,7 @@ from database_scripts import (
     get_all_report_versions_enhanced,
     # Pre-Sales Database Functions
     save_presales_analysis,
+    update_presales_cost_total,
     save_technology_risks,
     get_presales_analysis,
     get_presales_by_id,
@@ -290,7 +297,7 @@ async def upload_file(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
         logger.info(f"completed reading the file")
 
-        file_uuid = str(uuid.uuid4())
+        file_uuid = gen_id()
         file_extension = content_document.filename.split(".")[-1]
         document_name = content_document.filename.split(".")[0]
 
@@ -549,8 +556,7 @@ async def _run_presales_analysis(
         # Pre-generate presales_id so initial-scan LLM rows can be tagged with it
         # before save_presales_analysis runs. chat_history_id is created later in
         # the flow (after the scan completes).
-        import uuid as _uuid
-        _presales_id_pre = str(_uuid.uuid4())
+        _presales_id_pre = gen_id()
         from utils.llm_metrics import LLMCallRecorder, use_recorder
         _presales_recorder = LLMCallRecorder(
             db=db, user_id=user_id, presales_id=_presales_id_pre,
@@ -626,6 +632,11 @@ async def _run_presales_analysis(
         presales_record = await save_presales_analysis(presales_data=presales_data, db=db)
         presales_id = presales_record["presales_id"]
         logger.info(f"Saved pre-sales analysis with presales_id: {presales_id}")
+
+        # Freeze the initial-scan COGS roll-up now that the parent row exists and
+        # all scan llm_call_log rows (tagged with this presales_id) are committed.
+        scan_cost, scan_calls = await update_presales_cost_total(presales_id, db)
+        logger.info(f"Presales scan COGS: {scan_calls} LLM calls, ${scan_cost:.4f}")
 
         # Save technology risks for passive capture
         if result.get("technology_risks"):
@@ -761,7 +772,9 @@ async def generate_presales_report(
     pipeline is started later via ``POST /full-pipeline/start``.
     """
     user_id = current_token["regular_login_token"]["id"]
-    check_regen_limit(user_id, db)
+    # Presales briefs are cheap and metered on their own (generous) allowance,
+    # separate from the full-report pool — they're the conversion "wow".
+    check_presales_limit(user_id, db)
     logger.info(f"Generating presales brief for presales_id: {presales_id}")
 
     try:
@@ -874,7 +887,12 @@ async def generate_presales_report(
             saved = await save_chat_history(chat=initial_chat_data, db=db)
             chat_history_id = saved["chat_history_id"]
 
-        increment_regen_count(user_id, db)
+        consume_presales(user_id, db)
+
+        # Roll the brief's LLM calls into the project COGS total.
+        brief_cost, brief_calls = await update_presales_cost_total(presales_id, db)
+        logger.info(f"Presales project COGS after brief: {brief_calls} calls, ${brief_cost:.4f}")
+
         return {
             "report":          report_text,
             "document_id":     presales["document_id"],
@@ -989,7 +1007,10 @@ async def start_full_pipeline(
     from agents.pipeline_runner import run_full_pipeline_async
 
     user_id = current_token["regular_login_token"]["id"]
-    check_regen_limit(user_id, db)
+    # One pool for the initial generation AND regens; 402 only if neither the
+    # monthly allowance nor prepaid credits can cover it. model_tier gates COGS.
+    check_report_generation_limit(user_id, db)
+    model_tier = get_model_tier(user_id, db)
 
     # Verify the chat belongs to the user and find its presales context.
     chat = await get_single_user_chat_history(
@@ -1050,6 +1071,10 @@ async def start_full_pipeline(
 
     run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
 
+    # Charge the report (allowance, then credits) BEFORE scheduling, tagged with
+    # run_id so a failed run is refundable. A 402 here means nothing is scheduled.
+    consume_report_generation(user_id, db, ref_id=run["run_id"])
+
     # Schedule the long-running pipeline. BackgroundTasks runs after the
     # response is sent and lives in the same FastAPI event loop.
     background_tasks.add_task(
@@ -1061,8 +1086,8 @@ async def start_full_pipeline(
         presales_id=presales_id,
         document=[enhanced_context],
         title=title,
+        model_tier=model_tier,
     )
-    increment_regen_count(user_id, db)
 
     return {
         "run_id":          run["run_id"],
@@ -1129,7 +1154,8 @@ async def resume_full_pipeline(
         )
 
     user_id = current_token["regular_login_token"]["id"]
-    check_regen_limit(user_id, db)
+    check_report_generation_limit(user_id, db)
+    model_tier = get_model_tier(user_id, db)
 
     chat = await get_single_user_chat_history(
         chat_history_id=chat_history_id, user_id=user_id, db=db
@@ -1194,6 +1220,7 @@ async def resume_full_pipeline(
         preserve_snapshot=True,
     )
 
+    consume_report_generation(user_id, db, ref_id=run["run_id"])
     background_tasks.add_task(
         run_full_pipeline_async,
         run_id=run["run_id"],
@@ -1204,8 +1231,8 @@ async def resume_full_pipeline(
         document=[enhanced_context],
         title=title,
         resume_from_snapshot=snapshot,
+        model_tier=model_tier,
     )
-    increment_regen_count(user_id, db)
 
     logger.info(
         f"Resuming pipeline run {run['run_id']} for chat {chat_history_id} "
@@ -4257,11 +4284,15 @@ Just ask me anything about your report!
 
                     if wants_pdf:
                         try:
+                            # Branding policy by tier: free → watermark, pro → firm white-label.
+                            from utils.subscription import pdf_branding_for
+                            _brand = pdf_branding_for(current_user["regular_login_token"]["id"], db)
                             # Generate PDF on-the-fly
                             pdf_data = await generate_pdf_from_markdown(
                                 markdown_content=report_content,
                                 title="Technical Report",
-                                version=version_number
+                                version=version_number,
+                                **_brand,
                             )
 
                             # Return base64 encoded PDF for frontend download
@@ -5126,7 +5157,9 @@ async def regenerate_report_endpoint(
     from agents.pipeline_runner import run_full_pipeline_async
 
     user_id = current_user["regular_login_token"]["id"]
-    check_regen_limit(user_id, db)
+    # A regeneration draws from the same report-generation pool as the initial run.
+    check_report_generation_limit(user_id, db)
+    model_tier = get_model_tier(user_id, db)
 
     chat = await get_single_user_chat_history(chat_history_id=chat_history_id, user_id=user_id, db=db)
     if not chat:
@@ -5184,13 +5217,13 @@ async def regenerate_report_endpoint(
     title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
 
     run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
+    consume_report_generation(user_id, db, ref_id=run["run_id"])
     background_tasks.add_task(
         run_full_pipeline_async,
         run_id=run["run_id"], chat_history_id=chat_history_id, user_id=user_id,
         document_id=document_id, presales_id=presales_id, document=[enhanced_context], title=title,
-        applied_changes=pending,
+        applied_changes=pending, model_tier=model_tier,
     )
-    increment_regen_count(user_id, db)
 
     # Optimistically clear the queue (changes are now in the scheduled document).
     try:
@@ -6428,4 +6461,117 @@ async def get_llm_stats(
         },
         "totals": totals,
         "by_agent": by_agent,
+    }
+
+
+@router.get("/admin/project-cost/{chat_history_id}")
+async def get_project_cost(
+    chat_history_id: str,
+    current_token: dict = Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """End-to-end COGS for one project — what you'd open to 'get the rates right'.
+
+    Resolves the project's full scope from its chat_history_id (its presales_id via
+    the analysis link + any pipeline runs), then reports — all derived live from the
+    append-only llm_call_log so it's correct at any point in time, no drift:
+      - by_stage: per-agent/stage cost + tokens table (scan, pipeline stages, chat, embedding)
+      - totals: live SUM across the whole project
+      - materialized: the frozen totals on presales_analysis / pipeline_runs, with a
+        reconciliation check against the live SUM
+      - recent_calls: the last 50 individual calls (each call's tokens + $)
+    """
+    from sqlalchemy import func, or_
+    from database_scripts import get_presales_id_for_chat
+
+    # Resolve the project's presales_id (best effort) so scan + brief calls are included.
+    try:
+        presales_id = get_presales_id_for_chat(chat_history_id, db)
+    except Exception:
+        presales_id = None
+
+    conds = [models.LLMCallLog.chat_history_id == chat_history_id]
+    if presales_id:
+        conds.append(models.LLMCallLog.presales_id == presales_id)
+    scope = or_(*conds)
+
+    # by_stage (per agent + model), derived live from the ledger.
+    rows = (
+        db.query(
+            models.LLMCallLog.agent_name,
+            models.LLMCallLog.model,
+            func.count(models.LLMCallLog.id).label("calls"),
+            func.coalesce(func.sum(models.LLMCallLog.input_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(models.LLMCallLog.cached_input_tokens), 0).label("cached_input_tokens"),
+            func.coalesce(func.sum(models.LLMCallLog.output_tokens), 0).label("output_tokens"),
+            func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0).label("cost_usd"),
+        )
+        .filter(scope)
+        .group_by(models.LLMCallLog.agent_name, models.LLMCallLog.model)
+        .all()
+    )
+
+    by_stage = []
+    t_calls = t_in = t_cached = t_out = 0
+    t_cost = 0.0
+    for r in rows:
+        calls, itok, ctok, otok = int(r.calls or 0), int(r.input_tokens or 0), int(r.cached_input_tokens or 0), int(r.output_tokens or 0)
+        cost = float(r.cost_usd or 0)
+        by_stage.append({
+            "stage": r.agent_name, "model": r.model, "calls": calls,
+            "input_tokens": itok, "cached_input_tokens": ctok, "output_tokens": otok,
+            "cost_usd": round(cost, 6),
+        })
+        t_calls += calls; t_in += itok; t_cached += ctok; t_out += otok; t_cost += cost
+    by_stage.sort(key=lambda x: x["cost_usd"], reverse=True)
+
+    live_total = round(t_cost, 6)
+
+    # Materialized (frozen) totals for reconciliation.
+    materialized = {"presales": None, "pipeline_runs": []}
+    mat_sum = 0.0
+    if presales_id:
+        pre = db.query(models.PresalesAnalysis).filter(models.PresalesAnalysis.presales_id == presales_id).first()
+        if pre:
+            materialized["presales"] = {"total_cost_usd": round(float(pre.total_cost_usd or 0), 6), "total_calls": int(pre.total_calls or 0)}
+            mat_sum += float(pre.total_cost_usd or 0)
+    for run in db.query(models.PipelineRun).filter(models.PipelineRun.chat_history_id == chat_history_id).all():
+        materialized["pipeline_runs"].append({
+            "run_id": run.run_id, "status": run.status,
+            "total_cost_usd": round(float(run.total_cost_usd or 0), 6), "total_calls": int(run.total_calls or 0),
+        })
+        mat_sum += float(run.total_cost_usd or 0)
+
+    recent = (
+        db.query(models.LLMCallLog)
+        .filter(scope)
+        .order_by(models.LLMCallLog.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    recent_calls = [{
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "stage": c.agent_name, "model": c.model,
+        "input_tokens": c.input_tokens, "cached_input_tokens": c.cached_input_tokens,
+        "output_tokens": c.output_tokens, "cost_usd": round(float(c.cost_usd or 0), 6),
+    } for c in recent]
+
+    return {
+        "chat_history_id": chat_history_id,
+        "presales_id": presales_id,
+        "totals": {
+            "calls": t_calls, "input_tokens": t_in, "cached_input_tokens": t_cached,
+            "output_tokens": t_out, "cost_usd": live_total,
+        },
+        "by_stage": by_stage,
+        "materialized": materialized,
+        "reconciliation": {
+            # Live ledger sum is authoritative; materialized totals should track it.
+            # Note: presales materialized counts only presales-tagged calls, pipeline
+            # only its run — together they should approximate the live total.
+            "live_total_usd": live_total,
+            "materialized_sum_usd": round(mat_sum, 6),
+            "matches": abs(live_total - mat_sum) < 0.005,
+        },
+        "recent_calls": recent_calls,
     }

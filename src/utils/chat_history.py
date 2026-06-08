@@ -6,6 +6,7 @@ import models
 import json
 from sqlalchemy import text, and_
 import uuid
+from utils.ids import new_id
 from fastapi import HTTPException
 from utils.logger import logger
 from database_scripts import get_analysis_mode
@@ -214,7 +215,7 @@ async def save_chat_history(chat:Dict, db:Session) -> Dict:
             else:
                 # Create new chat only if none exists
                 logger.info(f"no existing chat found, creating new chat for user: {chat['user_id']}")
-                chat_history_id = str(uuid.uuid4())
+                chat_history_id = new_id()
                 new_chat = models.ChatHistory(
                     chat_history_id = chat_history_id,
                     user_id = chat["user_id"],
@@ -390,7 +391,7 @@ async def save_report_version(summary_report_details:Dict, db:Session):
         ).update({"is_default": False})
 
         new_report_insert = models.ReportVersions(
-            report_version_id = str(uuid.uuid4()),
+            report_version_id = new_id(),
             chat_history_id = chat_id,
             user_id = summary_report_details["user_id"],
             version_number = version_details,

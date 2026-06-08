@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 import copy
 import json
 import uuid
+from utils.ids import new_id
 from typing import Optional
 
 class UserCreationError(Exception):
@@ -1052,7 +1053,7 @@ async def create_new_report_version(
 
         # Create new version record with changelog tracking
         new_version = models.ReportVersions(
-            report_version_id=str(uuid.uuid4()),
+            report_version_id=new_id(),
             chat_history_id=chat_history_id,
             user_id=user_id,
             version_number=new_version_number,
@@ -1281,7 +1282,7 @@ async def rollback_to_version(
 
         # Create new version with target's content
         rollback_version = models.ReportVersions(
-            report_version_id=str(uuid.uuid4()),
+            report_version_id=new_id(),
             chat_history_id=chat_history_id,
             user_id=user_id,
             version_number=new_version_number,
@@ -3442,7 +3443,7 @@ async def record_transaction(
 
         # Create new transaction record
         transaction = models.TransactionHistory(
-            id=str(uuid.uuid4()),
+            id=new_id(),
             chat_history_id=chat_history_id,
             action_type=action_type,
             action_description=description,
@@ -4270,7 +4271,7 @@ async def create_or_reset_pipeline_run(
             # completed_nodes; new mark_stage_* calls overwrite as needed.
         else:
             run = models.PipelineRun(
-                run_id=str(uuid.uuid4()),
+                run_id=new_id(),
                 chat_history_id=chat_history_id,
                 user_id=user_id,
                 status=models.PipelineRunStatus.QUEUED,
@@ -4347,19 +4348,70 @@ async def increment_loop_count(run_id: str, db: Session) -> None:
 
 
 async def complete_pipeline_run(run_id: str, db: Session) -> None:
-    """Mark a pipeline run as successfully completed."""
+    """Mark a pipeline run as successfully completed and freeze its COGS roll-up."""
     from datetime import datetime
+    from sqlalchemy import func
     try:
         run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
         if not run:
             return
+        # Materialize the cost roll-up from the append-only ledger so billing reads
+        # are O(1) and frozen at completion (immune to later price-table changes).
+        total, count = (
+            db.query(
+                func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0.0),
+                func.count(models.LLMCallLog.id),
+            )
+            .filter(models.LLMCallLog.pipeline_run_id == run_id)
+            .one()
+        )
+        run.total_cost_usd = float(total or 0.0)
+        run.total_calls = int(count or 0)
         run.status = models.PipelineRunStatus.COMPLETED
         run.current_stage = None
         run.completed_at = datetime.utcnow()
         db.commit()
+        logger.info(
+            f"complete_pipeline_run {run_id}: {run.total_calls} LLM calls, "
+            f"${run.total_cost_usd:.4f} COGS"
+        )
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"complete_pipeline_run failed for {run_id}: {e}")
+
+
+async def update_presales_cost_total(presales_id: str, db: Session) -> tuple[float, int]:
+    """Materialize SUM/COUNT of llm_call_log onto presales_analysis for a project.
+
+    Call after the initial scan saves, and again at the end of brief generation,
+    so presales_analysis.total_cost_usd tracks the full project COGS (scan + brief
+    + presales chat). The per-call detail stays in llm_call_log. Returns the
+    (total_cost_usd, total_calls) it wrote.
+    """
+    from sqlalchemy import func
+    try:
+        total, count = (
+            db.query(
+                func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0.0),
+                func.count(models.LLMCallLog.id),
+            )
+            .filter(models.LLMCallLog.presales_id == presales_id)
+            .one()
+        )
+        pre = (
+            db.query(models.PresalesAnalysis)
+            .filter(models.PresalesAnalysis.presales_id == presales_id)
+            .first()
+        )
+        if pre:
+            pre.total_cost_usd = float(total or 0.0)
+            pre.total_calls = int(count or 0)
+            db.commit()
+        return float(total or 0.0), int(count or 0)
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"update_presales_cost_total failed for {presales_id}: {e}")
+        return 0.0, 0
 
 
 async def fail_pipeline_run(run_id: str, error_msg: str, db: Session) -> None:

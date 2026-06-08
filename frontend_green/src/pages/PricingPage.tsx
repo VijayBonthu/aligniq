@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { startPlanChange, getPortalUrl } from '../services/billingService';
-import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, PlanDescriptor, Tier } from '../data/plans';
+import { startPlanChange, getPortalUrl, buyCreditPack, PaidTier, CreditPackSize } from '../services/billingService';
+import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, CREDIT_PACKS, PlanDescriptor, Tier } from '../data/plans';
 import { Logo } from '../components/Logo';
 
 export default function PricingPage() {
@@ -11,7 +11,9 @@ export default function PricingPage() {
   const [loading, setLoading] = useState<string | null>(null);
 
   const currentTier: Tier | null = subscription?.tier ?? null;
+  // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.
   const isPaidUser = currentTier && currentTier !== 'free' && currentTier !== 'pro';
+  const creditBalance = subscription?.credits?.balance ?? 0;
 
   async function handleCta(plan: PlanDescriptor) {
     if (plan.ctaKind === 'contact') {
@@ -32,11 +34,24 @@ export default function PricingPage() {
     try {
       // startPlanChange handles all three outcomes: new-customer Checkout,
       // downgrade → portal, or an in-place prorated upgrade (no redirect).
-      const { updated } = await startPlanChange(plan.id as 'basic' | 'plus');
+      const { updated } = await startPlanChange(plan.id as PaidTier);
       if (updated) {
         window.location.reload();
         return;
       }
+    } catch {
+      setLoading(null);
+    }
+  }
+
+  async function handleBuyCredits(size: CreditPackSize) {
+    if (!isAuthenticated) {
+      navigate('/login', { state: { from: '/pricing' } });
+      return;
+    }
+    setLoading(`credits-${size}`);
+    try {
+      await buyCreditPack(size);
     } catch {
       setLoading(null);
     }
@@ -200,6 +215,49 @@ export default function PricingPage() {
               </div>
             );
           })}
+        </div>
+
+        {/* Credit packs — prepaid top-ups, every tier. Spent when a plan's
+            monthly allowance runs out (a frontier report ≈ 74 credits ≈ $7.40). */}
+        <div style={{ maxWidth: 1100, margin: '56px auto 0' }}>
+          <div style={{ textAlign: 'center', marginBottom: 24 }}>
+            <p className="eyebrow" style={{ color: 'var(--accent)', marginBottom: 10 }}>Credits</p>
+            <h2 className="display" style={{ fontSize: 28, marginBottom: 8 }}>Need more this month?</h2>
+            <p style={{ fontSize: 14, color: 'var(--fg-dim)', margin: 0 }}>
+              Top up anytime — credits never expire and work on any plan.{' '}
+              {isAuthenticated && (
+                <strong style={{ color: 'var(--fg)' }}>Balance: {creditBalance.toLocaleString()} credits</strong>
+              )}
+            </p>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 14 }}>
+            {CREDIT_PACKS.map(pack => (
+              <div
+                key={pack.size}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+                  padding: 20, borderRadius: 'var(--radius-lg)',
+                  background: 'var(--surface)', border: '1px solid var(--border)',
+                }}
+              >
+                <span className="display" style={{ fontSize: 26 }}>{pack.price}</span>
+                <span style={{ fontSize: 13, color: 'var(--fg)' }}>
+                  {pack.credits.toLocaleString()} credits
+                </span>
+                {pack.bonus && (
+                  <span className="badge badge-accent" style={{ fontSize: 10, padding: '2px 8px' }}>{pack.bonus} bonus</span>
+                )}
+                <button
+                  className="btn btn-ghost"
+                  disabled={loading !== null}
+                  onClick={() => handleBuyCredits(pack.size)}
+                  style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+                >
+                  {loading === `credits-${pack.size}` ? 'Redirecting…' : 'Buy credits'}
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
 
         {isPaidUser && (

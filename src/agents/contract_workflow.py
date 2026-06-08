@@ -71,6 +71,27 @@ _writer_llm_high = ChatOpenAI(
     model=settings.GENERATING_REPORT_MODEL,
     reasoning_effort="high",
 )
+# Lite "smart" model — the cheap model standing in for the smart nodes on the
+# free/basic tiers. The frontier SMART_MODEL is the single biggest per-report
+# cost; gating it to plus/pro (model_tier='frontier') keeps free/basic reports
+# margin-safe (COGS ~$0.65 vs ~$1.85). _resolve_smart() picks per run; the writers
+# are always the cheap model regardless of tier.
+_smart_llm_lite = ChatOpenAI(
+    api_key=settings.OPENAI_CHATGPT,
+    model=settings.GENERATING_REPORT_MODEL,
+    temperature=0,
+)
+
+
+def _resolve_smart(model_tier: str) -> tuple[ChatOpenAI, str]:
+    """Return (smart_llm, smart_model_name) for the plan/decide/known-issues/judge
+    nodes. 'frontier' (plus/pro) → SMART_MODEL_NAME; anything else ('lite') → the
+    cheap model. The model name is returned too so llm_call_log tags the real COGS."""
+    if model_tier == "frontier":
+        return _smart_llm, settings.SMART_MODEL_NAME
+    return _smart_llm_lite, settings.GENERATING_REPORT_MODEL
+
+
 _DEEP_REASONING_SECTIONS = {"recommended-approach", "feasibility-and-cost"}
 _smart_json_parser = OutputFixingParser.from_llm(parser=JsonOutputParser(), llm=llm_parser)
 
@@ -186,11 +207,13 @@ async def plan_node(
     document_chunks_block: str,
     evidence_index_block: str,
     prior_context: str = "(none — this is a first run; design from scratch)",
+    smart_llm: ChatOpenAI = _smart_llm,
+    smart_model: str = settings.SMART_MODEL_NAME,
 ) -> ReportContract:
     """Smart model emits a ReportContract (structure only — decisions come later)."""
     logger.info("contract_pipeline: plan_node starting")
 
-    chain = ChatPromptTemplate.from_template(PLANNER_PROMPT) | _smart_llm | _smart_json_parser
+    chain = ChatPromptTemplate.from_template(PLANNER_PROMPT) | smart_llm | _smart_json_parser
     response = await invoke_with_timeout(
         chain,
         {
@@ -201,7 +224,7 @@ async def plan_node(
             "prior_context": prior_context,
         },
         agent_name="contract_planner",
-        model=settings.SMART_MODEL_NAME,
+        model=smart_model,
         prompt_hash=_HASHES["contract_planner"],
     )
 
@@ -234,11 +257,13 @@ async def decide_node(
     document_chunks_block: str,
     research_block: str = "(no external research available)",
     prior_context: str = "(none — this is a first run; design from scratch)",
+    smart_llm: ChatOpenAI = _smart_llm,
+    smart_model: str = settings.SMART_MODEL_NAME,
 ) -> ReportContract:
     """Smart model fills the contract's decision artifacts. Returns the merged contract."""
     logger.info("contract_pipeline: decide_node starting")
 
-    chain = ChatPromptTemplate.from_template(DECIDE_PROMPT) | _smart_llm | _smart_json_parser
+    chain = ChatPromptTemplate.from_template(DECIDE_PROMPT) | smart_llm | _smart_json_parser
     response = await invoke_with_timeout(
         chain,
         {
@@ -249,7 +274,7 @@ async def decide_node(
             "prior_context": prior_context,
         },
         agent_name="contract_decider",
-        model=settings.SMART_MODEL_NAME,
+        model=smart_model,
         prompt_hash=_HASHES["contract_decider"],
     )
 
@@ -373,7 +398,12 @@ def _build_known_issue_queries(contract: ReportContract, limit: int) -> list[str
     return deduped[:limit]
 
 
-async def known_issues_node(*, contract: ReportContract) -> ReportContract:
+async def known_issues_node(
+    *,
+    contract: ReportContract,
+    smart_llm: ChatOpenAI = _smart_llm,
+    smart_model: str = settings.SMART_MODEL_NAME,
+) -> ReportContract:
     """Enrich the contract with web-sourced known issues. Inert unless
     ENABLE_KNOWN_ISSUES and a Tavily key are set. Never raises — enrichment only.
 
@@ -412,7 +442,7 @@ async def known_issues_node(*, contract: ReportContract) -> ReportContract:
         ) or "(none)"
         integration_points = "\n".join(f"- {ip}" for ip in contract.integration_points) or "(none)"
 
-        chain = ChatPromptTemplate.from_template(KNOWN_ISSUES_PROMPT) | _smart_llm | _smart_json_parser
+        chain = ChatPromptTemplate.from_template(KNOWN_ISSUES_PROMPT) | smart_llm | _smart_json_parser
         response = await invoke_with_timeout(
             chain,
             {
@@ -421,7 +451,7 @@ async def known_issues_node(*, contract: ReportContract) -> ReportContract:
                 "search_results": "\n\n".join(result_blocks),
             },
             agent_name="contract_known_issues",
-            model=settings.SMART_MODEL_NAME,
+            model=smart_model,
             prompt_hash=_HASHES["contract_known_issues"],
         )
 
@@ -537,6 +567,8 @@ async def judge_node(
     firm_context: str,
     prechecks_context: str = "",
     research_block: str = "(no external research available)",
+    smart_llm: ChatOpenAI = _smart_llm,
+    smart_model: str = settings.SMART_MODEL_NAME,
 ) -> tuple[dict[str, str], dict[str, str], dict]:
     """Smart-model judge scores sections; revise flagged ones once.
 
@@ -548,7 +580,7 @@ async def judge_node(
         f"=== {sid} ===\n{body}" for sid, body in sections_md.items()
     )
 
-    chain = ChatPromptTemplate.from_template(JUDGE_PROMPT) | _smart_llm | _smart_json_parser
+    chain = ChatPromptTemplate.from_template(JUDGE_PROMPT) | smart_llm | _smart_json_parser
     judge_response = await invoke_with_timeout(
         chain,
         {
@@ -558,7 +590,7 @@ async def judge_node(
             "deterministic_prechecks":   prechecks_context or "(none — all deterministic checks passed)",
         },
         agent_name="contract_judge",
-        model=settings.SMART_MODEL_NAME,
+        model=smart_model,
         prompt_hash=_HASHES["contract_judge"],
     )
 
@@ -619,6 +651,7 @@ async def run_contract_pipeline(
     applied_changes: Optional[list] = None,
     on_stage_started: Optional[callable] = None,
     on_stage_completed: Optional[callable] = None,
+    model_tier: str = "frontier",
 ) -> dict:
     """Run all stages and stitch the final report.
 
@@ -629,6 +662,10 @@ async def run_contract_pipeline(
     planner/decider evolve the prior contract by applying the requested changes
     instead of redesigning from scratch (the "feed new answers → converge" loop).
 
+    `model_tier` gates the plan/decide/known-issues/judge model: 'frontier'
+    (plus/pro) uses SMART_MODEL_NAME; 'lite' (free/basic) uses the cheap model so
+    those tiers stay margin-safe. Writers are the cheap model in either case.
+
     Returns:
         {
           "report_markdown": str,
@@ -636,6 +673,8 @@ async def run_contract_pipeline(
           "judge_response": dict,
         }
     """
+    smart_llm, smart_model = _resolve_smart(model_tier)
+
     # Evidence index is built once and shared by the planner, the decider, and
     # the per-section writers (deterministic lookup, no Chroma round-trip).
     evidence_by_id, document_chunks_block, evidence_index_block = await _build_evidence_index(document)
@@ -650,6 +689,8 @@ async def run_contract_pipeline(
         document_chunks_block=document_chunks_block,
         evidence_index_block=evidence_index_block,
         prior_context=prior_context,
+        smart_llm=smart_llm,
+        smart_model=smart_model,
     )
     if on_stage_completed:
         await on_stage_completed("plan")
@@ -669,8 +710,10 @@ async def run_contract_pipeline(
         document_chunks_block=document_chunks_block,
         research_block=research_block,
         prior_context=prior_context,
+        smart_llm=smart_llm,
+        smart_model=smart_model,
     )
-    contract = await known_issues_node(contract=contract)
+    contract = await known_issues_node(contract=contract, smart_llm=smart_llm, smart_model=smart_model)
     if on_stage_completed:
         await on_stage_completed("decide")
 
@@ -713,6 +756,8 @@ async def run_contract_pipeline(
         firm_context=firm_context,
         prechecks_context=prechecks_context,
         research_block=research_block,
+        smart_llm=smart_llm,
+        smart_model=smart_model,
     )
     # Judge notes are a debugging aid, not client content. Only embed them (as
     # HTML comments) when DEBUG_MODE is on; otherwise they would leak into the
