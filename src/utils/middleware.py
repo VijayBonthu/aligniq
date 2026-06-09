@@ -115,7 +115,10 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # Skip validation for authentication endpoints (login, registration).
             # Forgot/reset are unauthenticated POSTs from users who may not hold a
             # CSRF cookie yet; the reset token in the URL is the unforgeable secret.
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email"]:
+            # The Stripe webhook is a server-to-server POST with no browser/cookie —
+            # it is authenticated by its Stripe-Signature HMAC (verified in billing.py),
+            # so CSRF does not apply (and must be skipped, or it 403s → 500 in middleware).
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe"]:
                 return await call_next(request)
             
             # Validate CSRF token
