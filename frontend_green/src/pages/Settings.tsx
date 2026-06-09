@@ -57,6 +57,28 @@ export default function Settings() {
   const tier = subscription?.tier ?? 'free';
   const isPaid = tier !== 'free' && tier !== 'pro';
 
+  // Credit wallet view-model (à-la-carte costs come from the backend, so the
+  // "what it buys" math stays in sync with the credit multiplier).
+  const credits = subscription?.credits?.balance ?? 0;
+  const creditCosts = subscription?.credits?.costs ?? {};
+  const modelTier = subscription?.limits?.model_tier ?? 'lite';
+  const reportCost = (modelTier === 'frontier' ? creditCosts.report_frontier : creditCosts.report_lite)
+    || creditCosts.report_lite || 0;
+  const reportsAffordable = reportCost > 0 ? Math.floor(credits / reportCost) : 0;
+  const creditLow = reportCost > 0 && credits < reportCost;
+  // Fuel gauge: full ≈ 5 reports' worth of credits (no hard max on a wallet).
+  const creditPct = reportCost > 0 ? Math.min(100, Math.round((credits / (reportCost * 5)) * 100)) : 0;
+
+  // Auto-refresh usage + balance on mount and whenever the window regains focus
+  // (e.g. returning from a credit purchase), so it stays live like ChatGPT/Claude.
+  useEffect(() => {
+    refreshSubscription();
+    const onFocus = () => refreshSubscription();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function openPortal() {
     setBusy('portal');
     try {
@@ -172,6 +194,44 @@ export default function Settings() {
             </div>
           </div>
 
+          {subscription?.credits && (
+            <div
+              style={{
+                padding: 24,
+                background: 'var(--surface)',
+                border: `1px solid ${creditLow ? 'rgba(255,194,87,.3)' : 'var(--border)'}`,
+                borderRadius: 'var(--radius-lg)',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
+                <div>
+                  <p className="eyebrow" style={{ marginBottom: 6 }}>Credit balance</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                    <span className="display" style={{ fontSize: 34, color: creditLow ? 'var(--warn)' : 'var(--fg)' }}>
+                      {credits.toLocaleString()}
+                    </span>
+                    <span style={{ fontSize: 14, color: 'var(--fg-dim)' }}>credits</span>
+                  </div>
+                  <p style={{ fontSize: 12, color: 'var(--fg-muted)', margin: '4px 0 0', fontFamily: 'var(--font-mono)' }}>
+                    ≈ {reportsAffordable} full report{reportsAffordable === 1 ? '' : 's'}
+                    {creditCosts.presales ? ` · ${Math.floor(credits / creditCosts.presales)} presales briefs` : ''}
+                  </p>
+                </div>
+                <button className="btn btn-primary" onClick={() => navigate('/pricing')}>
+                  Buy credits
+                </button>
+              </div>
+              <div style={{ marginTop: 16, height: 8, borderRadius: 4, background: 'var(--border)', overflow: 'hidden' }}>
+                <div style={{ width: `${creditPct}%`, height: '100%', background: creditLow ? 'var(--warn)' : 'var(--accent)', transition: 'width .3s ease' }} />
+              </div>
+              {creditLow && (
+                <p style={{ fontSize: 11.5, color: 'var(--warn)', margin: '8px 0 0' }}>
+                  Low balance — top up to keep generating reports beyond your monthly allowance.
+                </p>
+              )}
+            </div>
+          )}
+
           {subscription && (
             <div
               style={{
@@ -193,15 +253,20 @@ export default function Settings() {
                   limit={subscription.limits.max_chats}
                 />
                 <UsageCounter
-                  label="Report regenerations"
-                  current={subscription.usage.report_regenerations_used}
-                  limit={subscription.limits.monthly_report_regen}
+                  label="Reports this period"
+                  current={subscription.usage.report_generations_used ?? 0}
+                  limit={subscription.limits.report_generations_per_month ?? subscription.limits.monthly_report_regen}
+                />
+                <UsageCounter
+                  label="Presales briefs"
+                  current={subscription.usage.presales_used ?? 0}
+                  limit={subscription.limits.presales_per_month ?? null}
                 />
               </div>
               <p style={{ fontSize: 11.5, color: 'var(--fg-muted)', margin: '14px 0 0', fontFamily: 'var(--font-mono)' }}>
-                Messages are tracked per chat — open a chat to see remaining sends.
+                Reports beyond your monthly allowance draw from credits.
                 {subscription.limits.messages_per_chat != null && (
-                  <> Limit: {subscription.limits.messages_per_chat} per chat.</>
+                  <> Messages are capped at {subscription.limits.messages_per_chat} per chat.</>
                 )}
               </p>
             </div>

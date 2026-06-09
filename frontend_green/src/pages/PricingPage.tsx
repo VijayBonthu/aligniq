@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { startPlanChange, getPortalUrl, buyCreditPack, PaidTier, CreditPackSize } from '../services/billingService';
 import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, CREDIT_PACKS, PlanDescriptor, Tier } from '../data/plans';
@@ -7,13 +7,33 @@ import { Logo } from '../components/Logo';
 
 export default function PricingPage() {
   const navigate = useNavigate();
-  const { isAuthenticated, subscription } = useAuth();
+  const location = useLocation();
+  const { isAuthenticated, subscription, refreshSubscription } = useAuth();
   const [loading, setLoading] = useState<string | null>(null);
+  const [creditsAdded, setCreditsAdded] = useState(false);
 
   const currentTier: Tier | null = subscription?.tier ?? null;
   // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.
   const isPaidUser = currentTier && currentTier !== 'free' && currentTier !== 'pro';
   const creditBalance = subscription?.credits?.balance ?? 0;
+
+  // Returning from a credit purchase (?credits=success): the webhook grants the
+  // credits asynchronously, so poll the balance a few times until it lands, then
+  // drop the query param so a reload doesn't re-trigger it.
+  useEffect(() => {
+    if (new URLSearchParams(location.search).get('credits') !== 'success') return;
+    setCreditsAdded(true);
+    let n = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      refreshSubscription();
+      if (++n < 6) timer = setTimeout(tick, 2000);  // ~10s of polling
+    };
+    tick();
+    navigate('/pricing', { replace: true });
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.search]);
 
   async function handleCta(plan: PlanDescriptor) {
     if (plan.ctaKind === 'contact') {
@@ -229,6 +249,11 @@ export default function PricingPage() {
                 <strong style={{ color: 'var(--fg)' }}>Balance: {creditBalance.toLocaleString()} credits</strong>
               )}
             </p>
+            {creditsAdded && (
+              <p style={{ fontSize: 13, color: 'var(--ok)', margin: '10px 0 0', fontWeight: 500 }}>
+                ✓ Payment received — your credits are being added and will appear here within a few seconds.
+              </p>
+            )}
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 14 }}>
             {CREDIT_PACKS.map(pack => (
