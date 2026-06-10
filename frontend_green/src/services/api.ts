@@ -1,4 +1,5 @@
 import axios from 'axios';
+import toast from 'react-hot-toast';
 
 const API_URL = import.meta.env.VITE_API_URL;
 const api = axios.create({
@@ -92,6 +93,41 @@ api.interceptors.response.use(
       return Promise.reject(error);
     }
 
+    // --- Operational responses: friendly UX, never raw error text ---
+    const status: number | undefined = error.response?.status;
+    const data = error.response?.data || {};
+    const reqUrl: string = original?.url || '';
+    // The site-config poll fails silently (don't toast a background poll).
+    const isConfigPoll = reqUrl.includes('site-config');
+
+    // App-level maintenance → let the MaintenanceGate take over the whole screen.
+    if (status === 503 && (data.error === 'maintenance' || error.response?.headers?.['x-maintenance'])) {
+      window.dispatchEvent(new CustomEvent('ops:maintenance', {
+        detail: { title: data.title, message: data.message, eta: data.eta },
+      }));
+      return Promise.reject(error);
+    }
+    // Read-only / granular kill switches → a clear toast, action rejected.
+    if (status === 503 && ['read_only', 'signups_disabled', 'logins_disabled', 'pipeline_paused'].includes(data.error)) {
+      if (!isConfigPoll) toast.error(data.message || 'This action is temporarily unavailable.');
+      return Promise.reject(error);
+    }
+    // Network/timeout (no response) — but not an aborted request.
+    if (!error.response) {
+      if (!isConfigPoll && error.code !== 'ERR_CANCELED') {
+        toast.error('Network error — please check your connection and try again.');
+      }
+      return Promise.reject(error);
+    }
+    // Server errors → generic message + the incident reference (full detail is logged server-side).
+    if (status && status >= 500) {
+      if (!isConfigPoll) {
+        const ref = data.incident_id ? ` (ref: ${data.incident_id})` : '';
+        toast.error((data.message || 'Something went wrong on our end.') + ref);
+      }
+      return Promise.reject(error);
+    }
+
     if (!isMissingOrExpiredAuth(error) || !original || original._retry) {
       return Promise.reject(error);
     }
@@ -121,5 +157,22 @@ api.interceptors.response.use(
     }
   }
 );
+
+// Map any axios error to a user-safe message. Components should use this instead of
+// reading `error.response.data.detail` directly, so internal/5xx text never reaches users.
+export function friendlyError(error: unknown): string {
+  const e = error as { response?: { status?: number; data?: { detail?: unknown; message?: string; incident_id?: string } } };
+  if (!e?.response) return 'Network error — please check your connection and try again.';
+  const { status, data } = e.response;
+  if (status && status >= 500) {
+    return (data?.message || 'Something went wrong on our end.') + (data?.incident_id ? ` (ref: ${data.incident_id})` : '');
+  }
+  if (typeof data?.detail === 'string') return data.detail;
+  if (data?.detail && typeof data.detail === 'object' && typeof (data.detail as { error?: string }).error === 'string') {
+    return (data.detail as { error: string }).error;
+  }
+  if (typeof data?.message === 'string') return data.message;
+  return 'Something went wrong. Please try again.';
+}
 
 export default api;

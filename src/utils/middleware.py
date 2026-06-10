@@ -8,7 +8,9 @@ from utils.logger import logger
 from utils.rate_limit import lifespan, rate_limit_key, get_client_ip, CustomRateLimiter
 from fastapi_limiter import FastAPILimiter
 from fastapi.responses import JSONResponse
+from jose import jwt, JWTError
 from config import settings
+from utils import ops_state
 
 # ---------------------------------------------------------------------------
 # Rate-limit route classification
@@ -118,15 +120,20 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # The Stripe webhook is a server-to-server POST with no browser/cookie —
             # it is authenticated by its Stripe-Signature HMAC (verified in billing.py),
             # so CSRF does not apply (and must be skipped, or it 403s → 500 in middleware).
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe"]:
+            # CSRF-exempt: cookieless server-to-server POSTs authenticated by their own
+            # secret/signature, where a browser CSRF token can't (and needn't) exist —
+            # the Stripe webhook (HMAC) and the X-Admin-Key break-glass admin endpoints.
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp"]:
                 return await call_next(request)
-            
-            # Validate CSRF token
+
+            # Validate CSRF token. Return a clean 403 (NOT raise) — an HTTPException
+            # raised inside BaseHTTPMiddleware escapes the exception handlers and
+            # surfaces as an opaque 500. Mirrors RateLimitMiddleware returning a 429.
             if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
-                logger.warning(f"CSRF validation failed for {request.url.path} - Cookie: {csrf_cookie}, Header: {csrf_header}")
-                raise HTTPException(
-                    status_code=403, 
-                    detail=f"CSRF token missing or invalid. Cookie: {csrf_cookie and 'present' or 'missing'}, Header: {csrf_header and 'present' or 'missing'}"
+                logger.warning(f"CSRF validation failed for {request.url.path} - Cookie: {csrf_cookie and 'present' or 'missing'}, Header: {csrf_header and 'present' or 'missing'}")
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "csrf", "message": "Your session security token is missing or expired. Please refresh the page and try again."},
                 )
             
             return await call_next(request)
@@ -211,4 +218,140 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # remains the outer guard.
             logger.error(f"Rate limit error: {e}")
             return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Maintenance / read-only / feature kill switches
+# ---------------------------------------------------------------------------
+# Dynamic, no-restart enforcement driven by utils.ops_state (Postgres-backed,
+# TTL-cached). Runs just inside CORS (so 503s keep Access-Control headers) and
+# before CSRF/RateLimit (so a maintenance block neither 403s nor burns quota).
+def _bearer(request: Request):
+    auth = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return None
+
+
+class MaintenanceMiddleware(BaseHTTPMiddleware):
+    # Always reachable even in maintenance: infra probes, the public config the SPA
+    # polls, the whole admin console (staff manage from there), and the auth endpoints
+    # needed to actually sign in as staff and turn maintenance back off.
+    _ALWAYS_OK_EXACT = {"/", "/health", "/api/v1/site-config", "/api/v1/my-site-config"}
+    _ALWAYS_OK_PREFIX = ("/api/v1/admin/",)
+    _AUTH_BYPASS = {
+        "/api/v1/login",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/callback",
+        "/api/v1/auth/github/login",
+        "/api/v1/auth/github/callback",
+        "/api/v1/auth/microsoft/login",
+        "/api/v1/auth/microsoft/callback",
+    }
+    # Identity/session establishment must stay reachable even for a blocked user so the SPA
+    # can finish login → identify them → SHOW them the maintenance page, rather than the
+    # login silently failing on a 503. (Targeted maintenance: a user is only known to be a
+    # target AFTER they authenticate.) `decode_token/{token}` is prefix-matched (path param).
+    _AUTH_BYPASS_PREFIX = ("/api/v1/decode_token/",)
+
+    def _auth_bypass(self, path: str) -> bool:
+        return path in self._AUTH_BYPASS or any(path.startswith(p) for p in self._AUTH_BYPASS_PREFIX)
+
+    def _claims(self, request: Request) -> dict:
+        """Decode the bearer once. Returns the JWT claims (incl. `is_staff`, `email`)
+        or {} when there's no/invalid token. Trusting the claim for the bypass is fine:
+        it's minted from the DB at login/refresh, and authoritative DB checks live on the
+        admin endpoints (require_staff) — a stale claim only affects maintenance bypass."""
+        token = _bearer(request)
+        if not token:
+            return {}
+        try:
+            return jwt.decode(token, settings.SECRET_KEY_J, algorithms=[settings.ALGORITHM]) or {}
+        except JWTError:
+            return {}
+
+    async def _ip_allowed(self, request: Request, maint: dict) -> bool:
+        allow = maint.get("allowlist_ips") or []
+        if not allow:
+            return False
+        try:
+            return (await get_client_ip(request)) in allow
+        except Exception:
+            return False
+
+    @staticmethod
+    def _blocked(status_code: int, error: str, message: str, extra: dict | None = None):
+        body = {"error": error, "message": message}
+        if extra:
+            body.update(extra)
+        headers = {"Retry-After": "300"}
+        if error == "maintenance":
+            headers["X-Maintenance"] = "1"
+        return JSONResponse(status_code=status_code, content=body, headers=headers)
+
+    async def dispatch(self, request: Request, call_next):
+        method = request.method.upper()
+        path = request.url.path
+
+        if method == "OPTIONS" or path in self._ALWAYS_OK_EXACT \
+                or any(path.startswith(p) for p in self._ALWAYS_OK_PREFIX):
+            return await call_next(request)
+
+        try:
+            state = ops_state.get_ops_state()
+        except Exception as e:
+            # Fail open — a config-read hiccup must never block the whole site.
+            logger.error(f"ops_state read failed in middleware: {e}")
+            return await call_next(request)
+
+        maint = state.get("maintenance", {})
+        read_only = state.get("read_only", {})
+        flags = state.get("feature_flags", {})
+
+        # Granular kill switches first (don't require full downtime).
+        if path == "/api/v1/registration" and not flags.get("signups_enabled", True):
+            return self._blocked(503, "signups_disabled",
+                                 "New sign-ups are temporarily paused. Please check back soon.")
+        if path == "/api/v1/login" and not flags.get("logins_enabled", True):
+            return self._blocked(503, "logins_disabled",
+                                 "Sign-in is temporarily unavailable. Please try again shortly.")
+        if method in ("POST", "PUT", "PATCH") and not flags.get("pipeline_enabled", True) and _is_expensive(path):
+            return self._blocked(503, "pipeline_paused",
+                                 "Report generation is paused for maintenance — your projects are safe. Try again soon.")
+
+        # Maintenance — the `on` toggle is the master switch; `target_emails` scopes WHO it
+        # applies to: a non-empty list = only those accounts (everyone else, incl. anonymous
+        # visitors, use the site normally), empty = the whole site. Token is only decoded
+        # while maintenance is on.
+        if bool(maint.get("on")):
+            target_emails = {str(e).strip().lower() for e in (maint.get("target_emails") or [])}
+            claims = self._claims(request)
+            is_staff = bool(claims.get("is_staff"))
+            email = (claims.get("email") or "").strip().lower()
+            in_maint = (email in target_emails) if target_emails else True
+            if in_maint:
+                if self._auth_bypass(path):
+                    return await call_next(request)
+                # Staff always bypass; allowlisted IPs bypass site-wide downtime.
+                if is_staff or await self._ip_allowed(request, maint):
+                    response = await call_next(request)
+                    response.headers["X-Maintenance-Bypass"] = "1"
+                    return response
+                return self._blocked(
+                    503, "maintenance",
+                    maint.get("message") or "GroundedIQ is down for brief maintenance. We'll be back shortly.",
+                    extra={"title": maint.get("title") or "We'll be right back", "eta": maint.get("eta") or ""},
+                )
+
+        # Read-only — allow reads, block state changes (except staff / auth).
+        if read_only.get("on") and method in ("POST", "PUT", "PATCH", "DELETE"):
+            if self._auth_bypass(path) or bool(self._claims(request).get("is_staff")):
+                return await call_next(request)
+            return self._blocked(
+                503, "read_only",
+                read_only.get("message") or "We're in read-only mode for brief maintenance — changes are temporarily disabled.",
+            )
+
+        return await call_next(request)
 

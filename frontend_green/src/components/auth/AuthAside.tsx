@@ -13,11 +13,8 @@ export const AuthAside: React.FC = () => (
 
     <div className="auth-side-mid">
       <h2 className="auth-quote">
-        "Finally, a kickoff where everyone <i>starts on the same page.</i>"
+        Every estimate, <i>grounded</i> in the brief.
       </h2>
-      <div className="auth-quote-attr">
-        — Mira Okafor, VP Eng, Kaleido Consulting
-      </div>
 
       <div className="auth-preview">
         <div className="auth-preview-head">
@@ -41,7 +38,7 @@ export const AuthAside: React.FC = () => (
 
     <div className="auth-meta">
       <span>© 2026 GroundedIQ</span>
-      <span>SOC 2 · GDPR · ISO 27001</span>
+      <span>Your data is never used to train AI.</span>
     </div>
   </aside>
 

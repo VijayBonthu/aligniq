@@ -1,0 +1,22 @@
+# GroundedIQ — https://grounded-iq.com
+# Public marketing pages are crawlable; the authenticated app is not (it requires
+# login and returns no useful content to crawlers). Staging is kept out of the index
+# via an X-Robots-Tag header (Cloudflare) + a host check in index.html.
+
+User-agent: *
+Allow: /
+
+# Authenticated app surfaces — no value to index, save crawl budget.
+Disallow: /projects
+Disallow: /new-project
+Disallow: /chat
+Disallow: /compare
+Disallow: /full-pipeline
+Disallow: /deliverable
+Disallow: /dashboard
+Disallow: /messages
+Disallow: /reports
+Disallow: /settings
+Disallow: /firm
+
+Sitemap: https://grounded-iq.com/sitemap.xml

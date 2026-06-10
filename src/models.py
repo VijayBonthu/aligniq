@@ -5,7 +5,7 @@ from config import settings
 import uuid
 from sqlalchemy.sql.sqltypes import TIMESTAMP
 from sqlalchemy.sql.expression import text
-from sqlalchemy.dialects.postgresql import JSON
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy import Column, String, DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
@@ -85,6 +85,10 @@ class User(Base):
     # Firm membership (migration 019, Bet 3)
     firm_id                 = Column(String, ForeignKey("firms.firm_id"), nullable=True, index=True)
     firm_role               = Column(String(32), nullable=True)  # 'firm_admin' | 'member'
+    # Platform (GroundedIQ) staff — gates the /admin ops console. Distinct from
+    # firm_role (which is per-customer-firm). Migration 0010. Granted via the
+    # X-Admin-Key break-glass endpoint /admin/set-staff.
+    is_staff                = Column(Boolean, nullable=False, server_default=text("false"))
 
 class LoginDetails(Base):
     __tablename__="login_details"
@@ -833,3 +837,63 @@ class FirmPastProject(Base):
     effort_estimated_weeks  = Column(Float, nullable=True)
     effort_actual_weeks     = Column(Float, nullable=True)
     created_at              = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+
+
+# ---------------------------------------------------------------------------
+# Operational control plane (migration 0010) — dynamic, no-restart site config.
+# Durable in Postgres (Redis here is non-persistent, so it can't be the source
+# of truth for "are we in maintenance"). Read via utils.ops_state.get_ops_state()
+# behind a short TTL cache; admin writes call ops_state.invalidate().
+# ---------------------------------------------------------------------------
+class SiteSetting(Base):
+    """Key/value operational config so a new flag needs no migration. Seeded keys:
+      - 'maintenance'    {on, title, message, eta, allowlist_ips[], allowlist_emails[]}
+      - 'read_only'      {on, message}
+      - 'feature_flags'  {signups_enabled, logins_enabled, pipeline_enabled}
+    """
+    __tablename__ = "site_settings"
+    key        = Column(String(64), primary_key=True)
+    value      = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
+    updated_by = Column(String, nullable=True)
+
+
+class Announcement(Base):
+    """User-facing banner shown by the SPA via GET /site-config. Time-windowed +
+    dismissible. `kind` drives the colour; `audience` is 'all' | 'authenticated' | 'users'."""
+    __tablename__ = "announcements"
+    id          = Column(String, primary_key=True, default=new_id)
+    kind        = Column(String(20), nullable=False, server_default=text("'info'"))  # info|warning|outage|maintenance|success
+    title       = Column(String(200), nullable=False)
+    body        = Column(Text, nullable=True)
+    active      = Column(Boolean, nullable=False, server_default=text("true"))
+    starts_at   = Column(TIMESTAMP(timezone=True), nullable=True)
+    ends_at     = Column(TIMESTAMP(timezone=True), nullable=True)
+    dismissible = Column(Boolean, nullable=False, server_default=text("true"))
+    audience    = Column(String(20), nullable=False, server_default=text("'all'"))  # all|authenticated|users
+    link_url    = Column(String(500), nullable=True)
+    link_label  = Column(String(80), nullable=True)
+    # When audience='users', the explicit recipient emails (lowercased list). Served ONLY
+    # via the authenticated /my-site-config endpoint (matched server-side against the
+    # caller's email) — never the public /site-config — so the recipient list is never
+    # exposed to anonymous clients.
+    target_emails = Column(JSONB, nullable=True)
+    created_at  = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at  = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
+    created_by  = Column(String, nullable=True)
+
+
+class ChangelogEntry(Base):
+    """Product 'what's new' feed. Only `published` entries surface in the app."""
+    __tablename__ = "changelog_entries"
+    id           = Column(String, primary_key=True, default=new_id)
+    version      = Column(String(40), nullable=True)
+    title        = Column(String(200), nullable=False)
+    body         = Column(Text, nullable=True)
+    category     = Column(String(20), nullable=True)  # feature|fix|improvement
+    media_url    = Column(String(500), nullable=True)  # optional GIF/image URL shown in "What's new"
+    published    = Column(Boolean, nullable=False, server_default=text("false"))
+    published_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    created_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
+    created_by   = Column(String, nullable=True)

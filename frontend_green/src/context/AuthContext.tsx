@@ -14,6 +14,8 @@ interface UserData {
   role?: string;
   firm_id?: string;
   firm_role?: FirmRole;
+  // Platform-admin (GroundedIQ staff) — gates the /admin ops console + maintenance bypass.
+  is_staff?: boolean;
   iat: number;
   exp: number;
 }

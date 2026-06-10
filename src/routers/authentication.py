@@ -122,6 +122,7 @@ def _build_session_payload(user: User, login_provider: str = None) -> dict:
         "email": user.email_address,
         "firm_id": user.firm_id,
         "firm_role": user.firm_role,
+        "is_staff": bool(getattr(user, "is_staff", False)),
     }
 
 

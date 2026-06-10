@@ -144,6 +144,22 @@ async def require_verified_email(current: dict = Depends(token_validator)) -> di
         )
     return current
 
+
+async def require_staff(current: dict = Depends(token_validator), db: Session = Depends(models.get_db)) -> dict:
+    """Platform-admin gate for the /admin ops console. Authoritative: checks the DB
+    `is_staff` flag rather than trusting a (possibly stale) token claim, so revoking
+    staff takes effect immediately. JWT user id is the 'id' claim (see
+    authentication._build_session_payload)."""
+    tok = current.get("regular_login_token") or {}
+    user_id = tok.get("id")
+    user = db.query(models.User).filter(models.User.user_id == user_id).first() if user_id else None
+    if not user or not getattr(user, "is_staff", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "Staff access required.", "code": "NOT_STAFF"},
+        )
+    return current
+
 def hash_passwords(password:str):
     return pwd_context.hash(password)
 

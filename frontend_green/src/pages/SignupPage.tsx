@@ -154,7 +154,7 @@ const SignupPage: React.FC = () => {
               <button type="submit" className="btn btn-primary auth-submit btn-lg">Continue →</button>
 
               <div className="auth-terms">
-                By creating an account you agree to our <a href="#">Terms</a> and <a href="#">Privacy Policy</a>.
+                By creating an account you agree to our <Link to="/terms">Terms</Link> and <Link to="/privacy">Privacy Policy</Link>.
               </div>
               <div className="auth-footer-link">
                 Already have an account? <Link to="/login">Sign in</Link>

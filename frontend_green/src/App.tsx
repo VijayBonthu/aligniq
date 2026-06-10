@@ -3,6 +3,8 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'react-hot-toast';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { SiteConfigProvider } from './context/SiteConfigContext';
+import MaintenanceGate from './components/ops/MaintenanceGate';
 import { ThemeProvider } from './context/ThemeContext';
 import ThemeToggle from './components/layout/ThemeToggle';
 import LandingPage from './pages/LandingPage';
@@ -22,10 +24,14 @@ import Messages from './pages/Messages';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
+import TermsPage from './pages/legal/TermsPage';
+import PrivacyPage from './pages/legal/PrivacyPage';
 import AppShell from './components/layout/AppShell';
 import ErrorBoundary from './components/ErrorBoundary';
 import UpgradeModal from './components/billing/UpgradeModal';
 import FirmAdminRoute from './components/auth/FirmAdminRoute';
+import StaffRoute from './components/auth/StaffRoute';
+import AdminConsole from './pages/admin/AdminConsole';
 import FirmSettings from './pages/firm/FirmSettings';
 import RateCardPage from './pages/firm/RateCard';
 import TeamTemplatesPage from './pages/firm/TeamTemplates';
@@ -114,6 +120,7 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
         <AuthProvider>
+          <SiteConfigProvider>
           <Toaster
             position="top-right"
             toastOptions={{
@@ -133,6 +140,7 @@ function App() {
           <PublicThemeToggle />
           <GlobalUpgradeModal />
           <UpgradeReturnRefresher />
+          <MaintenanceGate>
           <Routes>
             <Route path="/" element={<LandingPage />} />
             <Route path="/login" element={<LoginPage />} />
@@ -141,6 +149,8 @@ function App() {
             <Route path="/verify-email" element={<VerifyEmailPage />} />
             <Route path="/verify-email-required" element={<VerifyEmailRequiredPage />} />
             <Route path="/pricing" element={<PricingPage />} />
+            <Route path="/terms" element={<TermsPage />} />
+            <Route path="/privacy" element={<PrivacyPage />} />
             <Route
               path="/projects"
               element={
@@ -242,6 +252,16 @@ function App() {
               }
             />
             <Route
+              path="/admin"
+              element={
+                <StaffRoute>
+                  <AppShell>
+                    <AdminConsole />
+                  </AppShell>
+                </StaffRoute>
+              }
+            />
+            <Route
               path="/dashboard"
               element={
                 <ProtectedRoute>
@@ -329,6 +349,8 @@ function App() {
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </MaintenanceGate>
+          </SiteConfigProvider>
         </AuthProvider>
         </ThemeProvider>
       </QueryClientProvider>

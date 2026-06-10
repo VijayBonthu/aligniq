@@ -9,10 +9,14 @@ import models
 from models import engine
 from config import settings
 from fastapi.middleware.cors import CORSMiddleware
-from routers import authentication, services, third_party_integrations, billing, firm_admin
+from routers import authentication, services, third_party_integrations, billing, firm_admin, admin_ops
 from utils.logger import setup_logger
 from utils.rate_limit import lifespan as rate_limit_lifespan
-from utils.middleware import CSRFMiddleware, RateLimitMiddleware
+from utils.middleware import CSRFMiddleware, RateLimitMiddleware, MaintenanceMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from utils.ids import new_id
 
 # Setup logging once at application startup
 logger = setup_logger()
@@ -143,12 +147,14 @@ origins = (
     else _default_local_origins
 )
 # Middleware order: Starlette wraps last-added on the outside, so request flow is
-# CORS -> CSRF -> RateLimit -> handler. CORS is outermost so rejected responses
-# (429 from rate-limit, 403 from CSRF) still carry Access-Control-* headers and stay
-# readable by the browser instead of surfacing as opaque CORS/network errors. CSRF
-# still runs before RateLimit, so CSRF-invalid requests don't consume rate-limit quota.
+# CORS -> Maintenance -> CSRF -> RateLimit -> handler. CORS is outermost so rejected
+# responses (503 maintenance, 429 rate-limit, 403 CSRF) still carry Access-Control-*
+# headers and stay readable by the browser instead of surfacing as opaque CORS/network
+# errors. Maintenance runs before CSRF/RateLimit so a maintenance/read-only block
+# neither 403s on a missing CSRF token nor consumes rate-limit quota.
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(CSRFMiddleware)
+app.add_middleware(MaintenanceMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -162,6 +168,54 @@ app.include_router(services.router, prefix="/api/v1", tags=["services"])
 app.include_router(third_party_integrations.router, prefix="/api/v1", tags=["third party integrations"])
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(firm_admin.router, prefix="/api/v1", tags=["firm"])
+app.include_router(admin_ops.router, prefix="/api/v1", tags=["ops"])
+
+
+# ---------------------------------------------------------------------------
+# Friendly errors. Users never see stack traces or internal codes; the full
+# detail is logged with an incident_id so support can find it by reference.
+# 4xx details are author-written for users (e.g. "Incorrect email or password",
+# EMAIL_NOT_VERIFIED / NOT_STAFF, rate-limit) so they pass through unchanged.
+# ---------------------------------------------------------------------------
+_GENERIC_500 = ("Something went wrong on our end. Please try again — if it keeps "
+                "happening, contact support with this reference.")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    headers = getattr(exc, "headers", None) or {}
+    if exc.status_code >= 500:
+        incident_id = new_id()
+        logger.error(f"HTTP {exc.status_code} incident={incident_id} "
+                     f"{request.method} {request.url.path}: {exc.detail}")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "internal_error", "message": _GENERIC_500, "incident_id": incident_id},
+            headers=headers,
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Keep `detail` for any existing client code that reads it; add a friendly message.
+    return JSONResponse(
+        status_code=422,
+        content={"error": "invalid_request",
+                 "message": "Some of the submitted details look invalid. Please check and try again.",
+                 "detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    incident_id = new_id()
+    logger.exception(f"UNHANDLED incident={incident_id} {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "message": _GENERIC_500, "incident_id": incident_id},
+    )
+
 
 @app.get("/")
 async def home():

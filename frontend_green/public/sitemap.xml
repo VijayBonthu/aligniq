@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Only the homepage is listed. The site is a single-page app served from S3, whose
+  website config returns HTTP 404 for any non-root path (only "/" is the 200 index
+  document). The landing page already contains the features, pricing and FAQ content
+  inline (#features / #pricing / #faq), so it is the canonical SEO surface.
+  Add more <url> entries here only once those routes serve a real 200 (e.g. prerender).
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://grounded-iq.com/</loc>
+    <lastmod>2026-06-09</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>

@@ -49,7 +49,7 @@ const FAQS = [
   { q: 'What does the output look like?',
     a: 'A structured alignment report: risks ranked by severity, clarifying questions, a first-pass architecture, week-level phasing, and a resource plan. All Markdown-exportable.' },
   { q: 'Is my client data used for training?',
-    a: 'No. Inputs are processed ephemerally and are not used to train any models. SOC 2 Type II, GDPR, ISO 27001.' },
+    a: 'No. Your documents are processed only to generate your report and are never used to train any AI models.' },
 ];
 
 const LandingPage: React.FC = () => {
@@ -259,7 +259,10 @@ const LandingPage: React.FC = () => {
 
           <div className="footer-bottom">
             <span>© 2026 GroundedIQ, Inc.</span>
-            <span>SOC 2 Type II · GDPR · ISO 27001</span>
+            <span style={{ display: 'flex', gap: 18 }}>
+              <Link to="/privacy">Privacy</Link>
+              <Link to="/terms">Terms</Link>
+            </span>
           </div>
         </div>
       </section>
