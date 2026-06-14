@@ -40,14 +40,19 @@ jobs:
 
       - run: npm ci
 
-      # Vite inlines VITE_* at build time, so the API URL must be set here.
-      # VITE_API_URL is an environment variable (staging vs production). Trim any
-      # stray whitespace/newline so Vite doesn't bake in ".../api/v1%20/...".
+      # Vite inlines VITE_* at build time, so anything the SPA needs baked in must
+      # be set here. VITE_API_URL and VITE_TURNSTILE_SITE_KEY are per-environment
+      # variables (staging vs production). Trim stray whitespace/newline so Vite
+      # doesn't bake in ".../api/v1%20/..." or a key with a trailing newline.
+      # (The Stripe publishable key is NOT here — the SPA fetches it at runtime
+      # from GET /billing/publishable-key.)
       - name: Build
         env:
           VITE_API_URL_RAW: ${{ vars.VITE_API_URL }}
+          VITE_TURNSTILE_SITE_KEY_RAW: ${{ vars.VITE_TURNSTILE_SITE_KEY }}
         run: |
           export VITE_API_URL="$(printf '%s' "$VITE_API_URL_RAW" | tr -d '[:space:]')"
+          export VITE_TURNSTILE_SITE_KEY="$(printf '%s' "$VITE_TURNSTILE_SITE_KEY_RAW" | tr -d '[:space:]')"
           npm run build
 
       - name: Configure AWS credentials

@@ -33,10 +33,13 @@ export type PipelineStatus =
   | 'failed'
   | 'cancelled';
 
+export type QuestionnaireStatus = 'none' | 'sent' | 'started' | 'submitted';
+
 export interface ProjectRow {
   chat_history_id: string;
   document_id: string | null;
   title: string;
+  custom_title: string | null;
   analysis_mode: 'presales' | 'full';
   presales_id: string | null;
   full_report_generated: boolean;
@@ -48,6 +51,8 @@ export interface ProjectRow {
   report_versions: number;
   last_message_preview: string;
   pipeline_status: PipelineStatus;
+  questionnaire_status: QuestionnaireStatus;
+  client_submitted_at: string | null;
 }
 
 export interface InboxQuestion {

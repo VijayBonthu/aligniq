@@ -159,8 +159,10 @@ api.interceptors.response.use(
 );
 
 // Map any axios error to a user-safe message. Components should use this instead of
-// reading `error.response.data.detail` directly, so internal/5xx text never reaches users.
-export function friendlyError(error: unknown): string {
+// reading `error.response.data.detail` directly, so internal/5xx text never reaches users
+// — and so an object `detail` (e.g. a 402 limit payload) is never handed to a React renderer
+// like toast.error(), which crashes on a non-string child.
+export function friendlyError(error: unknown, fallback = 'Something went wrong. Please try again.'): string {
   const e = error as { response?: { status?: number; data?: { detail?: unknown; message?: string; incident_id?: string } } };
   if (!e?.response) return 'Network error — please check your connection and try again.';
   const { status, data } = e.response;
@@ -172,7 +174,24 @@ export function friendlyError(error: unknown): string {
     return (data.detail as { error: string }).error;
   }
   if (typeof data?.message === 'string') return data.message;
-  return 'Something went wrong. Please try again.';
+  return fallback;
+}
+
+// A metering / quota 402 — its `detail` carries a `limit_type`. The response interceptor above
+// already dispatched `billing:limit-hit` for these, so the global UpgradeModal is on its way up;
+// callers must NOT also toast them.
+export function isLimitError(error: unknown): boolean {
+  const e = error as { response?: { status?: number; data?: { detail?: { limit_type?: string } } } };
+  return e?.response?.status === 402 && !!e?.response?.data?.detail?.limit_type;
+}
+
+// Toast a user-safe string for an error — UNLESS it's a limit 402 (handled globally by the
+// UpgradeModal). Use this in component catch blocks instead of reading `detail` directly: it can
+// be an object, and passing one to toast.error() throws "Objects are not valid as a React child",
+// which trips the error boundary into the full-page "Something went wrong".
+export function notifyError(error: unknown, fallback?: string): void {
+  if (isLimitError(error)) return;
+  toast.error(friendlyError(error, fallback));
 }
 
 export default api;

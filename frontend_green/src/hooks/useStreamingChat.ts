@@ -47,7 +47,9 @@ export interface StreamChatParams {
   onToolStart?: (toolName: string, args?: Record<string, unknown>) => void;
   onToolResult?: (toolName: string, result: string) => void;
   onComplete?: (content: string, toolsUsed: Array<{ tool: string }>) => void;
-  onError?: (error: string) => void;
+  // `silent` marks an error already surfaced elsewhere (e.g. a limit 402 that raises the global
+  // UpgradeModal) — the caller should show it in-line without an extra toast.
+  onError?: (error: string, opts?: { silent?: boolean }) => void;
 }
 
 export interface UseStreamingChatReturn extends StreamingState {
@@ -115,7 +117,26 @@ export function useStreamingChat(): UseStreamingChatReturn {
         response = await makeRequest(newToken);
       }
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+      if (!response.ok) {
+        const bodyText = await response.text();
+        // A metering 402 (e.g. the per-chat message cap). This is a raw fetch, so it bypasses the
+        // axios interceptor that normally raises the UpgradeModal — mirror that here by dispatching
+        // billing:limit-hit, then surface a clean message the caller shows silently (no toast on
+        // top of the modal). Without this, the cap would throw a raw `HTTP 402: {json}` error.
+        if (response.status === 402) {
+          try {
+            const detail = JSON.parse(bodyText)?.detail;
+            if (detail && typeof detail === 'object' && detail.limit_type) {
+              window.dispatchEvent(new CustomEvent('billing:limit-hit', { detail }));
+              const msg = typeof detail.error === 'string' ? detail.error : 'You have reached a usage limit.';
+              setState(p => ({ ...p, isStreaming: false, error: msg, currentTool: null, toolStatus: 'idle', thinkingMessage: null }));
+              onError?.(msg, { silent: true });
+              return accumulatedContent;
+            }
+          } catch { /* not JSON — fall through to the generic error */ }
+        }
+        throw new Error(`HTTP ${response.status}: ${bodyText}`);
+      }
 
       const reader = response.body?.getReader();
       if (!reader) throw new Error('No response body reader');

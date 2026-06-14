@@ -47,11 +47,26 @@ export async function removePanelist(
 
 export async function applyItemAction(
   chatHistoryId: string,
-  body: { turn_id: string; panelist_id: string; item_id: string; action: ItemAction },
+  body: {
+    turn_id: string; panelist_id: string; item_id: string; action: ItemAction;
+    counter_response?: string; came_up?: boolean | null;
+  },
 ): Promise<{ thread: Thread; action_result: ItemActionResult }> {
   const { data } = await api.post<{ thread: Thread; action_result: ItemActionResult }>(
     `/pre-mortem/${chatHistoryId}/item-action`,
     body,
+  );
+  return data;
+}
+
+/** Download the deterministic Defense Brief. format 'md' → {markdown}; 'pdf' → base64. */
+export async function getDefenseBrief(
+  chatHistoryId: string,
+  format: 'md' | 'pdf' = 'pdf',
+  group: 'severity' | 'panelist' = 'severity',
+): Promise<{ markdown?: string; pdf_base64?: string; filename?: string }> {
+  const { data } = await api.get(
+    `/pre-mortem/${chatHistoryId}/defense-brief?format=${format}&group=${group}`,
   );
   return data;
 }

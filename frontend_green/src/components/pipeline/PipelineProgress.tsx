@@ -36,6 +36,7 @@ const LEGACY_STAGES: StageDef[] = [
 
 const CONTRACT_STAGES: StageDef[] = [
   { id: 'plan',                label: 'Planning report contract',         icon: '🧠' },
+  { id: 'research',            label: 'Researching the real world',       icon: '🔎' },
   { id: 'decide',              label: 'Deciding solution & estimate',     icon: '📐' },
   { id: 'write_sections',      label: 'Writing sections in parallel',     icon: '✍' },
   { id: 'judge_and_finalize',  label: 'Judging and finalizing',           icon: '⚖' },

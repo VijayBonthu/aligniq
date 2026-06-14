@@ -73,6 +73,10 @@ async def _load_report(force: bool = False):
         report = SimpleNamespace(
             report_content=getattr(row, "report_content", None),
             summary_report=getattr(row, "summary_report", None),
+            # Typed decision artifact (plain JSON dict, NOT a ReportContract;
+            # legacy rows are None — read defensively). Powers the reality-gap
+            # and what-if tools.
+            report_contract=getattr(row, "report_contract", None),
             # The column is version_number (there is no `version` attribute); read
             # the right one so the active version can be surfaced. Keep a `version`
             # alias for any back-compat readers.
@@ -2000,169 +2004,32 @@ async def regenerate_report(include_changes: bool = True) -> str:
                     "action": "resolve_conflicts"
                 })
 
-        # Step 3: GET FULL REGENERATION CONTEXT (document, presales data, Q&A, etc.)
+        # Step 3+: kick off the SAME async pipeline the changes-queue button and the
+        # REST /report/regenerate endpoint use (the contract pipeline when
+        # USE_CONTRACT_PIPELINE=true). The old path ran the legacy 9-agent
+        # run_pipeline_with_constraints inline here — that's the bug being fixed.
+        # Async, so we return "started"; the new version persists when the run finishes.
         try:
-            regen_context = await get_regeneration_context(chat_history_id, user_id, db)
-        except Exception as e:
-            logger.error(f"Failed to get regeneration context: {str(e)}")
+            from fastapi import HTTPException
+            from agents.pipeline_runner import kickoff_regeneration
+            run = await kickoff_regeneration(chat_history_id, user_id, db)
+            n = len(pending_changes)
             return json.dumps({
-                "status": "error",
-                "message": "Could not retrieve the necessary context for regeneration. Please try again.",
-                "action": "context_error"
+                "status": "started",
+                "action": "regeneration_started",
+                "run_id": run.get("run_id"),
+                "changes_applied": n,
+                "message": (
+                    f"**Regeneration started** — applying {n} change(s) through the full pipeline. "
+                    "This takes a couple of minutes; track progress in the pipeline view and the new "
+                    "version will appear when it's ready."
+                ),
             })
-
-        # Step 4: RUN FULL 9-AGENT PIPELINE WITH CONSTRAINTS
-        try:
-            # Document needs to be in list format for pipeline
-            document_chunks = [regen_context.get("document_text", "")]
-
-            # Build presales context dict with all available data
-            presales_context = {
-                "scanned_requirements": regen_context.get("scanned_requirements"),
-                "blind_spots": regen_context.get("blind_spots"),
-                "assumptions_list": regen_context.get("assumptions_list", []),
-                "questions_and_answers": regen_context.get("questions_and_answers", []),
-                "additional_context": regen_context.get("additional_context", ""),
-                "user_answers": regen_context.get("user_answers", {})
-            }
-
-            logger.info(
-                f"Starting regeneration for chat_history_id: {chat_history_id} with "
-                f"{len(pending_changes)} changes, {len(presales_context.get('questions_and_answers', []))} Q&A pairs"
-            )
-
-            result = await run_pipeline_with_constraints(
-                document=document_chunks,
-                pending_changes=pending_changes,
-                presales_context=presales_context,
-                timeout=settings.PIPELINE_TIMEOUT or 600  # 10 min for full pipeline
-            )
-
-            if result.get("error"):
-                raise Exception(result["error"])
-
-            regenerated_report = result["report"]
-            processing_time = result.get("processing_time", time.time() - start_time)
-            logger.info(f"Full pipeline completed in {processing_time:.2f}s with {len(pending_changes)} constraints")
-
+        except HTTPException as he:
+            return json.dumps({"status": "error", "action": "regen_error", "message": f"Couldn't start regeneration: {he.detail}"})
         except Exception as e:
-            logger.error(f"Report generation failed: {str(e)}")
-            return json.dumps({
-                "status": "error",
-                "message": f"Report generation encountered an error: {str(e)}\n\nPlease try again. If the problem persists, try removing some pending changes and regenerating.",
-                "action": "pipeline_error"
-            })
-
-        # Step 5: GENERATE REPORT SUMMARY
-        try:
-            new_version_number = regen_context.get("current_version", 0) + 1
-            summary_report = await main_report_summary(regenerated_report, new_version_number)
-        except Exception as e:
-            logger.error(f"Failed to generate report summary: {str(e)}")
-            summary_report = {"version": f"v{new_version_number}", "error": "Summary generation failed"}
-
-        # Step 5.5: GENERATE CHANGELOG SUMMARY
-        changelog_summary = None
-        parent_version_id = None
-        try:
-            # Get previous version's summary for comparison
-            previous_summary = regen_context.get("previous_summary", {})
-            parent_version_id = regen_context.get("previous_version_id")
-            previous_version_number = regen_context.get("current_version", 0)
-
-            if previous_summary:
-                previous_exec_summary = previous_summary.get("executive_summary", "") if isinstance(previous_summary, dict) else str(previous_summary)
-                new_exec_summary = summary_report.get("executive_summary", "") if isinstance(summary_report, dict) else str(summary_report)
-
-                changelog_summary = await generate_changelog_summary(
-                    previous_summary=previous_exec_summary,
-                    new_summary=new_exec_summary,
-                    changes_applied=pending_changes,
-                    previous_version=previous_version_number,
-                    new_version=new_version_number
-                )
-                logger.info(f"Generated changelog summary for v{previous_version_number} -> v{new_version_number}")
-            else:
-                changelog_summary = f"Version {new_version_number} created with {len(pending_changes)} change(s) applied."
-        except Exception as e:
-            logger.warning(f"Failed to generate changelog summary (non-fatal): {str(e)}")
-            changelog_summary = f"Version {new_version_number} created with {len(pending_changes)} change(s) applied."
-
-        # Step 6: CREATE NEW REPORT VERSION IN DB
-        try:
-            version_result = await create_new_report_version(
-                chat_history_id=chat_history_id,
-                user_id=user_id,
-                report_content=regenerated_report,
-                summary_report=summary_report,
-                changes_applied=pending_changes,
-                db=db,
-                changelog_summary=changelog_summary,
-                parent_version_id=parent_version_id
-            )
-            new_version = version_result.get("version_number", new_version_number)
-        except Exception as e:
-            logger.error(f"Failed to create new report version: {str(e)}")
-            return json.dumps({
-                "status": "partial_success",
-                "message": f"Report was generated but couldn't be saved: {str(e)}\n\nPlease try again.",
-                "action": "save_error",
-                "report_content": regenerated_report  # Include report even if save failed
-            })
-
-        # Step 7: UPDATE VECTOR DB (non-fatal if fails). Section-aware + metadata.
-        try:
-            _invalidate_report_cache()  # new version persisted above — serve fresh
-            await embed_report(
-                markdown=regenerated_report,
-                model=settings.EMBEDDING_MODEL,
-                chat_history_id=chat_history_id,
-            )
-            logger.info("Updated vector DB (section-aware) after regeneration")
-        except Exception as e:
-            logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
-
-        # Step 8: CLEAR PENDING CHANGES (non-fatal if fails)
-        try:
-            await clear_pending_changes(chat_history_id, db)
-            logger.info(f"Cleared {len(pending_changes)} pending changes after regeneration")
-        except Exception as e:
-            logger.warning(f"Failed to clear pending changes (non-fatal): {str(e)}")
-
-        # Step 9: RECORD TRANSACTION
-        try:
-            await record_transaction(
-                chat_history_id=chat_history_id,
-                action_type="regenerate_report",
-                action_data={
-                    "changes_applied": len(pending_changes),
-                    "new_version": new_version,
-                    "processing_time": processing_time
-                },
-                description=f"Regenerated report v{new_version} with {len(pending_changes)} changes",
-                db=db
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record transaction (non-fatal): {str(e)}")
-
-        # Step 10: BUILD SUCCESS RESPONSE
-        changes_summary = "\n".join([
-            f"- {c.get('id', 'CHG-?')}: {c.get('user_request', '')[:60]}..."
-            for c in pending_changes[:5]
-        ])
-        if len(pending_changes) > 5:
-            changes_summary += f"\n- ... and {len(pending_changes) - 5} more"
-
-        return json.dumps({
-            "status": "success",
-            "message": f"**Report Regenerated Successfully** (Version {new_version})\n\nApplied {len(pending_changes)} change(s):\n{changes_summary}\n\nThe report has been updated with all your requested modifications.",
-            "action": "report_regenerated",
-            "version_number": new_version,
-            "changes_applied": len(pending_changes),
-            "processing_time": f"{processing_time:.1f} seconds",
-            "report_content": regenerated_report,
-            "summary": summary_report.get("executive_summary", "")[:500] if isinstance(summary_report, dict) else ""
-        })
+            logger.error(f"Failed to start regeneration: {str(e)}")
+            return json.dumps({"status": "error", "action": "regen_error", "message": f"Could not start regeneration: {str(e)}"})
 
     except Exception as e:
         logger.error(f"Unexpected error in regenerate_report: {str(e)}")
@@ -2365,6 +2232,12 @@ def get_all_tools() -> list:
         firm_project_search,
         # Delivery handoff — turn the report into Jira tickets
         push_to_jira,
+        # Live advisor tools — on-demand web research, the typed gap picture,
+        # and instant deterministic what-if estimates
+        research_live,
+        deep_research,
+        get_reality_gap,
+        whatif_estimate,
         # Optimization & Analysis tools
         suggest_optimization,
         analyze_cost_reduction,
@@ -2392,7 +2265,7 @@ def get_all_tools() -> list:
 
 
 # System prompt for tool-enabled chat
-TOOL_SYSTEM_PROMPT = """You are ALIGN IQ, an expert AI assistant for project analysis and technical consulting. You help users understand, refine, and improve their project analysis reports.
+TOOL_SYSTEM_PROMPT = """You are ALIGN IQ, a LIVE solution architect for this engagement — not a report-lookup bot. The report is your starting brief; you can research the current real world, read the engagement's typed decision model, recompute estimates deterministically, and evolve the report through the change queue. Every conversation should leave the engagement sharper than it found it.
 
 ## Your Role
 
@@ -2439,6 +2312,14 @@ When answering ANY question, automatically include relevant:
 - **Blind spots** if presales analysis exists (hidden complexities, red flags)
 
 ## Your Capabilities
+
+### Live Advisor Tools (what makes you an architect, not a search box)
+- **research_live(query, focus)**: QUICK web research (one search). Use for a fast fact-check — a tool capability, current pricing, a single known issue. Cite ONLY the returned urls as [title](url) links — NEVER invent a link. If results are thin, say so.
+- **deep_research(topic, angle)**: THOROUGH multi-round research (1-2 min): searches, reads the key pages in full, follows up, returns a typed dossier — sourced findings with verbatim quotes, prior art (who tried this, what happened), existing libraries/tools, honest gaps. Use when the user says "research X (deeply)", "has anyone done X", "what libraries/options exist for X", or when one search clearly won't cut it. angle weights the pass: prior_art | libraries | limits | benchmarks. Tell the user it takes a minute or two before calling it.
+- **get_reality_gap()**: The engagement's typed gap picture — problem profile, core challenge, what the client's brief understates (quote-anchored underplay flags), every assumption, open questions, staffing gaps, verdict conditions, and the pipeline's own confidence notes. Read it before any advisory answer about risk, scope, confidence, or "what could go wrong".
+- **whatif_estimate(apply_conditions, hours_delta_pct, contingency_pct_override)**: Instant, deterministic estimate scenarios computed in Python from the typed cost model — "what if Salesforce is in scope?" / "worst case?" / "+20% effort?" — WITHOUT a regeneration. NEVER do estimate arithmetic yourself; call this and quote its numbers.
+
+**THE ADVISOR LOOP (your defining behavior):** when research or conversation surfaces something material — a risk, a disproven assumption, a better option, a resolved open question — do not let it die in chat. Say what it changes, then OFFER to queue it with add_pending_change so the next regeneration bakes it into the plan of record. An insight that never reaches the report is a dropped requirement.
 
 ### Document & Report Tools
 - **search_document(query)**: Search the uploaded document and report for specific content using semantic search
@@ -2839,3 +2720,325 @@ async def push_to_jira(scope: str = "risks", project_key: str = None) -> str:
     except Exception as e:
         logger.warning(f"push_to_jira failed: {e}")
         return json.dumps({"status": "error", "message": str(e)})
+
+
+# ============= LIVE ADVISOR TOOLS =============
+# The pipeline researches once at generation time; these make the CHAT a live
+# solution architect: on-demand web research with real sources, the typed
+# reality-gap/assumption picture, and instant deterministic what-if estimates
+# (no 3-minute regen for "what if Salesforce is in scope?").
+
+
+def _contract_dict() -> Optional[dict]:
+    """The active version's report_contract as a plain dict, or None.
+
+    Stored as JSON (never a ReportContract instance); legacy rows are None.
+    Callers must read keys defensively."""
+    report = tool_context._report
+    contract = getattr(report, "report_contract", None) if report else None
+    return contract if isinstance(contract, dict) else None
+
+
+@tool
+async def research_live(query: str, focus: str = "general", max_results: int = 5) -> str:
+    """Run LIVE web research (real internet search) to ground an answer in current
+    sources — use whenever the user asks for research, evidence, benchmarks,
+    current capabilities/pricing of a tool, or whether a claim in the report
+    still holds.
+
+    Args:
+        query: What to research. Name actual technologies/versions ("LangGraph production failure modes"), not vague topics.
+        focus: 'general' | 'known_issues' (production gotchas for a tech/integration) | 'benchmarks' (comparable project costs/efforts/case studies).
+        max_results: How many sources to fetch (default 5, max 8).
+
+    Returns findings with REAL urls. CITE ONLY THESE URLS — never invent or
+    embellish a link. If findings are thin, say so plainly instead of padding.
+    """
+    from config import settings
+    from utils.web_research import tavily_search
+
+    if not settings.TAVILY_API_KEY:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "Live research is not configured (no TAVILY_API_KEY). Answer from the report and your expertise, and label unverified claims as assumptions.",
+        })
+
+    q = (query or "").strip()
+    if not q:
+        return json.dumps({"status": "error", "message": "Empty query."})
+    shaped = {
+        "known_issues": f"{q} known issues production gotchas pitfalls",
+        "benchmarks": f"{q} cost effort benchmark case study real-world",
+    }.get(focus, q)
+
+    results = await tavily_search(shaped, max_results=min(max(int(max_results or 5), 1), 8))
+    if not results:
+        return json.dumps({
+            "status": "no_results",
+            "message": "Search returned nothing usable. Say so honestly; do not fabricate sources.",
+            "query": shaped,
+        })
+
+    findings = [
+        {"title": r["title"], "url": r["url"], "snippet": (r.get("content") or "")[:600]}
+        for r in results
+    ]
+    return json.dumps({
+        "status": "success",
+        "query": shaped,
+        "findings": findings,
+        "instructions": (
+            "Synthesize an answer citing these urls as [title](url) markdown links — only these urls. "
+            "If a finding materially affects the report (a risk, a capability limit, a better option), "
+            "say so and OFFER to queue it via add_pending_change so the report can evolve."
+        ),
+    })
+
+
+@tool
+async def deep_research(topic: str, angle: str = "general") -> str:
+    """THOROUGH multi-round web research on a topic (the same iterative engine
+    that grounds report generation): searches, reads the most load-bearing pages
+    in full, follows up, and returns a typed dossier — findings with verbatim
+    quotes, prior art (who tried this and what happened), existing libraries,
+    and honest gaps. Takes 1-2 minutes. Use when the user asks to "research X",
+    "go deep on X", "has anyone done X", or when research_live's single search
+    is clearly too shallow for the question.
+
+    Args:
+        topic: What to research, specific ("agentic LLM migration of large Silverlight codebases"), not vague ("migration").
+        angle: 'general' | 'prior_art' | 'libraries' | 'limits' | 'benchmarks' — what to weight.
+
+    Premium-tier feature: on free/basic this degrades to a single quick search.
+    Cite ONLY returned urls. After synthesizing, offer to queue material
+    findings via add_pending_change so the report evolves.
+    """
+    from config import settings
+
+    if not settings.TAVILY_API_KEY:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "Live research is not configured (no TAVILY_API_KEY).",
+        })
+
+    t = (topic or "").strip()
+    if not t:
+        return json.dumps({"status": "error", "message": "Empty topic."})
+
+    # Tier gate — the iterative engine is frontier-only; lite degrades gracefully
+    # to one quick search (research_live behavior) with an upgrade note.
+    tier = "frontier"
+    try:
+        from utils.subscription import get_model_tier
+        tier = get_model_tier(tool_context.user_id, tool_context.db)
+    except Exception as e:  # noqa: BLE001 — a tier lookup blip must not break chat
+        logger.warning(f"deep_research: tier lookup failed ({e}); defaulting to frontier")
+    if tier != "frontier":
+        from utils.web_research import tavily_search
+        results = await tavily_search(t, max_results=5)
+        return json.dumps({
+            "status": "quick_only",
+            "message": (
+                "Deep research (multi-round, full-page reading, prior art) is a Plus/Pro feature; "
+                "ran a quick single search instead. Mention the upgrade ONCE, briefly, then answer from these."
+            ),
+            "findings": [
+                {"title": r["title"], "url": r["url"], "snippet": (r.get("content") or "")[:600]}
+                for r in results
+            ],
+        })
+
+    # Frontier: aim the pipeline's research agent at the topic, seeded with the
+    # engagement's context so findings are relevant to THIS project.
+    from agents.contract import ReportContract
+    from agents.contract_workflow import _resolve_smart
+    from agents.research_agent import run_deep_research
+
+    await _load_report()
+    contract_d = _contract_dict() or {}
+    angle_queries = {
+        "prior_art": [f"case study postmortem {t}", f"who has built {t}"],
+        "libraries": [f"open source libraries tools {t}", f"{t} framework comparison"],
+        "limits": [f"{t} limitations quotas production issues", f"{t} known issues"],
+        "benchmarks": [f"{t} cost effort benchmark", f"{t} real-world timeline case study"],
+    }.get(angle, [t])
+
+    topic_contract = ReportContract(
+        report_title=str(contract_d.get("report_title") or "Engagement"),
+        executive_summary_brief="(chat research)",
+        problem_statement=str(contract_d.get("problem_statement") or ""),
+        core_challenge=t,
+        research_queries=[t],
+        sections=[],
+    )
+    smart_llm, smart_model = _resolve_smart("frontier")
+    dossier = await run_deep_research(
+        contract=topic_contract,
+        smart_llm=smart_llm,
+        smart_model=smart_model,
+        extra_queries=angle_queries,
+    )
+    if not (dossier.findings or dossier.prior_art or dossier.libraries):
+        return json.dumps({
+            "status": "no_results",
+            "message": "Deep research returned nothing conclusive. Say so honestly; do not fabricate.",
+            "unanswered": dossier.unanswered,
+        })
+    return json.dumps({
+        "status": "success",
+        "stats": {
+            "rounds": dossier.rounds,
+            "queries": dossier.queries_run,
+            "sources": dossier.sources_consulted,
+        },
+        "dossier": dossier.model_dump(),
+        "instructions": (
+            "Synthesize a structured answer: lead with the bottom line, then prior art (who/what/outcome), "
+            "then key findings with [title](url) citations (only these urls), then honest gaps from "
+            "`unanswered`. If anything materially affects the report (risk, limit, better option), "
+            "OFFER to queue it via add_pending_change."
+        ),
+    }, default=str)
+
+
+@tool
+async def get_reality_gap() -> str:
+    """The engagement's full gap picture from the typed report contract: what
+    kind of problem this is (problem profile), what the client's brief
+    understates (underplay flags), every load-bearing assumption, the open
+    questions, staffing gaps, verdict conditions, and the pipeline's own
+    confidence notes (where the report's grounding is weakest).
+
+    Use for: "what are we assuming?", "where could this go wrong?", "what did
+    the client underplay?", "how confident is this report?", "what's still
+    open?", and as background before any advisory answer about risk or scope.
+    """
+    await _load_report()
+    contract = _contract_dict()
+    if not contract:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "No typed contract on the active version (older report). Use get_risks_and_mitigations and get_project_blind_spots instead.",
+        })
+
+    feasibility = contract.get("feasibility") or {}
+    payload = {
+        "status": "success",
+        "problem_profile": contract.get("problem_profile"),
+        "core_challenge": contract.get("core_challenge"),
+        "underplay_flags": contract.get("underplay_flags") or [],
+        "global_assumptions": contract.get("global_assumptions") or [],
+        "open_questions_for_client": contract.get("open_questions_for_client") or [],
+        "staffing_gaps": contract.get("staffing_gaps") or [],
+        "verdict": {
+            "verdict": feasibility.get("verdict"),
+            "confidence": feasibility.get("confidence"),
+            "conditions": feasibility.get("conditions") or [],
+        },
+        "confidence_notes": contract.get("confidence_notes") or [],
+        "contingency_pct": contract.get("contingency_pct"),
+        "instructions": (
+            "These are the engagement's honest gaps. When the user resolves one in conversation "
+            "(answers an open question, confirms/disproves an assumption), OFFER to queue it via "
+            "add_pending_change so the next regeneration bakes it in."
+        ),
+    }
+    return json.dumps(payload, default=str)
+
+
+@tool
+async def whatif_estimate(
+    apply_conditions: str = "",
+    hours_delta_pct: float = 0.0,
+    contingency_pct_override: float = -1.0,
+) -> str:
+    """Deterministic what-if on the costed estimate — recomputes totals in Python
+    from the typed cost model, instantly, WITHOUT regenerating the report. Use for
+    "what if Salesforce is in scope?", "what does the worst case look like?",
+    "what if effort runs 20% over?", "what if we drop contingency to 10%?".
+
+    Args:
+        apply_conditions: Comma-separated keywords matching sensitivity conditions to apply (e.g. "salesforce, data migration"), or "all" for every adverse condition. Empty = none.
+        hours_delta_pct: Scale all effort hours by this percent (e.g. 20 = +20%, -10 = -10%).
+        contingency_pct_override: Replace the contract's contingency percent (e.g. 10). Negative = keep as-is.
+
+    NEVER compute estimate numbers yourself — always call this and cite its output.
+    """
+    from agents.contract import CostLine, Sensitivity
+    from agents.stitcher import compute_cost
+
+    await _load_report()
+    contract = _contract_dict()
+    if not contract or not contract.get("cost_lines"):
+        return json.dumps({
+            "status": "unavailable",
+            "message": "No typed cost lines on the active version — what-if math needs the contract pipeline's cost model. Quote the report's stated estimate instead.",
+        })
+
+    try:
+        cost_lines = [CostLine(**c) for c in contract["cost_lines"] if isinstance(c, dict)]
+        sensitivity = [Sensitivity(**s) for s in (contract.get("cost_sensitivity") or []) if isinstance(s, dict)]
+    except Exception as e:  # noqa: BLE001 — malformed legacy data degrades, never crashes the turn
+        return json.dumps({"status": "error", "message": f"Contract cost data unreadable: {e}"})
+
+    contingency = contract.get("contingency_pct") or 0.0
+    if contingency_pct_override is not None and contingency_pct_override >= 0:
+        contingency = float(contingency_pct_override)
+
+    if hours_delta_pct:
+        factor = 1.0 + float(hours_delta_pct) / 100.0
+        cost_lines = [
+            cl.model_copy(update={
+                "hours_low": max(0, round(cl.hours_low * factor)),
+                "hours_high": max(0, round(cl.hours_high * factor)),
+            })
+            for cl in cost_lines
+        ]
+
+    base = compute_cost(cost_lines, sensitivity, contingency)
+
+    wanted = [w.strip().lower() for w in (apply_conditions or "").split(",") if w.strip()]
+    applied: list[dict] = []
+    if wanted:
+        for s in sensitivity:
+            cond = (s.condition or "").lower()
+            if "all" in wanted:
+                if s.delta_pct > 0:
+                    applied.append({"condition": s.condition, "delta_pct": s.delta_pct})
+            elif any(w in cond for w in wanted):
+                applied.append({"condition": s.condition, "delta_pct": s.delta_pct})
+    applied_pct = sum(a["delta_pct"] for a in applied)
+    scenario_factor = 1.0 + applied_pct / 100.0
+
+    return json.dumps({
+        "status": "success",
+        "inputs": {
+            "hours_delta_pct": hours_delta_pct,
+            "contingency_pct": contingency,
+            "applied_conditions": applied,
+            "unmatched_condition_keywords": [
+                w for w in wanted
+                if w != "all" and not any(w in (s.condition or "").lower() for s in sensitivity)
+            ],
+        },
+        "base_estimate": {
+            "low_usd": round(base["grand_low"]),
+            "high_usd": round(base["grand_high"]),
+        },
+        "scenario_estimate": {
+            "low_usd": round(base["grand_low"] * scenario_factor),
+            "high_usd": round(base["grand_high"] * scenario_factor),
+            "delta_pct_applied": applied_pct,
+        },
+        "worst_case_all_adverse": {
+            "low_usd": round(base["worst_case_low"]),
+            "high_usd": round(base["worst_case_high"]),
+            "adverse_pct": base["adverse_sensitivity_pct"],
+        },
+        "available_sensitivity_conditions": [s.condition for s in sensitivity],
+        "instructions": (
+            "Quote these numbers exactly, state which conditions were applied, and note this is a "
+            "deterministic recomputation of the current version's cost model — a scope change still "
+            "needs add_pending_change + regenerate to become the plan of record."
+        ),
+    })

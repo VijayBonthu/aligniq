@@ -179,6 +179,11 @@ locals {
           - REDIS_SSL=false
           - AUTO_CREATE_TABLES=false
           - LOG_LEVEL=WARNING
+          # Turn on the shipped product (4-stage contract pipeline + streaming chat).
+          # Also set as SSM params so an already-running box picks them up on the
+          # next deploy; SSM-exported values win over these on conflict (both true).
+          - USE_CONTRACT_PIPELINE=true
+          - USE_STREAMING_CHAT=true
         depends_on:
           - redis
         logging:

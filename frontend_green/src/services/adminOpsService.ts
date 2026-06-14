@@ -113,3 +113,29 @@ export async function listStaff(): Promise<StaffUser[]> {
 export async function setStaff(email: string, is_staff: boolean): Promise<void> {
   await api.post('/admin/staff', { email, is_staff });
 }
+
+// ── Per-firm client email templates (staff-managed) ──
+export interface FirmRef { firm_id: string; name: string; }
+
+export interface EmailTemplateFields {
+  subject?: string; heading?: string; intro?: string; button_label?: string; signoff?: string;
+}
+
+export interface FirmEmailTemplates {
+  firm_id: string;
+  templates: Record<string, { defaults: Required<EmailTemplateFields>; override: EmailTemplateFields }>;
+}
+
+export async function listFirms(search?: string): Promise<FirmRef[]> {
+  const { data } = await api.get('/admin/firms', { params: search ? { search } : {} });
+  return data.firms || [];
+}
+
+export async function getFirmEmailTemplates(firmId: string): Promise<FirmEmailTemplates> {
+  const { data } = await api.get(`/admin/firm-email-templates/${firmId}`);
+  return data;
+}
+
+export async function saveFirmEmailTemplate(firmId: string, key: string, fields: EmailTemplateFields): Promise<void> {
+  await api.put(`/admin/firm-email-templates/${firmId}/${key}`, fields);
+}

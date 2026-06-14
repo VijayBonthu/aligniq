@@ -10,9 +10,9 @@ import type { UploadPresalesResponse } from '../services/uploadService';
 import WizardStepper, { type WizardPhase } from '../components/newproject/WizardStepper';
 import UploadStep from '../components/newproject/UploadStep';
 import QuestionsStep, { type PresalesQuestion } from '../components/newproject/QuestionsStep';
-import AnalysisStep, { type AnalysisAssumption } from '../components/newproject/AnalysisStep';
+import AnalysisStep, { type AnalysisAssumption, type AnalysisData } from '../components/newproject/AnalysisStep';
 import ReportStep from '../components/newproject/ReportStep';
-import { answerKeyForDisplayId } from '../utils/questionKey';
+import { answerKeyForDisplayId, anchorIdForDisplayId } from '../utils/questionKey';
 import { useAuth } from '../context/AuthContext';
 
 const ASSUMPTION_TAG = '[SYSTEM ASSUMPTION]';
@@ -80,11 +80,20 @@ export default function NewProjectFlow() {
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [additionalContext, setAdditionalContext] = useState('');
   const [generating, setGenerating] = useState(false);
+  const [runningFullPipeline, setRunningFullPipeline] = useState(false);
   const [reportContent, setReportContent] = useState<string | null>(null);
   const [chatHistoryIdState, setChatHistoryIdState] = useState<string | null>(null);
   const [projectTitle, setProjectTitle] = useState<string>('New project');
   const [readinessStatus, setReadinessStatus] = useState<string | null>(null);
+  const [clientSubmission, setClientSubmission] = useState<
+    { submitted_at: string; name?: string; designation?: string; email?: string } | null
+  >(null);
   const [hydrating, setHydrating] = useState<boolean>(Boolean(urlChatHistoryId));
+  // Last readiness analysis, lifted so the Questions step can show inline
+  // assumption previews; skip marks; and the "revise this answer" scroll target.
+  const [lastAnalysis, setLastAnalysis] = useState<AnalysisData | null>(null);
+  const [skippedQuestions, setSkippedQuestions] = useState<Record<string, boolean>>({});
+  const [focusAnchorId, setFocusAnchorId] = useState<string | null>(null);
 
   const initialQuestions: PresalesQuestion[] = useMemo(() => {
     if (!uploadData) return [];
@@ -172,9 +181,11 @@ export default function NewProjectFlow() {
           const restored: Record<string, string> = {};
           const p1Items: PresalesQuestion[] = [];
           const kItems: PresalesQuestion[] = [];
+          const fItems: PresalesQuestion[] = [];
           for (const q of arr) {
             const t = q.question_type;
             if (t === 'p1' || t === 'p1_blocker' || q.blocker) p1Items.push(q);
+            else if (t === 'follow_up') fItems.push(q);
             else kItems.push(q);
           }
           p1Items.forEach((q, i) => {
@@ -185,9 +196,19 @@ export default function NewProjectFlow() {
             const key = answerKeyForDisplayId(q.question_number) || `question_${i}`;
             if (q.answer) restored[key] = q.answer;
           });
+          fItems.forEach((q, i) => {
+            const key = answerKeyForDisplayId(q.question_number) || `followup_${i}`;
+            if (q.answer) restored[key] = q.answer;
+          });
           setAnswers(restored);
         }
-        if (briefRes.status === 'rejected') {
+        if (briefRes.status === 'fulfilled') {
+          // The presales row carries the client-questionnaire submission record.
+          const p = (briefRes.value as { data?: { client_submitted_at?: string; client_respondent?: { name?: string; designation?: string; email?: string } | null } })?.data;
+          if (p?.client_submitted_at) {
+            setClientSubmission({ submitted_at: p.client_submitted_at, ...(p.client_respondent || {}) });
+          }
+        } else {
           // Brief is optional for the wizard; analysis step will recompute.
           console.warn('Failed to fetch presales brief during hydrate', briefRes.reason);
         }
@@ -202,8 +223,17 @@ export default function NewProjectFlow() {
           setReportContent(briefContent);
           setPhase('report');
         } else {
-          const anyUnanswered = hydratedQuestions.some((q) => !q.answer || !String(q.answer).trim());
-          setPhase(anyUnanswered || hydratedQuestions.length === 0 ? 'questions' : 'analysis');
+          // Resume where the firm LEFT OFF (persisted per project), not a derived
+          // default — leaving on Questions should return to Questions, not jump to
+          // the readiness screen. Fall back to the answer-state heuristic only when
+          // there's no saved step yet.
+          const stored = localStorage.getItem(`np_phase_${details.chat_history_id}`);
+          if (stored === 'questions' || stored === 'analysis') {
+            setPhase(stored);
+          } else {
+            const anyUnanswered = hydratedQuestions.some((q) => !q.answer || !String(q.answer).trim());
+            setPhase(anyUnanswered || hydratedQuestions.length === 0 ? 'questions' : 'analysis');
+          }
         }
       } catch (err) {
         if (cancelled) return;
@@ -222,6 +252,31 @@ export default function NewProjectFlow() {
       cancelled = true;
     };
   }, [urlChatHistoryId, navigate]);
+
+  // Remember the firm's current wizard step per project so reopening returns them
+  // here (not a derived default). Only the mid-funnel steps are worth restoring.
+  useEffect(() => {
+    if (chatHistoryIdState && (phase === 'questions' || phase === 'analysis')) {
+      localStorage.setItem(`np_phase_${chatHistoryIdState}`, phase);
+    }
+  }, [phase, chatHistoryIdState]);
+
+  // Analysis arrived: keep it for the Questions step's inline assumption
+  // previews, and swap in the refreshed question list (it now carries any
+  // newly created follow-up questions).
+  const handleAnalysisData = (analysis: AnalysisData) => {
+    setLastAnalysis(analysis);
+    if (Array.isArray(analysis.questions) && analysis.questions.length > 0) {
+      setQuestions(analysis.questions as PresalesQuestion[]);
+    }
+  };
+
+  // "Revise this answer" / "Answer follow-ups" from the Analysis step: back to
+  // Questions, scrolled to the named card.
+  const handleReviseAnswer = (displayId?: string) => {
+    setFocusAnchorId(anchorIdForDisplayId(displayId));
+    setPhase('questions');
+  };
 
   const handleApplyAssumptions = (assumptions: AnalysisAssumption[]) => {
     if (!assumptions.length) {
@@ -302,15 +357,18 @@ export default function NewProjectFlow() {
   };
 
   const handleOpenChat = async () => {
+    if (runningFullPipeline) return;  // guard double-clicks while the request is in flight
     if (!chatHistoryIdState) {
       toast.error('Missing chat reference.');
       return;
     }
     if (!checkRegenLimit()) return;
+    setRunningFullPipeline(true);
     try {
       await startFullPipeline(chatHistoryIdState);
       navigate(`/full-pipeline/${chatHistoryIdState}`);
     } catch (err) {
+      setRunningFullPipeline(false);  // re-enable so they can retry (on success we navigate away)
       // 402 quota errors handled by global UpgradeModal.
       if (isAxiosError(err) && err.response?.status === 402) return;
       const detail =
@@ -402,6 +460,10 @@ export default function NewProjectFlow() {
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
+        {/* The client-submission confirmation lives on the Questions step (with
+            date/who) + the projects dashboard badge. It is deliberately NOT shown
+            on the readiness/brief screens — a "Review answers" jump there would
+            cancel/abandon an in-progress run. */}
         {phase === 'upload' && (
           <UploadStep
             onBeforeUpload={checkChatLimit}
@@ -427,6 +489,12 @@ export default function NewProjectFlow() {
             setAdditionalContext={setAdditionalContext}
             onBack={() => setPhase('upload')}
             onComplete={() => setPhase('analysis')}
+            assumptions={lastAnalysis?.assumptions}
+            skipped={skippedQuestions}
+            setSkipped={setSkippedQuestions}
+            focusAnchorId={focusAnchorId}
+            onFocusConsumed={() => setFocusAnchorId(null)}
+            clientSubmittedAt={clientSubmission?.submitted_at ?? null}
           />
         )}
         {phase === 'analysis' && uploadData && (
@@ -436,6 +504,8 @@ export default function NewProjectFlow() {
             onBack={() => setPhase('questions')}
             onApplyAssumptions={handleApplyAssumptions}
             onGenerateReport={handleGenerateReport}
+            onData={handleAnalysisData}
+            onReviseAnswer={handleReviseAnswer}
           />
         )}
         {phase === 'report' && reportContent && (
@@ -444,6 +514,7 @@ export default function NewProjectFlow() {
             projectTitle={projectTitle}
             chatHistoryId={chatHistoryIdState}
             onOpenChat={handleOpenChat}
+            running={runningFullPipeline}
             onBack={() => setPhase('analysis')}
             onContentChange={setReportContent}
             requireAssumptionAck={readinessStatus === 'ready_with_assumptions'}

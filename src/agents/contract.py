@@ -51,6 +51,124 @@ class OpenQuestion(BaseModel):
     )
 
 
+class ProblemAxis(BaseModel):
+    """One dimension of the engagement's problem shape, scored and evidenced."""
+
+    axis: str = Field(description="data | scale | integration | distribution | compliance | organizational")
+    score: int = Field(description="0-5: how much this axis dominates the engagement (0 = not a factor).")
+    evidence: str = Field(
+        default="",
+        description="One line from the document/brief that drives the score — a quote or concrete fact, never a generality.",
+    )
+
+
+class ProblemProfile(BaseModel):
+    """Typed diagnosis of WHAT KIND of problem this engagement is.
+
+    Emitted by the planner; consumed by the decider (a migration crux is not a
+    greenfield crux) and rendered by the stitcher as the 'Problem Shape' block.
+    The dominant axes drive which risks, questions, and architecture patterns matter.
+    """
+
+    delivery_mode: str = Field(
+        description="greenfield | upgrade | migration | rescue | extension — what kind of delivery this is.",
+    )
+    summary: str = Field(
+        default="",
+        description="One sentence: the kind of problem this is (e.g. 'a data-migration problem wearing an app-rebuild costume').",
+    )
+    axes: list[ProblemAxis] = Field(default_factory=list)
+    dominant_axes: list[str] = Field(
+        default_factory=list,
+        description="The 1-3 axis names that dominate; approaches and risks must address these.",
+    )
+
+
+class UnderplayFlag(BaseModel):
+    """A statement in the client's document that understates real scope.
+
+    The Reality Gap engine's client-side half: 'simple integration' rarely is.
+    Each flag is anchored to a verbatim quote so it is auditable, never a vibe.
+    """
+
+    quote: str = Field(description="Verbatim phrase from the client document being flagged.")
+    stated_as: str = Field(description="What the client implies it is (e.g. 'a simple data sync').")
+    usually_involves: str = Field(
+        description="What this actually involves in practice — the concrete sub-work the phrase hides.",
+    )
+    effort_note: str = Field(
+        default="",
+        description="One line on the effort delta, e.g. 'typically 3-5x the implied effort'.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Research Dossier — the typed output of the iterative deep-research agent
+# (src/agents/research_agent.py). The report's grounding in the current real
+# world: every entry cites a URL the search actually returned (deterministically
+# guarded), so the dossier is auditable, never vibes. Consumed by the decider,
+# routed per-section to writers, and rendered as "Research & Prior Art".
+# ---------------------------------------------------------------------------
+
+
+class ResearchFinding(BaseModel):
+    """One sourced fact from web research."""
+
+    claim: str = Field(description="The fact, stated plainly.")
+    kind: str = Field(
+        description="capability | limit | gotcha | benchmark | prior_art | library — drives per-section routing.",
+    )
+    source_url: str = Field(description="Real URL from the consulted sources. Never invented.")
+    source_title: str = Field(default="")
+    quote: str = Field(
+        default="",
+        description="Short verbatim quote (≤300 chars) from the source backing the claim.",
+    )
+    relevance_note: str = Field(
+        default="",
+        description="One line: why this matters to THIS engagement.",
+    )
+
+
+class PriorArt(BaseModel):
+    """Someone who tried this (or something close) before — the 'has anyone done
+    this' answer with an outcome, not a vibe."""
+
+    name: str = Field(description="Who/what: company, project, paper, or product.")
+    url: str = Field(description="Real URL from the consulted sources.")
+    what_they_did: str
+    outcome: str = Field(default="", description="What happened — shipped/failed/partial, numbers when stated.")
+    applicability: str = Field(
+        default="",
+        description="How closely it maps to this engagement and what transfers.",
+    )
+
+
+class LibraryOption(BaseModel):
+    """An existing library/tool/framework that solves part of this problem."""
+
+    name: str
+    url: str = Field(description="Real URL from the consulted sources.")
+    purpose: str = Field(description="What part of the problem it covers.")
+    maturity_note: str = Field(default="", description="One line: maturity/adoption/maintenance signal.")
+
+
+class ResearchDossier(BaseModel):
+    """The full research record for the engagement. `unanswered` lists the
+    mandates research could not settle — they flow into confidence_notes."""
+
+    findings: list[ResearchFinding] = Field(default_factory=list)
+    prior_art: list[PriorArt] = Field(default_factory=list)
+    libraries: list[LibraryOption] = Field(default_factory=list)
+    unanswered: list[str] = Field(
+        default_factory=list,
+        description="Research mandates that returned nothing conclusive — honest gaps.",
+    )
+    rounds: int = Field(default=0, description="Search/reflect rounds actually run.")
+    queries_run: int = Field(default=0)
+    sources_consulted: int = Field(default=0, description="Unique URLs seen across all rounds.")
+
+
 class ClientQA(BaseModel):
     """One discovery question we asked the client and the answer they gave.
 
@@ -78,6 +196,22 @@ class ServiceOption(BaseModel):
     provider: str = Field(description="aws | azure | gcp | oss | other")
     service: str = Field(description="The concrete service/project, e.g. 'Azure AI Search' or 'pgvector'.")
     note: str = Field(default="", description="One line: when to pick this, or managed-vs-self-hosted tradeoff.")
+    limits: str = Field(
+        default="",
+        description="What bites you if you pick this — the concrete quota/feature/ops limitation a team hits in production.",
+    )
+    cost_class: str = Field(
+        default="",
+        description="Rough cost class: low | mid | high | free-tier-available — relative within this capability.",
+    )
+    lockin_note: str = Field(
+        default="",
+        description="One line on switching cost / vendor lock-in (proprietary APIs, egress, managed-only features).",
+    )
+    source_url: str = Field(
+        default="",
+        description="Real URL from the research dossier grounding the limits claim; empty when it is expert judgment.",
+    )
 
 
 class TechDecision(BaseModel):
@@ -223,6 +357,10 @@ class ReportContract(BaseModel):
         default="",
         description="The engagement's central make-or-break question (the crux) in plain language — the hard thing this report must actually solve. The planner identifies it; the report is structured around answering it.",
     )
+    problem_profile: Optional[ProblemProfile] = Field(
+        default=None,
+        description="Typed diagnosis of the problem's shape (delivery mode + dominant axes). Planner-filled; the decider keys approaches/risks/estimates to the dominant axes.",
+    )
     research_queries: list[str] = Field(
         default_factory=list,
         description="Web-research queries the planner wants run to ground the crux + tech decisions in the current real world. Consumed by the research stage; not rendered.",
@@ -266,6 +404,20 @@ class ReportContract(BaseModel):
     )
     staffing_gaps: list[StaffingGap] = Field(default_factory=list)
     known_issues: list[KnownIssue] = Field(default_factory=list)
+
+    # Reality Gap (decide-filled) — quote-anchored understatements in the client's
+    # own document. Rendered with the staffing/firm-fit picture as 'Reality Gap'.
+    underplay_flags: list[UnderplayFlag] = Field(default_factory=list)
+
+    # Research Dossier (research-stage-filled, frontier tiers) — the typed record
+    # of the iterative deep-research pass. None on lite tiers / legacy rows.
+    research_dossier: Optional[ResearchDossier] = None
+
+    # Honest-gaps surface (pipeline-filled, deterministic — never an LLM):
+    # research queries that returned nothing, estimate bands the validator flagged,
+    # verdicts that read as hedges. Rendered as 'Confidence Notes' so surfaced
+    # gaps are a feature, not a leak.
+    confidence_notes: list[str] = Field(default_factory=list)
 
     def section_ids(self) -> list[str]:
         return [s.id for s in self.sections]

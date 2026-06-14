@@ -78,6 +78,8 @@ export interface ReportVersionMeta {
   changelog_summary?: string;
   is_default?: boolean;
   is_latest?: boolean;
+  is_client_signoff?: boolean;
+  signoff_at?: string | null;
   changes_applied?: unknown[];
 }
 
@@ -214,6 +216,88 @@ export async function setDefaultVersion(chatHistoryId: string, versionNumber: nu
 
 export async function rollbackVersion(chatHistoryId: string, versionNumber: number) {
   const { data } = await api.post(`/report-versions/${chatHistoryId}/rollback/${versionNumber}`);
+  return data;
+}
+
+/** Pin one version as the client-signoff baseline (one per project). The change-order draft computes against it. */
+export async function signoffVersion(chatHistoryId: string, versionNumber: number) {
+  const { data } = await api.post(`/report-versions/${chatHistoryId}/signoff/${versionNumber}`);
+  return data;
+}
+
+export interface ChangeOrder {
+  baseline_version: number;
+  current_version: number;
+  markdown?: string;
+  pdf_base64?: string;
+  filename?: string;
+}
+
+/** Deterministic change-order draft: signed baseline vs current version. format 'md' | 'pdf'. */
+export async function getChangeOrder(chatHistoryId: string, format: 'md' | 'pdf' = 'md'): Promise<ChangeOrder> {
+  const { data } = await api.get(`/report-versions/${chatHistoryId}/change-order?format=${format}`);
+  return data as ChangeOrder;
+}
+
+// ---- Edit-without-regen (WS-2): cost editor + answer-question ----
+
+export interface CostLineEdit {
+  workstream: string;
+  role: string;
+  seniority?: string;
+  region?: string;
+  hours_low: number;
+  hours_high: number;
+  rate_usd: number;
+  rate_card_ref?: string;
+}
+
+export interface CostTotals {
+  subtotal_low: number; subtotal_high: number;
+  grand_low: number; grand_high: number;
+  worst_case_low: number; worst_case_high: number;
+  contingency_pct: number; adverse_sensitivity_pct: number;
+}
+
+export interface ContractCost {
+  version_number: number | null;
+  cost_lines: CostLineEdit[];
+  contingency_pct: number;
+  cost_sensitivity: { condition: string; delta_pct: number }[];
+  totals: CostTotals;
+}
+
+/** Current cost lines + totals for the active version (seeds the cost editor). 409 if legacy. */
+export async function getContractCost(chatHistoryId: string): Promise<ContractCost> {
+  const { data } = await api.get(`/report-contract/${chatHistoryId}/cost`);
+  return data as ContractCost;
+}
+
+/** Recompute totals from edited lines WITHOUT saving (live editor preview). */
+export async function previewContractCost(
+  chatHistoryId: string, costLines: CostLineEdit[], contingencyPct: number,
+): Promise<{ totals: CostTotals; cost_lines: CostLineEdit[]; rate_notes: string[] }> {
+  const { data } = await api.patch(
+    `/report-contract/${chatHistoryId}/cost?preview=true`,
+    { cost_lines: costLines, contingency_pct: contingencyPct },
+  );
+  return data;
+}
+
+/** Save edited cost lines as a new version (deterministic, no pipeline regen). */
+export async function saveContractCost(
+  chatHistoryId: string, costLines: CostLineEdit[], contingencyPct: number,
+): Promise<{ version_number: number; totals: CostTotals; cost_table_replaced: boolean }> {
+  const { data } = await api.patch(
+    `/report-contract/${chatHistoryId}/cost`,
+    { cost_lines: costLines, contingency_pct: contingencyPct },
+  );
+  return data;
+}
+
+/** Answer an open question inline; queues a reviewable change for the next regenerate. */
+export async function answerOpenQuestion(chatHistoryId: string, question: string, answer: string) {
+  const { data } = await api.post(`/report-contract/${chatHistoryId}/answer-question`, { question, answer });
   return data;
 }
 

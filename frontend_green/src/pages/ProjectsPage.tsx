@@ -169,7 +169,16 @@ export default function ProjectsPage() {
         <KpiStrip kpis={overview.kpis} subscription={overview.subscription} attention={attention} />
       </div>
 
-      <CardGrid projects={overview.projects} />
+      <CardGrid
+        projects={overview.projects}
+        onRenamed={(chatHistoryId, customTitle) =>
+          setOverview((prev) =>
+            prev
+              ? { ...prev, projects: prev.projects.map((p) => (p.chat_history_id === chatHistoryId ? { ...p, custom_title: customTitle } : p)) }
+              : prev,
+          )
+        }
+      />
     </div>
   );
 }

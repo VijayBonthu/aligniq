@@ -40,6 +40,35 @@ export async function restoreQuestion(presalesId: string, questionId: string) {
   return data;
 }
 
+/** Create (or fetch) the public client-questionnaire link. Returns { token }. */
+export async function createShareLink(presalesId: string): Promise<{ token: string; presales_id: string }> {
+  const { data } = await api.post(`/presales/${presalesId}/share-link`);
+  return data;
+}
+
+export async function revokeShareLink(presalesId: string) {
+  const { data } = await api.delete(`/presales/${presalesId}/share-link`);
+  return data;
+}
+
+/** Ensure a link, store the client's email, and email them the questionnaire. */
+export async function sendClientLink(presalesId: string, clientEmail: string, message?: string): Promise<{ token: string; link: string; emailed: boolean }> {
+  const { data } = await api.post(`/presales/${presalesId}/send-client-link`, { client_email: clientEmail, message });
+  return data;
+}
+
+/** Re-send the questionnaire email to the stored client email. */
+export async function sendReminder(presalesId: string): Promise<{ emailed: boolean; link: string }> {
+  const { data } = await api.post(`/presales/${presalesId}/send-reminder`);
+  return data;
+}
+
+/** Mark the link as shared manually (when email isn't used) so the dashboard shows "sent". */
+export async function markLinkShared(presalesId: string): Promise<{ token: string; link: string; shared: boolean }> {
+  const { data } = await api.post(`/presales/${presalesId}/mark-link-shared`);
+  return data;
+}
+
 export async function presalesChat(presalesId: string, payload: unknown) {
   const { data } = await api.post(`/presales/${presalesId}/chat`, payload);
   return data;

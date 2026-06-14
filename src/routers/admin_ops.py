@@ -459,6 +459,60 @@ async def grant_staff(body: StaffGrantIn, current: dict = Depends(require_staff)
 
 
 # ---------------------------------------------------------------------------
+# Per-firm client email templates (staff-managed). Admins pick an org, edit the
+# copy fields for the questionnaire invite/reminder; GroundedIQ branding + the
+# email shell are NEVER overridable (rendered server-side). Raw HTML is not
+# accepted — only the named text fields — so a template can't break or de-brand.
+# ---------------------------------------------------------------------------
+_EMAIL_TEMPLATE_KEYS = ("questionnaire_invite", "questionnaire_reminder")
+
+
+class FirmEmailTemplateIn(BaseModel):
+    subject: Optional[str] = None
+    heading: Optional[str] = None
+    intro: Optional[str] = None
+    button_label: Optional[str] = None
+    signoff: Optional[str] = None
+
+
+@router.get("/admin/firms")
+async def admin_list_firms(search: Optional[str] = None, current: dict = Depends(require_staff), db: Session = Depends(get_db)):
+    """Searchable firm list for the template-manager dropdown."""
+    from database_scripts import list_firms
+    return {"firms": list_firms(search, db)}
+
+
+@router.get("/admin/firm-email-templates/{firm_id}")
+async def admin_get_firm_email_templates(firm_id: str, current: dict = Depends(require_staff), db: Session = Depends(get_db)):
+    """Return, per template key, the firm's saved overrides + the GroundedIQ defaults
+    (so the UI shows defaults as placeholders the admin can override)."""
+    from database_scripts import get_firm_email_template_fields
+    from utils.email import DEFAULT_QUESTIONNAIRE_FIELDS
+    out = {}
+    for key in _EMAIL_TEMPLATE_KEYS:
+        out[key] = {
+            "defaults": DEFAULT_QUESTIONNAIRE_FIELDS[key],
+            "override": get_firm_email_template_fields(firm_id, key, db),
+        }
+    return {"firm_id": firm_id, "templates": out}
+
+
+@router.put("/admin/firm-email-templates/{firm_id}/{template_key}")
+async def admin_set_firm_email_template(
+    firm_id: str, template_key: str, body: FirmEmailTemplateIn,
+    current: dict = Depends(require_staff), db: Session = Depends(get_db),
+):
+    """Upsert a firm's override text for one template key. Empty fields fall back to
+    the GroundedIQ default at render time."""
+    from database_scripts import set_firm_email_template
+    if template_key not in _EMAIL_TEMPLATE_KEYS:
+        raise HTTPException(status_code=400, detail=f"Unknown template key. Allowed: {_EMAIL_TEMPLATE_KEYS}")
+    saved = set_firm_email_template(firm_id, template_key, body.model_dump(exclude_none=False), db)
+    logger.info("ADMIN firm-email-template firm=%s key=%s by=%s", firm_id, template_key, _actor(current))
+    return {"firm_id": firm_id, "template_key": template_key, "override": saved}
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap — grant/revoke staff via the shared X-Admin-Key (break-glass).
 # Restrict /admin/* to your IP at the Cloudflare edge as well (defense in depth).
 # ---------------------------------------------------------------------------

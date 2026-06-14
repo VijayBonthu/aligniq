@@ -65,6 +65,7 @@ class Settings:
     RATE_LIMIT_DEFAULT        = int(os.getenv("RATE_LIMIT_DEFAULT", "90"))    # other mutations (save answers, etc.)
     RATE_LIMIT_EXPENSIVE      = int(os.getenv("RATE_LIMIT_EXPENSIVE", "20"))  # LLM / pipeline / upload / report-gen — slow anyway
     RATE_LIMIT_AUTH           = int(os.getenv("RATE_LIMIT_AUTH", "20"))       # login/register/refresh/callback — per IP, anti brute-force
+    RATE_LIMIT_PUBLIC         = int(os.getenv("RATE_LIMIT_PUBLIC", "50"))     # public client questionnaire — per IP; higher (autosave) but capped per-token + LLM lifetime cap elsewhere
     RATE_LIMIT_GLOBAL_IP      = int(os.getenv("RATE_LIMIT_GLOBAL_IP", "600")) # per real client IP across ALL routes — DDoS backstop
     CHROMA_API_KEY = os.getenv("CHROMA_API_KEY")
     CHROME_TENANT = os.getenv("CHROMA_TENANT")
@@ -154,6 +155,14 @@ class Settings:
     VERIFY_RESEND_COOLDOWN_SECONDS = int(os.getenv("VERIFY_RESEND_COOLDOWN_SECONDS", "60"))
     VERIFY_RESEND_HOURLY_CAP       = int(os.getenv("VERIFY_RESEND_HOURLY_CAP", "5"))
 
+    # Public client-questionnaire "Check readiness" throttle — this is the only
+    # UNAUTHENTICATED endpoint that triggers an LLM call, so it's the real cost/DDoS
+    # surface. Three layers: per-IP (middleware), per-token cooldown + hourly cap
+    # (Redis, fail-open), and a durable per-token LIFETIME cap (DB, never fails open).
+    PUBLIC_READINESS_COOLDOWN_SECONDS = int(os.getenv("PUBLIC_READINESS_COOLDOWN_SECONDS", "20"))
+    PUBLIC_READINESS_HOURLY_CAP       = int(os.getenv("PUBLIC_READINESS_HOURLY_CAP", "10"))
+    PUBLIC_READINESS_MAX_CHECKS       = int(os.getenv("PUBLIC_READINESS_MAX_CHECKS", "40"))
+
     # Transactional email (password reset, etc.) via Resend — a single HTTPS POST,
     # wrapped in utils/email.py so the provider is swappable. If RESEND_API_KEY is
     # unset, utils/email logs the message (including any reset link) at WARNING and
@@ -220,6 +229,14 @@ class Settings:
     ENABLE_RESEARCH            = os.getenv("ENABLE_RESEARCH", "true").lower() == "true"
     RESEARCH_MAX_QUERIES       = int(os.getenv("RESEARCH_MAX_QUERIES", "6"))
     RESEARCH_RESULTS_PER_QUERY = int(os.getenv("RESEARCH_RESULTS_PER_QUERY", "3"))
+    # Depth Cut — the iterative deep-research agent (frontier tiers only).
+    # ROUNDS counts search→reflect cycles including the first fan-out; EXTRACTS
+    # caps full-page tavily_extract reads per run (the expensive, high-signal
+    # part); EXTRACT_CHARS clips each extracted page before it enters a prompt.
+    RESEARCH_MAX_ROUNDS           = int(os.getenv("RESEARCH_MAX_ROUNDS", "3"))
+    RESEARCH_MAX_EXTRACTS         = int(os.getenv("RESEARCH_MAX_EXTRACTS", "6"))
+    RESEARCH_EXTRACT_CHARS        = int(os.getenv("RESEARCH_EXTRACT_CHARS", "4000"))
+    RESEARCH_MAX_FOLLOWUP_QUERIES = int(os.getenv("RESEARCH_MAX_FOLLOWUP_QUERIES", "6"))
 
 
 settings = Settings()

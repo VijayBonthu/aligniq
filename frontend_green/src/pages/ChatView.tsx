@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
-import { isAxiosError } from 'axios';
-import api, { getAccessToken } from '../services/api';
+import api, { getAccessToken, notifyError } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import useStreamingChat from '../hooks/useStreamingChat';
 import useMediaQuery from '../hooks/useMediaQuery';
@@ -12,6 +11,7 @@ import PreMortemPanel from '../components/chat/PreMortemPanel';
 import ToolActivity from '../components/chat/ToolActivity';
 import PendingChangesPanel from '../components/chat/PendingChangesPanel';
 import VersionsPanel from '../components/chat/VersionsPanel';
+import CostEditor from '../components/chat/CostEditor';
 
 type TabKey = 'chat' | 'premortem';
 
@@ -113,12 +113,22 @@ export default function ChatView() {
   const [tab, setTab] = useState<TabKey>('chat');
   const [pendingOpen, setPendingOpen] = useState(false);
   const [versionsOpen, setVersionsOpen] = useState(false);
+  const [costEditorOpen, setCostEditorOpen] = useState(false);
   const [changeDraft, setChangeDraft] = useState<string | undefined>(undefined);
   const [savedOnly, setSavedOnly] = useState(false);
   // The assistant message currently streaming; diagrams in it render only once
   // it finishes (an unclosed ```mermaid fence can't be rendered mid-stream).
   const [streamingMsgId, setStreamingMsgId] = useState<string | number | null>(null);
   const reportReady = record?.pipeline_status === 'completed' || record?.pipeline_status === 'idle' || record?.pipeline_status == null;
+  // Depth-Cut upsell (app UI only, never the PDF): the report itself shows
+  // whether deep research ran — the stitcher renders "## Research & Prior Art"
+  // only when a dossier exists. Free/basic + no dossier section → soft banner.
+  const [depthUpsellDismissed, setDepthUpsellDismissed] = useState(false);
+  const showDepthUpsell =
+    !depthUpsellDismissed &&
+    (subscription?.tier === 'free' || subscription?.tier === 'basic') &&
+    messages.some((m) => m.type === 'full_report') &&
+    !messages.some((m) => m.type === 'full_report' && m.content.includes('## Research & Prior Art'));
   // Server is the source of truth on hydration; bumped locally on each send so
   // the indicator updates without re-fetching /chat/{id} after every message.
   const [messageCount, setMessageCount] = useState(0);
@@ -179,10 +189,7 @@ export default function ChatView() {
         setMessageCount(typeof details.message_count === 'number' ? details.message_count : 0);
       } catch (err) {
         if (cancelled) return;
-        const detail =
-          (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-          (err instanceof Error ? err.message : 'Project not found');
-        toast.error(detail);
+        notifyError(err, 'Project not found');
         navigate('/projects', { replace: true });
       } finally {
         if (!cancelled) setLoading(false);
@@ -320,16 +327,19 @@ export default function ChatView() {
           // and the cap gate both update without an extra round-trip.
           setMessageCount((c) => c + 1);
         },
-        onError: (errMsg) => {
+        onError: (errMsg, opts) => {
+          // A limit 402 (opts.silent) is already explained by the global UpgradeModal — show it
+          // softly in the bubble and skip the toast. Real failures keep the "_Error: …_" note + toast.
+          const note = opts?.silent ? `_${errMsg}_` : `_Error: ${errMsg}_`;
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: m.content || `_Error: ${errMsg}_` }
+                ? { ...m, content: m.content || note }
                 : m,
             ),
           );
           setStreamingMsgId(null);
-          toast.error(errMsg);
+          if (!opts?.silent) toast.error(errMsg);
         },
       });
     } catch {
@@ -498,6 +508,14 @@ export default function ChatView() {
             style={headerPill(reportReady)}
           >
             Changes
+          </button>
+          <button
+            onClick={() => { if (reportReady) setCostEditorOpen(true); }}
+            disabled={!reportReady}
+            title="Edit the cost estimate without a full regeneration"
+            style={headerPill(reportReady)}
+          >
+            Edit estimate
           </button>
           <button
             onClick={() => { if (reportReady) setVersionsOpen(true); }}
@@ -687,6 +705,12 @@ export default function ChatView() {
                   </MenuItem>
                   <MenuItem
                     disabled={!reportReady}
+                    onClick={() => { if (reportReady) { setCostEditorOpen(true); setMenuOpen(false); } }}
+                  >
+                    Edit estimate
+                  </MenuItem>
+                  <MenuItem
+                    disabled={!reportReady}
                     onClick={() => { if (reportReady) { setVersionsOpen(true); setMenuOpen(false); } }}
                   >
                     Versions
@@ -770,6 +794,36 @@ export default function ChatView() {
 
         <div ref={scrollRef} onScroll={handleMessagesScroll} style={{ flex: 1, overflowY: 'auto', padding: '20px 0' }}>
           <div style={{ maxWidth: 780, margin: '0 auto', padding: '0 clamp(14px, 4vw, 28px)' }}>
+            {showDepthUpsell && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 10,
+                  padding: '10px 14px',
+                  marginBottom: 14,
+                  borderRadius: 10,
+                  background: 'var(--accent-soft)',
+                  border: '1px solid color-mix(in oklab, var(--accent) 28%, transparent)',
+                }}
+              >
+                <span style={{ fontSize: 14, flexShrink: 0, marginTop: 1 }}>🔎</span>
+                <p style={{ fontSize: 12.5, color: 'var(--fg-dim)', lineHeight: 1.5, margin: 0, flex: 1 }}>
+                  This report was generated without <strong style={{ color: 'var(--fg)' }}>deep research</strong>.
+                  Plus reports add prior art (who tried this before), the library landscape, and per-cloud
+                  service limits — all with cited sources.{' '}
+                  <a href="/pricing" style={{ color: 'var(--accent)' }}>See plans</a>
+                </p>
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  onClick={() => setDepthUpsellDismissed(true)}
+                  style={{ background: 'none', border: 'none', color: 'var(--fg-muted)', cursor: 'pointer', fontSize: 14, padding: 0, flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            )}
             {messages.length === 0 && (
               <div
                 style={{
@@ -1140,6 +1194,14 @@ export default function ChatView() {
           onClose={() => setVersionsOpen(false)}
           onChanged={reloadChat}
           onAskInChat={(p) => { setVersionsOpen(false); prefillComposer(p); }}
+        />
+      )}
+      {chatHistoryId && (
+        <CostEditor
+          chatHistoryId={chatHistoryId}
+          open={costEditorOpen}
+          onClose={() => setCostEditorOpen(false)}
+          onSaved={reloadChat}
         />
       )}
     </div>

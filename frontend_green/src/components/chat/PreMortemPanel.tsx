@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Sev, Tag } from '../ui/Chips';
+import { friendlyError } from '../../services/api';
 import {
   addPanelist,
   applyItemAction,
+  getDefenseBrief,
   getSources,
   getThread,
   postTurn,
@@ -54,6 +56,7 @@ function sevLabel(s: Item['severity']): 'HIGH' | 'MED' | 'LOW' {
 }
 
 function evidenceLabel(e: EvidenceRef): string {
+  if (e.type === 'vector') return e.label;
   const prefix =
     e.type === 'risk'
       ? `Risk #${(e.ref_index ?? 0) + 1}`
@@ -92,22 +95,34 @@ function sourceText(item: unknown): string {
 }
 
 function resolveEvidence(ev: EvidenceRef, sources: Sources | null): string | null {
+  // v2 vector evidence: resolve against the attack-surface vectors (title + quote/detail).
+  if (ev.type === 'vector') {
+    const v = (sources?.vectors || []).find((x) => x.id === ev.vector_id);
+    if (!v) return null;
+    return v.quote ? `“${v.quote}” — ${v.detail}` : v.detail;
+  }
   if (ev.ref_index == null) return null;
   const arr = sourceArrayFor(ev, sources);
   if (!arr || ev.ref_index < 0 || ev.ref_index >= arr.length) return null;
   return sourceText(arr[ev.ref_index]);
 }
 
+function money(n?: number | null): string {
+  return n == null ? '—' : `$${Math.round(n).toLocaleString()}`;
+}
+
+// friendlyError safely flattens an object `detail` (e.g. a 402 payload) to a string, so the
+// returned value is always renderable by toast.error().
 function errorMessage(err: unknown, fallback: string): string {
-  const e = err as { response?: { data?: { detail?: string } }; message?: string };
-  return e?.response?.data?.detail || e?.message || fallback;
+  return friendlyError(err, fallback);
 }
 
 export default function PreMortemPanel({ chatHistoryId }: { chatHistoryId: string }) {
   const [view, setView] = useState<View>({ kind: 'loading' });
   const [sources, setSources] = useState<Sources | null>(null);
   const [composerText, setComposerText] = useState('');
-  const [busy, setBusy] = useState<null | 'turn' | 'panelist' | 'action' | 'reset'>(null);
+  const [busy, setBusy] = useState<null | 'turn' | 'panelist' | 'action' | 'reset' | 'export'>(null);
+  const [debrief, setDebrief] = useState(false);
   const [showAddPanelist, setShowAddPanelist] = useState(false);
   const [newLabel, setNewLabel] = useState('');
   const [newConcern, setNewConcern] = useState('');
@@ -198,15 +213,17 @@ export default function PreMortemPanel({ chatHistoryId }: { chatHistoryId: strin
     }
   }
 
-  async function onItemAction(turnId: string, panelistId: string, item: Item, action: ItemAction) {
-    if (busy || item.status !== 'open') return;
+  async function onItemAction(
+    turnId: string, panelistId: string, item: Item, action: ItemAction,
+    extra?: { counter_response?: string; came_up?: boolean | null },
+  ) {
+    // Loop-closing actions only fire on an open item; triage/edit actions work anytime.
+    const loopClosing = action === 'add_to_client_qs' || action === 'track_as_change';
+    if (busy || (loopClosing && item.status !== 'open')) return;
     setBusy('action');
     try {
       const res = await applyItemAction(chatHistoryId, {
-        turn_id: turnId,
-        panelist_id: panelistId,
-        item_id: item.id,
-        action,
+        turn_id: turnId, panelist_id: panelistId, item_id: item.id, action, ...extra,
       });
       setView(v => (v.kind === 'ok' ? { ...v, thread: res.thread } : v));
     } catch (err) {
@@ -225,6 +242,29 @@ export default function PreMortemPanel({ chatHistoryId }: { chatHistoryId: strin
       setView({ kind: 'ok', status: 'empty', thread: res.thread });
     } catch (err) {
       setView({ kind: 'error', message: errorMessage(err, 'Reset failed') });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function onExportBrief() {
+    if (busy) return;
+    setBusy('export');
+    try {
+      const res = await getDefenseBrief(chatHistoryId, 'pdf', 'severity');
+      if (res.pdf_base64) {
+        const bytes = atob(res.pdf_base64);
+        const arr = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([arr], { type: 'application/pdf' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = res.filename || 'defense-brief.pdf';
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      setView({ kind: 'error', message: errorMessage(err, 'Could not export the Defense Brief') });
     } finally {
       setBusy(null);
     }
@@ -296,9 +336,17 @@ export default function PreMortemPanel({ chatHistoryId }: { chatHistoryId: strin
             </div>
           </div>
           {!isEmpty && (
-            <button onClick={onReset} disabled={!!busy} style={btnGhost}>
-              {busy === 'reset' ? 'Resetting…' : 'Reset thread'}
-            </button>
+            <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+              <button onClick={onExportBrief} disabled={!!busy} style={btnGhost} title="Export the Defense Brief (objection → answer → evidence) for the meeting">
+                {busy === 'export' ? 'Exporting…' : '↧ Defense Brief'}
+              </button>
+              <button onClick={() => setDebrief(d => !d)} disabled={!!busy} style={debrief ? btnPrimary : btnGhost} title="Toggle post-call debrief — mark which objections actually came up">
+                {debrief ? 'Debrief on' : 'Debrief'}
+              </button>
+              <button onClick={onReset} disabled={!!busy} style={btnGhost}>
+                {busy === 'reset' ? 'Resetting…' : 'Reset'}
+              </button>
+            </div>
           )}
         </div>
         <PanelistStrip
@@ -349,6 +397,7 @@ export default function PreMortemPanel({ chatHistoryId }: { chatHistoryId: strin
               busyAction={busy === 'action'}
               onItemAction={onItemAction}
               sources={sources}
+              debrief={debrief}
             />
           ))
         )}
@@ -548,18 +597,25 @@ function DeliberatingSkeleton() {
   );
 }
 
+type ItemActionFn = (
+  turnId: string, panelistId: string, item: Item, action: ItemAction,
+  extra?: { counter_response?: string; came_up?: boolean | null },
+) => void;
+
 function TurnView({
   turn,
   panelists,
   busyAction,
   onItemAction,
   sources,
+  debrief,
 }: {
   turn: Turn;
   panelists: Panelist[];
   busyAction: boolean;
-  onItemAction: (turnId: string, panelistId: string, item: Item, action: ItemAction) => void;
+  onItemAction: ItemActionFn;
   sources: Sources | null;
+  debrief: boolean;
 }) {
   const labelMap = new Map(panelists.map(p => [p.id, p.label]));
   return (
@@ -601,8 +657,14 @@ function TurnView({
           busyAction={busyAction}
           onItemAction={onItemAction}
           sources={sources}
+          debrief={debrief}
         />
       ))}
+      {turn.dropped_items && turn.dropped_items.length > 0 && (
+        <div style={{ fontSize: 11, color: 'var(--fg-muted)', fontStyle: 'italic', paddingLeft: 4 }}>
+          {turn.dropped_items.length} ungrounded objection{turn.dropped_items.length === 1 ? '' : 's'} discarded (not tied to a real finding).
+        </div>
+      )}
     </div>
   );
 }
@@ -615,14 +677,16 @@ function PanelistResponseCard({
   busyAction,
   onItemAction,
   sources,
+  debrief,
 }: {
   turnId: string;
   panelistId: string;
   panelistLabel: string;
   items: Item[];
   busyAction: boolean;
-  onItemAction: (turnId: string, panelistId: string, item: Item, action: ItemAction) => void;
+  onItemAction: ItemActionFn;
   sources: Sources | null;
+  debrief: boolean;
 }) {
   return (
     <section
@@ -654,6 +718,7 @@ function PanelistResponseCard({
               busy={busyAction}
               onItemAction={onItemAction}
               sources={sources}
+              debrief={debrief}
             />
           ))}
         </ul>
@@ -669,17 +734,24 @@ function ItemRow({
   busy,
   onItemAction,
   sources,
+  debrief,
 }: {
   turnId: string;
   panelistId: string;
   item: Item;
   busy: boolean;
-  onItemAction: (turnId: string, panelistId: string, item: Item, action: ItemAction) => void;
+  onItemAction: ItemActionFn;
   sources: Sources | null;
+  debrief: boolean;
 }) {
   const [showSources, setShowSources] = useState(false);
-  const resolvable = (item.evidence || []).filter(e => e.ref_index != null && e.type !== 'section');
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(item.counter_response);
+  const resolvable = (item.evidence || []).filter(e =>
+    e.type === 'vector' ? !!e.vector_id : (e.ref_index != null && e.type !== 'section'),
+  );
   const hasResolvable = resolvable.length > 0;
+  const q = item.quantified;
 
   return (
     <li
@@ -697,10 +769,48 @@ function ItemRow({
           “{item.point}”
         </div>
       </div>
-      <div style={{ color: 'var(--fg-dim)', fontSize: 13, lineHeight: 1.55, paddingLeft: 4 }}>
-        <span style={{ color: 'var(--accent)', marginRight: 6 }}>↳</span>
-        {item.counter_response}
-      </div>
+      {q && q.scenario_low_usd != null && (
+        <div style={{ paddingLeft: 4 }}>
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent)',
+            background: 'var(--accent-soft)', border: '1px solid var(--border)',
+            borderRadius: 4, padding: '3px 8px',
+          }}>
+            {q.kind === 'worst_case' ? 'Worst case' : 'If this fires'}: {money(q.scenario_low_usd)}–{money(q.scenario_high_usd)}
+            {q.delta_pct != null ? ` (${q.delta_pct >= 0 ? '+' : ''}${Math.round(q.delta_pct)}%)` : ''}
+          </span>
+        </div>
+      )}
+      {editing ? (
+        <div style={{ paddingLeft: 4, display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={3}
+            style={{ width: '100%', boxSizing: 'border-box', background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 6, color: 'var(--fg)', fontSize: 13, padding: '8px 10px', resize: 'vertical' }}
+          />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button disabled={busy || !draft.trim()} style={btnAction}
+              onClick={() => { onItemAction(turnId, panelistId, item, 'edit_counter', { counter_response: draft }); setEditing(false); }}>
+              Save answer
+            </button>
+            <button style={btnAction} onClick={() => { setDraft(item.counter_response); setEditing(false); }}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ color: 'var(--fg-dim)', fontSize: 13, lineHeight: 1.55, paddingLeft: 4 }}>
+          <span style={{ color: 'var(--accent)', marginRight: 6 }}>↳</span>
+          {item.counter_response}
+          {item.counter_edited && <span style={{ color: 'var(--fg-muted)', fontSize: 10, marginLeft: 6 }}>✎ edited</span>}
+          <button
+            onClick={() => { setDraft(item.counter_response); setEditing(true); }}
+            title="Edit our answer"
+            style={{ background: 'none', border: 'none', color: 'var(--fg-muted)', cursor: 'pointer', fontSize: 11, marginLeft: 8, textDecoration: 'underline' }}
+          >
+            edit
+          </button>
+        </div>
+      )}
       {item.evidence?.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingLeft: 4, alignItems: 'center' }}>
           {item.evidence.map((e, i) => (
@@ -762,43 +872,48 @@ function ItemRow({
           })}
         </div>
       )}
-      <div style={{ paddingLeft: 4, marginTop: 2 }}>
-        {item.status === 'open' ? (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button
-              onClick={() => onItemAction(turnId, panelistId, item, 'add_to_client_qs')}
-              disabled={busy}
-              style={btnAction}
-            >
-              + Add to client questions
-            </button>
-            <button
-              onClick={() => onItemAction(turnId, panelistId, item, 'track_as_change')}
-              disabled={busy}
-              style={btnAction}
-            >
-              ⚙ Track as change
-            </button>
-          </div>
+      <div style={{ paddingLeft: 4, marginTop: 2, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        {item.status === 'added_to_client_qs' ? (
+          <StatusPill text="→ Added to client questions" />
+        ) : item.status === 'tracked_as_change' ? (
+          <StatusPill text="⚙ Tracked as change" />
         ) : (
-          <span
-            style={{
-              display: 'inline-block',
-              fontSize: 11,
-              fontFamily: 'var(--font-mono)',
-              color: 'var(--ok)',
-              background: 'var(--ok-soft)',
-              border: '1px solid var(--border)',
-              padding: '3px 8px',
-              borderRadius: 4,
-              letterSpacing: '.04em',
-            }}
-          >
-            ✓ {item.status === 'added_to_client_qs' ? 'Added to client questions' : 'Tracked as change'}
+          <>
+            {item.status === 'defended' ? (
+              <>
+                <StatusPill text="✓ Defended" />
+                <button onClick={() => onItemAction(turnId, panelistId, item, 'reopen')} disabled={busy} style={btnAction}>Reopen</button>
+              </>
+            ) : (
+              <button onClick={() => onItemAction(turnId, panelistId, item, 'mark_defended')} disabled={busy} style={btnAction}>✓ Defended</button>
+            )}
+            <button onClick={() => onItemAction(turnId, panelistId, item, 'add_to_client_qs')} disabled={busy} style={btnAction}>+ Client question</button>
+            <button onClick={() => onItemAction(turnId, panelistId, item, 'track_as_change')} disabled={busy} style={btnAction}>⚙ Track as change</button>
+          </>
+        )}
+        {debrief && (
+          <span style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 'auto' }}>
+            <span style={{ fontSize: 10, color: 'var(--fg-muted)', fontFamily: 'var(--font-mono)' }}>came up?</span>
+            <button onClick={() => onItemAction(turnId, panelistId, item, 'mark_came_up', { came_up: item.came_up === true ? null : true })}
+              disabled={busy} style={item.came_up === true ? btnPrimary : btnAction}>yes</button>
+            <button onClick={() => onItemAction(turnId, panelistId, item, 'mark_came_up', { came_up: item.came_up === false ? null : false })}
+              disabled={busy} style={item.came_up === false ? btnPrimary : btnAction}>no</button>
           </span>
         )}
       </div>
     </li>
+  );
+}
+
+function StatusPill({ text }: { text: string }) {
+  return (
+    <span style={{
+      display: 'inline-block', fontSize: 11, fontFamily: 'var(--font-mono)',
+      color: 'var(--ok)', background: 'var(--ok-soft)', border: '1px solid var(--border)',
+      padding: '3px 8px', borderRadius: 4, letterSpacing: '.04em',
+    }}>
+      {text}
+    </span>
   );
 }
 

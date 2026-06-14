@@ -30,11 +30,19 @@ OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences, no commentary):
   "report_title": "<short, client-ready title>",
   "executive_summary_brief": "<2-3 sentence ANSWER-FIRST commitment, Minto-style. Open with the recommendation as an imperative ('Run a phased AWS migration…'), then the single headline number and the top reason. NO hedging, NO 'it depends', NO opening caveat. This is the one line the reader sees first.>",
   "problem_statement": "<2-4 sentences in plain language: the client's core problem and what success looks like. The 'why' of the engagement, lifted from the brief — not a restatement of scope.>",
-  "core_challenge": "<THE crux: the single hardest, make-or-break question this engagement actually turns on — the thing a senior architect would obsess over. Often it is NOT 'which framework' but 'is the client's actual plan/method even feasible, and how'. State it as a sharp question. Example for a 'migrate 2M LOC in 2 weeks, 80% automated with GitHub Copilot only' brief: 'Can a Copilot-only, in-VPC agentic workflow realistically automate ~80% of a 2M-LOC Silverlight→Angular migration, and what is the machine that does it?'>",
+  "core_challenge": "<THE crux: the single hardest, make-or-break question this engagement actually turns on — the thing a senior architect would obsess over. Often it is NOT 'which framework' but 'is the client's actual plan/method even feasible, and how'. State it as a sharp HOW-question, never a yes/no. ❌ 'Is a Copilot-based migration feasible?' ✓ 'Can a Copilot-only, in-VPC agentic workflow realistically automate ~80% of a 2M-LOC Silverlight→Angular migration, and what is the machine that does it?' If your crux reads as a yes/no, restate it as the how-question behind it.>",
+  "problem_profile": {{
+    "delivery_mode": "greenfield | upgrade | migration | rescue | extension",
+    "summary": "<one sentence: what KIND of problem this engagement actually is — e.g. 'a data-migration problem wearing an app-rebuild costume'>",
+    "axes": [
+      {{ "axis": "data | scale | integration | distribution | compliance | organizational", "score": <0-5>, "evidence": "<one concrete fact/quote from the document that drives this score — never a generality>" }}
+    ],
+    "dominant_axes": ["<the 1-3 axis names that dominate this engagement>"]
+  }},
   "client_qa": [
-    {{ "question": "<a discovery question that WAS asked and answered, copied from the CRD's confirmed Q&A>", "answer": "<the client's answer, verbatim or lightly cleaned>", "source": "<original id if present, e.g. 'P1-2' or 'Q3'>" }}
+    {{ "question": "<a discovery question that WAS asked and answered, copied from the CRD's CONFIRMED Q&A block>", "answer": "<the client's answer, verbatim or lightly cleaned>", "source": "<the original id from the CRD, e.g. 'P1-2' or 'Q3'>" }}
   ],
-  "research_queries": ["<3-6 web-search queries that would let a specialist answer the core_challenge and ground the tech decisions in the CURRENT real world — e.g. capabilities/limits of the named tools in 2026, existing automation/migration tooling, known failure modes of the proposed method. Be specific; name the actual technologies.>"],
+  "research_queries": ["<3-6 web-search queries that would let a specialist answer the core_challenge and ground the tech decisions in the CURRENT real world. Each query must target ONE of: a capability claim ('can tool X actually do Y at scale Z'), a known gotcha ('what fails when integrating X with Z'), or a cost/effort baseline ('what comparable migrations/builds actually took'). Name the actual technologies. A query that would return generic blogs or vendor marketing is a wasted slot.>"],
   "sections": [
     {{
       "id": "<stable kebab-case slug, e.g. 'project-scope'>",
@@ -56,8 +64,8 @@ OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences, no commentary):
     }}
   ],
   "validated_requirements": {{
-    "functional": [{{"id": "FR-1", "text": "...", "priority": "must" | "should" | "nice"}}],
-    "non_functional": [{{"id": "NFR-1", "text": "...", "priority": "must" | "should" | "nice"}}],
+    "functional": [{{"id": "FR-1", "text": "...", "priority": "must" | "should" | "nice", "source": "crd" | "inferred"}}],
+    "non_functional": [{{"id": "NFR-1", "text": "...", "priority": "must" | "should" | "nice", "source": "crd" | "inferred"}}],
     "constraints": ["..."]
   }},
   "global_assumptions": ["<assumption every section inherits, e.g. 'AWS us-east-1'>"]
@@ -75,10 +83,12 @@ DIAGRAM GUIDANCE: assign diagrams where they make the design easier to follow �
 
 RULES:
 - Every claim_to_make must either map to an evidence_pointer OR be listed in global_assumptions / open_questions_for_client. No floating claims.
-- Use the CRD's accepted assumptions and open blockers verbatim where they apply — do not re-question what the CRD already resolved.
+- THE CRD IS STRUCTURED, NOT PROSE. When it contains a "CONFIRMED Q&A" block, copy each entry into client_qa exactly (question, answer, original id in `source`) — never re-derive Q&A from prose. When it contains an "ACCEPTED ASSUMPTIONS" block, treat each as a RESOLVED fact: inherit it into global_assumptions prefixed "Assumption (accepted): ..." and do NOT re-open it as a question. When it contains an "OPEN / UNANSWERED QUESTIONS" block, fold those into open_questions_for_client (they are unresolved — never invent answers for them).
 - If a fact is missing from the document, put it in open_questions_for_client. Do not invent numbers.
+- In validated_requirements, mark each row's `source`: "crd" when it comes from the CRD / client document, "inferred" when you derived it. Downstream consumers treat inferred rows with less authority.
 - Respect FIRM_CONTEXT: blocked vendors must not appear in claims; preferred stacks should be preferred where the document is silent.
-- problem_statement and client_qa are the engagement story rendered at the top of the report. Lift problem_statement from the brief's objective. Populate client_qa from the CRD's confirmed Q&A (every answered question, with its original id in `source`). Do not invent Q&A that the CRD does not contain; leave client_qa empty if there is none. Still-open questions go in open_questions_for_client, NOT client_qa.
+- problem_statement and client_qa are the engagement story rendered at the top of the report. Lift problem_statement from the brief's objective. Do not invent Q&A that the CRD does not contain; leave client_qa empty if there is none. Still-open questions go in open_questions_for_client, NOT client_qa.
+- Diagnose problem_profile BEFORE the crux: decide what KIND of problem this is (the dominant axes + delivery_mode), each axis score anchored to one concrete fact from the document. An "upgrade" or "migration" engagement has structurally different risks and questions than a greenfield build — the crux, sections, and research_queries must reflect the dominant axes, not a generic template.
 - Identify core_challenge FIRST — the real crux, which is usually about whether the client's intended METHOD is feasible and how to actually do it, not which framework to pick. Then derive research_queries that would let a specialist answer that crux against the current real world. The section list must be structured to ANSWER the crux (recommended-approach leads the body).
 - REGENERATION: if PRIOR_CONTEXT below contains a prior contract + requested changes, EVOLVE the prior contract — carry forward core_challenge, the section structure, and everything the changes do not touch; apply the requested changes; re-open only what they affect. Do NOT redesign from scratch, or you throw away decisions the client already agreed to.
 
@@ -88,7 +98,7 @@ FIRM_CONTEXT:
 PRIOR_CONTEXT (a prior contract + the client's requested changes — present only on a regeneration; evolve it, do not restart):
 {prior_context}
 
-CRD (presales brief — treat accepted assumptions as resolved):
+CRD (the structured presales output: CONFIRMED Q&A + ACCEPTED ASSUMPTIONS + OPEN QUESTIONS as JSON blocks, then the approved brief. Settled facts live here — the DOCUMENT CHUNKS below are raw evidence):
 {crd}
 
 DOCUMENT CHUNKS (referenced as evidence_pointers; each chunk has an id):
@@ -145,11 +155,27 @@ OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences, no commentary):
       "honors_firm_pref": true | false,
       "basis": "<evidence link text, or 'Assumption: ...' if not grounded>",
       "service_options": [
-        {{ "provider": "aws | azure | gcp | oss | other", "service": "<concrete service/project, e.g. 'Azure AI Search', 'pgvector'>", "note": "<one line: when to pick / managed vs self-hosted>" }}
+        {{
+          "provider": "aws | azure | gcp | oss | other",
+          "service": "<concrete service/project, e.g. 'Azure AI Search', 'pgvector'>",
+          "note": "<one line: when to pick / managed vs self-hosted>",
+          "limits": "<what BITES you if you pick this: the concrete quota/feature/ops limitation a team hits in production>",
+          "cost_class": "low | mid | high | free-tier-available",
+          "lockin_note": "<one line: switching cost / proprietary APIs / egress>",
+          "source_url": "<a RESEARCH_FINDINGS url grounding the limits claim, or empty string when it is expert judgment>"
+        }}
       ]
     }}
   ],
   "integration_points": ["<cross-system seam in the proposed solution, e.g. 'React chatbot embedded in Power BI -> Azure Function App'>"],
+  "underplay_flags": [
+    {{
+      "quote": "<VERBATIM phrase from the client document that understates scope, e.g. 'simple integration with SAP'>",
+      "stated_as": "<what the client implies it is>",
+      "usually_involves": "<the concrete sub-work the phrase hides: auth model, field mapping, error reconciliation, environments, ...>",
+      "effort_note": "<one line on the delta, e.g. 'typically 3-5x the implied effort'>"
+    }}
+  ],
   "staffing_gaps": [
     {{
       "needed_role": "<role the engagement needs, e.g. 'AI/ML Engineer'>",
@@ -190,17 +216,22 @@ OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences, no commentary):
 
 RULES:
 - ENGAGE THE CRUX, don't dodge it. Answer the core_challenge directly and constructively: if the client's intended method (e.g. an agentic, tool-restricted automation) is the hard part, design HOW it could actually work and give the real options — do not retreat to a generic safe playbook that quietly ignores their goal.
+- KEY OFF THE PROBLEM_PROFILE. The contract's problem_profile names the dominant axes (data / scale / integration / distribution / compliance / organizational) and the delivery_mode. Your approaches, risks, sensitivities, and estimates must address those axes specifically — a migration's costs concentrate in data quality and cutover, an integration problem's in the seams, a scale problem's in load and operations. An approach that ignores the dominant axis is wrong even if it is otherwise sensible.
+- UNDERPLAY FLAGS — the client-side reality check. Scan the document (and carry over any underplay flags the presales analysis already raised in the CRD) for phrases that understate real scope: "simple integration", "just migrate the data", "minor changes to the legacy system". For each, emit an underplay_flags entry whose `quote` is VERBATIM from the document and whose `usually_involves` names the concrete hidden sub-work. Max 5, most consequential first. No quote = no flag — never flag from vibes. These justify your contingency_pct: a contingency not backed by named gaps reads as padding.
 - APPROACHES must be real and differentiated. Each `how_it_works` names concrete tooling and the actual loop (what drives the work, how output is validated, where it runs). "Use the tool carefully with reviews" is not an approach. Ground capability/feasibility claims in RESEARCH_FINDINGS and put the supporting URL in `sources`. Where you assert a current-tech specific without a finding, lower its confidence and say so.
 - STRESS-TEST the client's stated targets. If a target (timeline, % automation, scope) is not credible given the evidence, say so plainly in the recommended approach / feasibility verdict and counter-propose what IS achievable (e.g. a proof + factory in the window, with a realistic full timeline). Decisiveness with honesty beats agreeable hedging.
 - DO NOT compute totals or multiply hours by rates. Emit hours and the rate per line only; the renderer does the arithmetic.
-- COST RANGE DISCIPLINE: hours_low..hours_high is your honest estimate band for the work AS SCOPED — keep it tight: hours_high must be ≤ ~1.4 × hours_low per line. A 2× band is a refusal to estimate, not an estimate. Capture scenario uncertainty (unconfirmed scope, items that hinge on open questions) ONLY in cost_sensitivity — never by widening the base band. Do not double-count the same risk in both the band and sensitivity.
-- Every cost_line.rate_usd MUST be copied from a row in FIRM_CONTEXT's rate card, and rate_card_ref MUST name that row. If no rate card is present, emit cost_lines with your best-estimate rates and set rate_card_ref to "Assumption: no firm rate card".
+- COST RANGE DISCIPLINE: hours_low..hours_high is your honest estimate band for the work AS SCOPED — keep it tight: hours_high must be ≤ ~1.4 × hours_low per line. A 2× band is a refusal to estimate, not an estimate. A deterministic validator REJECTS any line above 1.45× and stamps it into the report's Confidence Notes — if you cannot estimate that tightly, the scope is unclear: move the uncertainty into cost_sensitivity and keep the base band tight. Capture scenario uncertainty (unconfirmed scope, items that hinge on open questions) ONLY in cost_sensitivity — never by widening the base band. Do not double-count the same risk in both the band and sensitivity.
+- SENSITIVITY MUST BE SPECIFIC: every cost_sensitivity condition names a concrete scope item or open question from the contract ("if the Salesforce integration is confirmed in scope", "if legacy data quality requires manual remediation") — never a generic "if scope increases". A reader must be able to point at the thing that triggers the delta.
+- COST ROLES MUST MATCH THE RATE CARD VOCABULARY: emit each cost_line.role using the role name from FIRM_CONTEXT's rate card verbatim wherever a matching role exists. The firm's own $/hr is then applied deterministically from that row — your rate_usd is a fallback used only for roles the card does not cover. Still set rate_usd to your best market estimate and name the row in rate_card_ref. If no rate card is present, use best-estimate rates and set rate_card_ref to "Assumption: no firm rate card".
 - Respect FIRM_CONTEXT: a tech choice that contradicts a firm preference or uses a blocked vendor MUST set honors_firm_pref=false and justify it in rationale.
-- For every tech_decision, populate service_options with the concrete way to deploy it: a managed option for each of aws, azure, and gcp where one exists, plus at least one popular open-source option. Name real services (e.g. vector DB -> Azure AI Search, AWS OpenSearch, GCP Vertex AI Vector Search, OSS pgvector/Qdrant). The reader should not have to go find what to use.
+- For every tech_decision, populate service_options with the concrete way to deploy it: a managed option for each of aws, azure, and gcp where one exists, plus at least one popular open-source option. Name real services (e.g. vector DB -> Azure AI Search, AWS OpenSearch, GCP Vertex AI Vector Search, OSS pgvector/Qdrant). Fill `limits` with what actually BITES a team that picks it (quotas, missing features, ops burden), `cost_class`, and `lockin_note` — this renders as the cloud-options comparison table the client uses to choose. Ground `limits` in a RESEARCH_FINDINGS entry where one exists (copy its url into `source_url`); otherwise leave source_url empty (it reads as expert judgment). The reader should not have to go find what to use OR what's wrong with it.
+- PRIOR ART IS BINDING: when RESEARCH_FINDINGS contains prior_art entries relevant to an approach, the approach's `how_it_works` or `summary` MUST reference what they did and what happened (with the source in `sources`) — "nobody has tried this" is only claimable when research actually found nothing.
+- BENCHMARK ANCHORING: when RESEARCH_FINDINGS contains benchmark entries, state in the relevant approach or cost reasoning how your estimate compares to them (higher/lower and why). An estimate that ignores an available benchmark is unanchored.
 - integration_points: list the cross-system seams your solution introduces (e.g. "React app embedded in Power BI -> Azure Function App"). These drive downstream known-issue research, so be specific about which two systems meet.
 - STAFFING GAP CHECK: for every role in `team`, look for a matching role in FIRM_CONTEXT's rate card. If the firm staffs it, set in_firm_roster=true. If NOT (e.g. the project needs an AI/ML Engineer but the rate card only lists Software Engineers), set in_firm_roster=false AND add a staffing_gaps entry with covered_by_firm=false, a recommendation (hire / contract / upskill an existing role), and the cost/timeline impact. When there is no rate card at all, leave in_firm_roster=null and emit no staffing_gaps.
 - Do not invent facts the contract marks as open questions. Where a decision hinges on an open question, reflect that in cost_sensitivity and in feasibility.conditions, and lower the relevant confidence.
-- FEASIBILITY VERDICT — commit. Default to a clear "go" or "no-go". Use "go-with-conditions" ONLY when one or two specific blockers genuinely gate the engagement, and then cap `conditions` to those 1-3 items (not a wishlist). A verdict hedged behind a long list of conditions reads as "no opinion" and is graded down. Open questions that do not block delivery do NOT belong in conditions.
+- FEASIBILITY VERDICT — commit. Default to a clear "go" or "no-go". Use "go-with-conditions" ONLY when one or two specific blockers genuinely gate the engagement, and then cap `conditions` to those 1-3 items (not a wishlist). A deterministic validator flags any verdict with more than 3 conditions as a non-opinion and stamps it into the report's Confidence Notes. Open questions that do not block delivery do NOT belong in conditions.
 - Prefer the firm's default team template when present, adjusted to this engagement's scope.
 
 FIRM_CONTEXT (rate card, preferred stack, blocked vendors, default team template):
@@ -217,6 +248,108 @@ RESEARCH_FINDINGS (real web results to ground approach feasibility + tech specif
 
 PRIOR_CONTEXT (a prior contract + the client's requested changes — present only on a regeneration; carry forward prior decisions the changes do not touch, and apply the changes):
 {prior_context}
+
+Return ONLY the JSON object."""
+
+
+# ---------------------------------------------------------------------------
+# Deep research — reflect + synthesize prompts for the iterative research agent
+# (src/agents/research_agent.py). Frontier tiers only. The agent loop is:
+# round-1 fan-out → REFLECT (pick pages to read in full + follow-up queries)
+# → extract + follow-ups → SYNTHESIZE (typed ResearchDossier). URLs are
+# deterministically guarded to what the search actually returned.
+# ---------------------------------------------------------------------------
+RESEARCH_REFLECT_PROMPT = """You are the research lead on a presales engagement, midway through a web-research pass. You have a set of search-result snippets. Decide what to READ IN FULL and what to SEARCH NEXT so the final dossier can answer the research mandates.
+
+RESEARCH MANDATES (what the dossier must try to settle):
+1. CRUX CAPABILITY — can the client's intended method actually work? ({core_challenge})
+2. PRIOR ART — has anyone done this (or something close)? Case studies, postmortems, engineering blogs, papers, OSS projects. What happened?
+3. LIBRARY / TOOL LANDSCAPE — what existing libraries, frameworks, or products already solve parts of this?
+4. SERVICE LIMITS — for the candidate technologies and clouds, what are the concrete production limits/gotchas that would bite this design?
+5. BENCHMARKS — what did comparable work actually cost / take?
+
+ENGAGEMENT BRIEF (problem shape + candidate technologies):
+{engagement_brief}
+
+SNIPPETS GATHERED SO FAR (url -> title + snippet; snippets are truncated — reading the full page is how you get real substance):
+{snippets_block}
+
+OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences):
+
+{{
+  "extract_urls": ["<up to {max_extracts} urls FROM THE SNIPPETS ABOVE that look most load-bearing — prior-art writeups, limit/quota docs, benchmark posts. Pick pages whose FULL text would settle a mandate; skip thin listicles and marketing.>"],
+  "followup_queries": ["<up to {max_followups} NEW search queries targeting mandates the snippets do NOT yet cover. Name actual technologies/versions. Do not repeat a query already run.>"],
+  "gaps": ["<mandates (by name) that current results leave unsettled>"],
+  "done": <true if the snippets already cover all five mandates well enough that more searching is waste>
+}}
+
+RULES:
+- extract_urls MUST be copied verbatim from the snippet urls. Never invent or modify a url.
+- Prefer primary sources: official docs/quotas pages, engineering blogs, postmortems, papers, GitHub readmes — over aggregator listicles.
+- Be selective: each extract costs real budget. An extract that merely repeats its snippet is waste.
+
+QUERIES ALREADY RUN (do not repeat):
+{queries_run}
+
+Return ONLY the JSON object."""
+
+
+RESEARCH_SYNTHESIS_PROMPT = """You are compiling the research dossier for a presales engagement — the typed record of everything web research established. Downstream, the solution decisions cite this dossier and the report renders it as "Research & Prior Art", so precision and honest gaps both matter.
+
+RESEARCH MANDATES the dossier must address:
+1. CRUX CAPABILITY ({core_challenge})
+2. PRIOR ART — who tried this, what happened
+3. LIBRARY / TOOL LANDSCAPE
+4. SERVICE LIMITS — what bites in production
+5. BENCHMARKS — comparable cost/effort
+
+ENGAGEMENT BRIEF:
+{engagement_brief}
+
+EVIDENCE — search snippets:
+{snippets_block}
+
+EVIDENCE — full-page extracts (highest signal; quote from these where possible):
+{extracts_block}
+
+OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences):
+
+{{
+  "findings": [
+    {{
+      "claim": "<the fact, stated plainly — specific, with numbers/versions where the source gives them>",
+      "kind": "capability | limit | gotcha | benchmark | prior_art | library",
+      "source_url": "<MUST be one of the evidence urls above>",
+      "source_title": "<the source's title>",
+      "quote": "<short VERBATIM quote (≤300 chars) from the source backing the claim>",
+      "relevance_note": "<one line: why this matters to THIS engagement>"
+    }}
+  ],
+  "prior_art": [
+    {{
+      "name": "<company / project / paper / product>",
+      "url": "<MUST be one of the evidence urls above>",
+      "what_they_did": "<what they built or attempted>",
+      "outcome": "<what happened — shipped / failed / partial; numbers when stated>",
+      "applicability": "<how closely it maps to this engagement and what transfers>"
+    }}
+  ],
+  "libraries": [
+    {{
+      "name": "<library / tool / framework>",
+      "url": "<MUST be one of the evidence urls above>",
+      "purpose": "<what part of this problem it covers>",
+      "maturity_note": "<one line: adoption / maintenance signal, if the source says>"
+    }}
+  ],
+  "unanswered": ["<mandates (or specific questions) the evidence could NOT settle — be honest; these surface as confidence notes>"]
+}}
+
+RULES:
+- EVERY url MUST be copied verbatim from the evidence above. Entries citing any other url are deleted mechanically — do not waste them.
+- A claim without a backing quote from its source is weaker — prefer fewer, well-quoted findings over many thin ones.
+- Do NOT pad: if research genuinely found no prior art, return an empty prior_art list and say so in unanswered. An honest gap is worth more than a stretched analogy.
+- Aim for 8-20 findings across kinds, ≤5 prior_art, ≤8 libraries.
 
 Return ONLY the JSON object."""
 
@@ -289,7 +422,7 @@ SECTION CONTRACT:
 EVIDENCE (the client's own document — reference in plain prose, never as an opaque id):
 {evidence_block}
 
-RESEARCH FINDINGS (external sources; cite these as REAL clickable links to back any industry/expert/tool-capability claim — never invent a url):
+RESEARCH FINDINGS (external sources routed to THIS section; cite these as REAL clickable links to back any industry/expert/tool-capability claim — never invent a url. When a finding carries a verbatim quote, you may use it attributed with its link; never repeat a sourced fact without its link):
 {research_block}
 
 GLOBAL ASSUMPTIONS (you inherit these; do not restate them):
@@ -306,7 +439,7 @@ RULES:
 - VOICE — write as a senior consultant giving direction, not a clerk summarizing the brief. Commit to a recommendation in the first sentence of each point, then defend it. Do NOT open a paragraph with a hedge ("It depends", "This is contingent on", "may/might/could", "further analysis is needed", "the pilot will tell us"). When something is genuinely uncertain, state the expert DEFAULT position decisively, then add at most one clause: "…unless <the single condition that would change it>". Decisiveness is graded.
 - Every claim_to_make MUST be addressed. Ground it in the evidence where you can. Where the evidence is silent, give the industry-standard expert answer and mark it inline with "Assumption:". Assumptions are the exception, not the texture — a section that is mostly "Assumption:" lines has failed.
 - ADD VALUE beyond the input. The client already knows what they wrote; tell them what a senior practitioner knows that they don't — the standard approach, the real options, the failure mode to avoid. A section that only restates the brief has failed.
-- IF THIS IS THE `recommended-approach` SECTION: show the ACTUAL MACHINE that delivers the recommended approach to the core_challenge — the concrete build→test→self-correct loop, the named tooling, what drives the work and where it runs. A lead should be able to start building from it. A generic "inventory → map → generate → validate" outline FAILS. Include the required diagram of the flow. Cite tool-capability claims to RESEARCH FINDINGS.
+- IF THIS IS THE `recommended-approach` SECTION: show the ACTUAL MACHINE that delivers the recommended approach to the core_challenge — the concrete build→test→self-correct loop, the named tooling, what drives the work and where it runs. A lead should be able to start building from it. A generic "inventory → map → generate → validate" outline FAILS. Include the required diagram of the flow. Cite tool-capability claims to RESEARCH FINDINGS. End the section with a short "### Why we believe this works" passage that names what concretely grounds the feasibility claim — the specific research findings, comparable precedents, or proof-points — and states the single biggest thing that would disprove it. If nothing grounds it, say so plainly as an Assumption rather than projecting confidence.
 - CITATIONS — two distinct kinds, never an opaque label:
   - A fact from the CLIENT's own document: reference it inline in plain prose (e.g. "per the RFP, the timeline is 20 days"). Do NOT dress it as a formal citation, and NEVER emit placeholder links like (#), (source), or "(quoted)".
   - An EXTERNAL / industry fact (a known issue, a best practice, a vendor capability): cite it as a real clickable markdown link to its source — [descriptive text](https://real-url). Never invent a URL; if you have no real source, mark it "Assumption:" instead.
@@ -361,8 +494,8 @@ OUTPUT JSON SCHEMA (return ONLY valid JSON, no markdown fences):
 }}
 
 RUBRIC (apply per section, weighted by the section's rubric_focus). For each, a 1 is the failure mode, a 5 is the bar:
-- engages_core_challenge: 1 = the report dances around the engagement's crux (the core_challenge) or retreats to a generic playbook that ignores the client's actual goal/method; 5 = it answers the crux head-on and constructively. Apply hardest to the `recommended-approach` section. A report that does not engage its own core_challenge fails overall.
-- approach_concreteness: 1 = the recommended approach is a generic process outline ("inventory → map → generate → validate") or the approaches are vague labels; 5 = the approach shows the ACTUAL machine (named tooling, the build/validate loop, where it runs) a lead could start building, and tool-capability claims carry a real source link.
+- engages_core_challenge: 1 = the report dances around the engagement's crux (the core_challenge) or retreats to a generic playbook that ignores the client's actual goal/method (e.g. crux is "can an agentic Copilot loop automate 80%?" and the section answers "follow a phased migration methodology with regular checkpoints"); 5 = it answers the crux head-on and constructively. Apply hardest to the `recommended-approach` section. A report that does not engage its own core_challenge fails overall.
+- approach_concreteness: 1 = the recommended approach is a generic process outline ("inventory → map → generate → validate") or the approaches are vague labels ("use machine learning"); 5 = the approach shows the ACTUAL machine (named tooling, the build/validate loop, where it runs) a lead could start building ("fine-tune a 7B model with LoRA on labeled intents; batch jobs assign work units; failed validations re-queue with the error appended"), and tool-capability claims carry a real source link.
 - decisiveness: 1 = fence-sitting, "it depends", every claim deferred to a future pilot/analysis; 5 = commits to a recommendation and defends it, uncertainty handled with a single "unless X" clause. THIS IS A TOP PRIORITY AXIS — a hedged section fails even if everything else is perfect.
 - insight: 1 = only restates the client's own brief; 5 = tells the client something a senior practitioner knows that they don't (the standard approach, the real options, the failure mode to avoid).
 - non_redundancy: 1 = repeats facts, themes, or recommendations that other sections already cover; 5 = says each idea once, cross-references instead of repeating.
@@ -381,5 +514,6 @@ RULES:
 - If a section passes its rubric, set revise=false and revision_note="".
 - Flag a section when it materially fails ANY axis — especially decisiveness, insight, or non_redundancy. Do not flag mere stylistic preferences.
 - The revision_note must be actionable in one writer turn and concrete (name the hedge to cut, the duplicate to remove, or the missing recommendation). No "improve the overall flow" notes.
+- UPSTREAM FAILURES ARE NOT WRITER FAILURES. If a section's real defect lives in the contract's decisions — an incoherent cost basis, an approach choice the evidence contradicts, a timeline that cannot contain the estimated hours — do NOT burn the writer revision asking for better prose around a bad decision. Set revise=false for that section and put the defect in its `issues` list prefixed "DECIDER:" (e.g. "DECIDER: cost_lines total ~2,400h but the timeline allows ~800 person-hours"). These surface as report-level confidence issues instead of being papered over.
 
 Return ONLY the JSON object."""

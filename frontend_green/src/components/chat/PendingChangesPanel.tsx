@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
-import { isAxiosError } from 'axios';
+import { notifyError } from '../../services/api';
 import {
   listPendingChanges,
   addPendingChange,
@@ -60,12 +60,9 @@ export default function PendingChangesPanel({ chatHistoryId, open, onClose, draf
     if (open && draft) setText(draft);
   }, [open, draft]);
 
-  const handleErr = (err: unknown, fallback: string) => {
-    const detail =
-      (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-      (err instanceof Error ? err.message : fallback);
-    toast.error(detail);
-  };
+  // Limit 402s (e.g. hitting the monthly report cap on regenerate) are surfaced by the global
+  // UpgradeModal; notifyError skips toasting those and never passes an object detail to toast.
+  const handleErr = (err: unknown, fallback: string) => notifyError(err, fallback);
 
   const add = async () => {
     const user_request = text.trim();

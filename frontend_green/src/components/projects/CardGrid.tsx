@@ -44,9 +44,10 @@ function matchesFilter(p: ProjectRow, f: Filter): boolean {
 
 interface Props {
   projects: ProjectRow[];
+  onRenamed?: (chatHistoryId: string, customTitle: string | null) => void;
 }
 
-export default function CardGrid({ projects }: Props) {
+export default function CardGrid({ projects, onRenamed }: Props) {
   const [filter, setFilter] = useState<Filter>('all');
   const [sort, setSort] = useState<SortKey>('recent');
   const [query, setQuery] = useState('');
@@ -69,6 +70,7 @@ export default function CardGrid({ projects }: Props) {
       list = list.filter(
         (p) =>
           p.title.toLowerCase().includes(q) ||
+          (p.custom_title || '').toLowerCase().includes(q) ||
           (p.last_message_preview || '').toLowerCase().includes(q),
       );
     }
@@ -313,7 +315,7 @@ export default function CardGrid({ projects }: Props) {
           }}
         >
           {filtered.map((p, i) => (
-            <ProjectCard key={p.chat_history_id} project={p} delay={Math.min(i, 12) * 40} />
+            <ProjectCard key={p.chat_history_id} project={p} delay={Math.min(i, 12) * 40} onRenamed={onRenamed} />
           ))}
           {showNewCard && <NewProjectCard />}
         </div>

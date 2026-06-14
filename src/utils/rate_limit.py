@@ -146,6 +146,48 @@ async def mark_verification_sent(user_id: str, cooldown: int):
         logger.error(f"verification resend mark error: {e}")
 
 
+async def check_public_readiness(token: str, cooldown: int, hourly_cap: int):
+    """Return (allowed, retry_after_seconds) for a public 'Check readiness' call.
+    Per-TOKEN cooldown + hourly cap — the token is the abusable resource, so this
+    caps LLM cost even from many IPs. Fails OPEN on Redis trouble; the durable
+    DB lifetime cap (client_check_count) is the backstop that never fails open."""
+    try:
+        redis = await _get_limiter_redis()
+        if redis is None:
+            return True, 0
+        prefix = FastAPILimiter.prefix or "fastapi-limiter:"
+        cd_key = f"{prefix}readiness:cd:{token}"
+        ct_key = f"{prefix}readiness:ct:{token}"
+        ttl = await redis.ttl(cd_key)
+        if ttl and ttl > 0:
+            return False, int(ttl)
+        count = int(await redis.get(ct_key) or 0)
+        if count >= hourly_cap:
+            cap_ttl = await redis.ttl(ct_key)
+            return False, max(int(cap_ttl), 1)
+        return True, 0
+    except Exception as e:
+        logger.error(f"public readiness throttle check error: {e}")
+        return True, 0
+
+
+async def mark_public_readiness(token: str, cooldown: int):
+    """Arm the per-token cooldown + bump the hourly count (1h TTL). Best-effort."""
+    try:
+        redis = await _get_limiter_redis()
+        if redis is None:
+            return
+        prefix = FastAPILimiter.prefix or "fastapi-limiter:"
+        cd_key = f"{prefix}readiness:cd:{token}"
+        ct_key = f"{prefix}readiness:ct:{token}"
+        await redis.set(cd_key, "1", ex=cooldown)
+        count = await redis.incr(ct_key)
+        if count == 1:
+            await redis.expire(ct_key, 3600)
+    except Exception as e:
+        logger.error(f"public readiness mark error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 

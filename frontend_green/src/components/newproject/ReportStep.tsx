@@ -8,6 +8,7 @@ interface Props {
   projectTitle: string;
   chatHistoryId: string | null;
   onOpenChat: () => void;
+  running?: boolean;
   onBack: () => void;
   onContentChange?: (content: string) => void;
   requireAssumptionAck?: boolean;
@@ -18,6 +19,7 @@ export default function ReportStep({
   projectTitle,
   chatHistoryId,
   onOpenChat,
+  running = false,
   onBack,
   onContentChange,
   requireAssumptionAck = false,
@@ -203,7 +205,7 @@ export default function ReportStep({
                 getReportNode={() => reportRef.current}
                 markdown={reportContent}
                 title={projectTitle}
-                trailing={<RunButton onClick={onOpenChat} locked={runLocked} />}
+                trailing={<RunButton onClick={onOpenChat} locked={runLocked} running={running} />}
               />
             </>
           )}
@@ -395,7 +397,7 @@ export default function ReportStep({
                 </p>
               </div>
             </div>
-            <RunButton onClick={onOpenChat} locked={runLocked} large />
+            <RunButton onClick={onOpenChat} locked={runLocked} running={running} large />
           </div>
         )}
       </div>
@@ -410,17 +412,21 @@ function Dot() {
 function RunButton({
   onClick,
   locked,
+  running,
   large,
 }: {
   onClick: () => void;
   locked?: boolean;
+  running?: boolean;
   large?: boolean;
 }) {
+  const disabled = locked || running;
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={locked}
+      disabled={disabled}
+      aria-busy={running}
       title={locked ? 'Acknowledge the AI-inferred assumptions before running the full pipeline.' : undefined}
       style={{
         display: 'inline-flex',
@@ -434,17 +440,24 @@ function RunButton({
         color: 'var(--accent-ink)',
         border: 'none',
         boxShadow: 'var(--glow)',
-        cursor: locked ? 'not-allowed' : 'pointer',
-        opacity: locked ? 0.55 : 1,
+        cursor: disabled ? (running ? 'progress' : 'not-allowed') : 'pointer',
+        opacity: disabled ? 0.6 : 1,
         fontFamily: large ? 'var(--font-display)' : 'var(--font-sans)',
         whiteSpace: 'nowrap',
         flexShrink: 0,
       }}
     >
-      Run full pipeline
-      <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path d="M5 12h14M13 5l7 7-7 7" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
+      {running ? 'Starting pipeline…' : 'Run full pipeline'}
+      {running ? (
+        <span style={{
+          width: 13, height: 13, borderRadius: '50%', border: '2px solid currentColor',
+          borderTopColor: 'transparent', display: 'inline-block', animation: 'spin 0.7s linear infinite',
+        }} />
+      ) : (
+        <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path d="M5 12h14M13 5l7 7-7 7" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      )}
     </button>
   );
 }

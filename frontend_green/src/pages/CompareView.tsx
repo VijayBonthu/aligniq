@@ -11,6 +11,7 @@ import {
   getVersionSections,
   setDefaultVersion,
   addPendingChange,
+  getChangeOrder,
   type ReportVersionMeta,
   type VersionDiff,
   type VersionMetric,
@@ -251,6 +252,48 @@ export default function CompareView() {
     }
   };
 
+  // The signed baseline + the active version drive the "since sign-off" preset
+  // and the change-order draft (the scope-creep-defense artifact).
+  const baselineVersion = useMemo(() => versions.find((v) => v.is_client_signoff)?.version_number ?? null, [versions]);
+  const activeVersion = useMemo(() => {
+    const def = versions.find((v) => v.is_default);
+    if (def) return def.version_number;
+    return versions.find((v) => v.is_latest)?.version_number ?? versions[0]?.version_number ?? null;
+  }, [versions]);
+
+  const sinceSignoff = () => {
+    if (baselineVersion == null || activeVersion == null) return;
+    if (baselineVersion === activeVersion) {
+      toast('The active version IS the signed baseline — nothing has changed yet.');
+      return;
+    }
+    setPair(baselineVersion, activeVersion);
+  };
+
+  const draftChangeOrder = async () => {
+    if (!chatHistoryId) return;
+    setBusy(true);
+    try {
+      const co = await getChangeOrder(chatHistoryId, 'pdf');
+      if (co.pdf_base64) {
+        const bytes = atob(co.pdf_base64);
+        const arr = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([arr], { type: 'application/pdf' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = co.filename || 'change-order.pdf';
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+      toast.success(`Change order drafted: baseline v${co.baseline_version} → v${co.current_version}`);
+    } catch (err) {
+      handleErr(err, 'Could not draft change order');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const cheapest = useMemo(() => {
     const priced = metrics.filter((m) => m.cost_low != null);
     return priced.length ? priced.reduce((p, c) => ((c.cost_low as number) < (p.cost_low as number) ? c : p)).version : null;
@@ -296,6 +339,12 @@ export default function CompareView() {
               {versions.map((v) => <option key={v.version_number} value={v.version_number}>v{v.version_number}</option>)}
             </select>
             <div style={{ flex: 1 }} />
+            {baselineVersion != null && (
+              <button onClick={sinceSignoff} disabled={busy} style={ghostBtn} title={`Compare the signed baseline (v${baselineVersion}) to the active version`}>Since sign-off</button>
+            )}
+            {baselineVersion != null && (
+              <button onClick={draftChangeOrder} disabled={busy} style={primaryBtn} title="Deterministic change order: signed baseline vs current scope">Draft change order</button>
+            )}
             {b != null && <button onClick={() => makeActive(b)} disabled={busy} style={primaryBtn}>Set v{b} active</button>}
             <button onClick={exportPdf} disabled={busy || loading} style={ghostBtn}>Export PDF</button>
           </div>

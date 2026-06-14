@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import { isAxiosError } from 'axios';
+import { friendlyError } from '../../services/api';
 import {
   listJiraProjects,
   listJiraEpics,
@@ -27,11 +28,10 @@ interface Props {
   onClose: () => void;
 }
 
+// Always returns a string — friendlyError safely flattens an object `detail` so it can never
+// reach toast.error() (which crashes on a non-string React child).
 function errDetail(err: unknown, fallback: string): string {
-  return (
-    (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-    (err instanceof Error ? err.message : fallback)
-  );
+  return friendlyError(err, fallback);
 }
 
 export default function JiraWorkspace({ chatHistoryId, onClose }: Props) {

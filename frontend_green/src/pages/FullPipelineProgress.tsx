@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
 import { isAxiosError } from 'axios';
 import PipelineProgress from '../components/pipeline/PipelineProgress';
+import { friendlyError } from '../services/api';
 import {
   startFullPipeline,
   resumeFullPipeline,
@@ -59,10 +60,7 @@ export default function FullPipelineProgress() {
           try {
             await startFullPipeline(chatHistoryId);
           } catch (err) {
-            const detail =
-              (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-              (err instanceof Error ? err.message : 'Failed to start pipeline.');
-            toast.error(detail);
+            toast.error(friendlyError(err, 'Couldn’t start your report just yet — please try again shortly.'));
           }
         }
 
@@ -107,10 +105,7 @@ export default function FullPipelineProgress() {
       );
       toast.success('Pipeline restarted.');
     } catch (err) {
-      const detail =
-        (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-        (err instanceof Error ? err.message : 'Failed to restart pipeline.');
-      toast.error(detail);
+      toast.error(friendlyError(err, 'Couldn’t restart your report just yet — please try again shortly.'));
     } finally {
       setActionInFlight(false);
     }
@@ -151,10 +146,7 @@ export default function FullPipelineProgress() {
         await handleRetry();
         return;
       }
-      const detail =
-        (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-        (err instanceof Error ? err.message : 'Failed to resume pipeline.');
-      toast.error(detail);
+      toast.error(friendlyError(err, 'Couldn’t resume your report just yet — please try again shortly.'));
     } finally {
       setActionInFlight(false);
     }
@@ -299,10 +291,14 @@ export default function FullPipelineProgress() {
                   marginBottom: 6,
                 }}
               >
-                Pipeline failed
+                Something went wrong
               </p>
-              <p style={{ fontSize: 13, color: 'var(--fg)', margin: 0, marginBottom: 12 }}>
-                {snapshot?.error || 'Unknown error.'}
+              {/* NEVER surface the raw backend error to customers — it can leak
+                  platform/billing internals (e.g. OpenAI quota). The real error is
+                  in pipeline_runs.error + logs for staff. */}
+              <p style={{ fontSize: 13, color: 'var(--fg)', margin: 0, marginBottom: 12, lineHeight: 1.5 }}>
+                We hit a problem finishing your report. Our team has been notified and is looking into it —
+                please try again in a little while.
               </p>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button

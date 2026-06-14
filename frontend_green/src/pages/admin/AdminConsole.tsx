@@ -6,7 +6,7 @@ import { friendlyError } from '../../services/api';
 import * as ops from '../../services/adminOpsService';
 import EmojiInsert from '../../components/ops/EmojiInsert';
 
-type Tab = 'ops' | 'announcements' | 'changelog' | 'staff';
+type Tab = 'ops' | 'announcements' | 'changelog' | 'staff' | 'emails';
 
 const labelStyle: React.CSSProperties = {
   display: 'block', fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.06em',
@@ -472,7 +472,113 @@ const TAB_LABELS: Record<Tab, string> = {
   announcements: 'Announcements',
   changelog: 'Changelog',
   staff: 'Staff access',
+  emails: 'Client emails',
 };
+
+const EMAIL_TEMPLATE_KEYS: { key: string; label: string }[] = [
+  { key: 'questionnaire_invite', label: 'Questionnaire invite' },
+  { key: 'questionnaire_reminder', label: 'Questionnaire reminder' },
+];
+const EMAIL_FIELDS: { key: keyof ops.EmailTemplateFields; label: string; multiline?: boolean }[] = [
+  { key: 'subject', label: 'Subject' },
+  { key: 'heading', label: 'Heading' },
+  { key: 'intro', label: 'Intro paragraph', multiline: true },
+  { key: 'button_label', label: 'Button label' },
+  { key: 'signoff', label: 'Sign-off (optional)', multiline: true },
+];
+
+function EmailTemplatesTab() {
+  const [search, setSearch] = useState('');
+  const [firms, setFirms] = useState<ops.FirmRef[]>([]);
+  const [selected, setSelected] = useState<ops.FirmRef | null>(null);
+  const [data, setData] = useState<ops.FirmEmailTemplates | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, ops.EmailTemplateFields>>({});
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => { ops.listFirms(search).then(setFirms).catch((e) => toast.error(friendlyError(e))); }, 250);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const selectFirm = async (f: ops.FirmRef) => {
+    setSelected(f);
+    setData(null);
+    try {
+      const res = await ops.getFirmEmailTemplates(f.firm_id);
+      setData(res);
+      const d: Record<string, ops.EmailTemplateFields> = {};
+      for (const { key } of EMAIL_TEMPLATE_KEYS) d[key] = { ...(res.templates[key]?.override || {}) };
+      setDrafts(d);
+    } catch (e) { toast.error(friendlyError(e)); }
+  };
+
+  const setField = (tkey: string, fkey: keyof ops.EmailTemplateFields, v: string) =>
+    setDrafts((p) => ({ ...p, [tkey]: { ...p[tkey], [fkey]: v } }));
+
+  const save = async (tkey: string) => {
+    if (!selected) return;
+    setSavingKey(tkey);
+    try {
+      await ops.saveFirmEmailTemplate(selected.firm_id, tkey, drafts[tkey] || {});
+      toast.success('Template saved — this org now uses your custom copy.');
+    } catch (e) { toast.error(friendlyError(e)); }
+    finally { setSavingKey(null); }
+  };
+
+  return (
+    <div>
+      <div style={card}>
+        <h3 style={{ margin: '0 0 6px', fontSize: 16 }}>Client email templates</h3>
+        <p style={{ color: 'var(--fg-dim)', fontSize: 13, margin: '0 0 14px' }}>
+          Customize the questionnaire emails per organization. Leave a field blank to use the GroundedIQ default.
+          The GroundedIQ brand and the email layout are always applied — you're only editing the copy.
+        </p>
+        <input className="input" style={{ width: '100%' }} placeholder="Search organizations…"
+               value={search} onChange={(e) => setSearch(e.target.value)} />
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+          {firms.map((f) => (
+            <button key={f.firm_id} className="btn btn-ghost" onClick={() => selectFirm(f)}
+                    style={{ padding: '4px 10px', fontSize: 13, border: `1px solid ${selected?.firm_id === f.firm_id ? 'var(--accent)' : 'var(--border)'}`, color: selected?.firm_id === f.firm_id ? 'var(--accent)' : 'var(--fg-dim)' }}>
+              {f.name}
+            </button>
+          ))}
+          {firms.length === 0 && <span style={{ color: 'var(--fg-muted)', fontSize: 13 }}>No organizations match.</span>}
+        </div>
+      </div>
+
+      {selected && data && EMAIL_TEMPLATE_KEYS.map(({ key, label }) => {
+        const defaults = data.templates[key]?.defaults || {};
+        return (
+          <div key={key} style={{ ...card, marginTop: 16 }}>
+            <h4 style={{ margin: '0 0 10px', fontSize: 15 }}>{label} — <span style={{ color: 'var(--fg-muted)', fontWeight: 400 }}>{selected.name}</span></h4>
+            {EMAIL_FIELDS.map(({ key: fkey, label: flabel, multiline }) => (
+              <div key={fkey} style={{ marginBottom: 10 }}>
+                <label style={{ display: 'block', fontSize: 12, color: 'var(--fg-muted)', marginBottom: 4 }}>{flabel}</label>
+                {multiline ? (
+                  <textarea className="input" style={{ width: '100%', minHeight: 56 }}
+                            placeholder={(defaults as Record<string, string>)[fkey] || ''}
+                            value={(drafts[key]?.[fkey] as string) || ''}
+                            onChange={(e) => setField(key, fkey, e.target.value)} />
+                ) : (
+                  <input className="input" style={{ width: '100%' }}
+                         placeholder={(defaults as Record<string, string>)[fkey] || ''}
+                         value={(drafts[key]?.[fkey] as string) || ''}
+                         onChange={(e) => setField(key, fkey, e.target.value)} />
+                )}
+              </div>
+            ))}
+            <p style={{ fontSize: 11, color: 'var(--fg-muted)', margin: '4px 0 10px' }}>
+              Tip: use <code>{'{firm}'}</code> in the heading or intro to insert the firm's name.
+            </p>
+            <button className="btn btn-primary" disabled={savingKey === key} onClick={() => save(key)}>
+              {savingKey === key ? 'Saving…' : `Save ${label.toLowerCase()}`}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 export default function AdminConsole() {
   const [tab, setTab] = useState<Tab>('ops');
@@ -499,6 +605,7 @@ export default function AdminConsole() {
       {tab === 'announcements' && <AnnouncementsTab />}
       {tab === 'changelog' && <ChangelogTab />}
       {tab === 'staff' && <StaffTab />}
+      {tab === 'emails' && <EmailTemplatesTab />}
     </div>
   );
 }

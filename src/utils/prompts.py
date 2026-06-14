@@ -3034,6 +3034,66 @@ You MUST return one entry in `responses` for EACH panelist id given above (in th
 """
 
 
+PRE_MORTEM_TURN_PROMPT_V2 = """You are an adversarial buyer-side panel stress-testing a vendor's presales report before a stakeholder meeting. The report's OWN weaknesses have already been enumerated below as OBJECTION VECTORS (computed deterministically from the report's typed contract).
+
+Your job is NOT to invent weaknesses. It is to:
+1. SELECT — for each panelist, pick the vectors THAT persona would actually weaponize in the room.
+2. VOICE — say it in their register (a CFO and a CISO attack the same vector differently).
+3. RANK — order by deal-kill likelihood from the buyer's chair.
+4. DRAFT — write the BA's honest counter-response.
+
+PANELISTS (this turn):
+{panelists_block}
+
+OBJECTION VECTORS (cite these by id — every item MUST reference at least one):
+{vectors_block}
+
+COST FACTS (precomputed — quote these numbers, never recompute or invent):
+{cost_facts_block}
+
+PRIOR THREAD (condensed, for continuity):
+{thread_history}
+
+THIS TURN — kind = "{turn_kind}":
+USER MESSAGE: {user_message}
+
+INSTRUCTIONS:
+- For a "starter" turn: each panelist produces {starter_min}–{starter_max} of the strongest objections THEY would raise, drawn from the vectors. Cover their distinct angle.
+- For a "user_question" turn: each panelist produces {followup_min}–{followup_max} reactions to what the user just said, still grounded in vectors.
+- Every item's `evidence` array MUST contain at least one entry of `{{"type": "vector", "vector_id": "<an id from OBJECTION VECTORS>", "label": "<the vector's title>"}}`. Items that cite a vector id not in the list above are DISCARDED — only cite ids that exist.
+- COST objections: quote the COST FACTS lines verbatim and cite the matching `sens-*` or `wc` vector. Never state a dollar figure that isn't in COST FACTS.
+- UNDERPLAY objections (vector_type underplay): quote the client's own words back to them ("You called this 'a simple data sync' — in our experience that means…").
+- `severity`: "high" (deal-breaker), "med" (needs explanation), "low" (minor pushback) — judged by deal-kill likelihood, not topic importance.
+- `point`: what THIS panelist says, first person, 1–3 sharp sentences. Paraphrase the vector in plain English — NEVER write a raw id like `up-2` or `sens-0` in prose.
+- `counter_response`: the BA's honest answer, 2–4 sentences, referencing the vector's substance. If the objection genuinely can't be defended yet, say so and recommend taking it to the client as an open question.
+- If a panelist honestly has nothing this turn, return them with `items: []` — do not pad or invent.
+- Do NOT repeat objections already in PRIOR THREAD unless the user revisits them.
+
+OUTPUT — strict JSON, this exact shape, no surrounding prose:
+
+{{
+  "responses": [
+    {{
+      "panelist_id": "<one of the panelist ids above>",
+      "items": [
+        {{
+          "id": "auto",
+          "severity": "high|med|low",
+          "point": "...",
+          "counter_response": "...",
+          "evidence": [
+            {{ "type": "vector", "vector_id": "<id from OBJECTION VECTORS>", "label": "<vector title>" }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+
+Return one entry in `responses` for EACH panelist id above (same order), even if `items: []`.
+"""
+
+
 # Legacy v1 one-shot prompt — kept for reference and potentially reusable
 # by a future "snapshot" feature. Not wired into the live flow.
 PRE_MORTEM_PROMPT = """You are simulating three adversarial buyer-side reviewers of a presales report that a vendor will pitch to a client. Your job is to generate the questions/objections each reviewer will raise IN THE MEETING, plus a drafted counter-response the vendor's BA can use, grounded in the report data below.

@@ -44,7 +44,17 @@ from vectordb import chunking
 from agents.agentic_workflow import invoke_with_timeout, llm_parser
 from agents.contract import ReportContract
 from agents.stitcher import render_report
-from agents.tools import validate_mermaid, validate_citations, format_prechecks_for_judge
+from agents.tools import (
+    validate_mermaid,
+    validate_citations,
+    validate_cost_bands,
+    validate_verdict_discipline,
+    research_gaps,
+    reconcile_staffing_gaps,
+    resolve_rates,
+    sanitize_service_option_sources,
+    format_prechecks_for_judge,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +115,7 @@ _HASHES = {
 }
 
 
-CONTRACT_STAGES_ORDER = ["plan", "decide", "write_sections", "judge_and_finalize"]
+CONTRACT_STAGES_ORDER = ["plan", "research", "decide", "write_sections", "judge_and_finalize"]
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +257,8 @@ _DECISION_FIELDS = (
     "contingency_pct", "timeline", "team", "feasibility",
     # Slice 2 — service_options ride inside tech_decisions (no separate key).
     "integration_points", "staffing_gaps",
+    # Reality Gap — quote-anchored client-side understatements.
+    "underplay_flags",
 )
 
 
@@ -383,14 +395,38 @@ async def research_node(*, contract: ReportContract) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Node 1.6 — known issues (Tavily-backed; flag-gated; runs inside decide stage)
 # ---------------------------------------------------------------------------
+def _dossier_covers(contract: ReportContract, subject: str) -> bool:
+    """True when the research dossier already carries a gotcha/limit finding
+    about `subject` — the known-issues pass skips it to avoid paying for the
+    same research twice. Token-overlap match (a 'Power BI iframe -> Azure
+    Function' seam is never a literal substring of a short claim): covered when
+    ≥half of the subject's salient tokens appear in a gotcha/limit finding."""
+    dossier = contract.research_dossier
+    if not dossier or not subject:
+        return False
+    import re as _re
+    tokens = [t for t in _re.findall(r"[a-z0-9]+", subject.lower()) if len(t) >= 3]
+    if not tokens:
+        return False
+    for f in dossier.findings:
+        if f.kind not in ("gotcha", "limit"):
+            continue
+        haystack = f"{f.claim} {f.relevance_note}".lower()
+        hits = sum(1 for t in tokens if t in haystack)
+        if hits and hits * 2 >= len(tokens):
+            return True
+    return False
+
+
 def _build_known_issue_queries(contract: ReportContract, limit: int) -> list[str]:
-    """Targeted queries from integration points (highest signal) then tech picks."""
+    """Targeted queries from integration points (highest signal) then tech picks.
+    Skips subjects the research dossier already covers with gotcha/limit findings."""
     queries: list[str] = []
     for ip in contract.integration_points:
-        if ip and ip.strip():
+        if ip and ip.strip() and not _dossier_covers(contract, ip):
             queries.append(f"known issues integrating {ip.strip()}")
     for td in contract.tech_decisions:
-        if td.choice and td.choice.strip():
+        if td.choice and td.choice.strip() and not _dossier_covers(contract, td.choice):
             queries.append(f"{td.choice.strip()} production gotchas known issues")
     # De-dupe preserving order, then cap.
     seen: set[str] = set()
@@ -489,6 +525,17 @@ async def known_issues_node(
 # ---------------------------------------------------------------------------
 # Node 2 — parallel section writers
 # ---------------------------------------------------------------------------
+
+# Typed research routing: which dossier finding kinds each standard section
+# consumes. Sections not listed (and any dossier-less run) get the full block.
+_SECTION_RESEARCH_KINDS = {
+    "recommended-approach":  ["capability", "prior_art", "library", "benchmark"],
+    "proposed-architecture": ["capability", "limit", "library"],
+    "risks-and-mitigations": ["gotcha", "limit"],
+    "feasibility-and-cost":  ["benchmark", "limit"],
+}
+
+
 async def _write_one_section(
     *,
     contract: ReportContract,
@@ -503,6 +550,15 @@ async def _write_one_section(
     section = contract.get_section(section_id)
     if section is None:
         raise KeyError(f"contract_pipeline: section_id '{section_id}' not in contract")
+
+    # Depth Cut: when a typed dossier exists, route each section the finding
+    # kinds it actually consumes (verbatim quotes + real links) instead of one
+    # undifferentiated block for everyone.
+    if contract.research_dossier:
+        from agents.research_agent import dossier_research_block
+        research_block = dossier_research_block(
+            contract.research_dossier, _SECTION_RESEARCH_KINDS.get(section_id)
+        )
 
     # Substance-heavy sections get the higher-reasoning writer; bulk sections stay cheap.
     llm = _writer_llm_high if section_id in _DEEP_REASONING_SECTIONS else _writer_llm
@@ -652,6 +708,7 @@ async def run_contract_pipeline(
     on_stage_started: Optional[callable] = None,
     on_stage_completed: Optional[callable] = None,
     model_tier: str = "frontier",
+    rate_cards: Optional[list[dict]] = None,
 ) -> dict:
     """Run all stages and stitch the final report.
 
@@ -695,15 +752,52 @@ async def run_contract_pipeline(
     if on_stage_completed:
         await on_stage_completed("plan")
 
-    # Stage 2 — research + decide. Research runs first (over the planner's
-    # crux-targeted research_queries) so the decider can ground its approaches and
-    # feasibility in the current real world. Both the crux research and the
-    # post-decide known-issues research are inert without ENABLE_* + a Tavily key,
-    # so the report renders normally when they are absent. They fold into one UI stage.
+    # Stage 2 — research (its own visible stage). Frontier tiers run the
+    # iterative deep-research agent (fan-out → reflect → full-page extracts →
+    # follow-ups → typed ResearchDossier); lite tiers keep the original
+    # single-pass fan-out so free/basic COGS is unchanged. Inert without
+    # ENABLE_RESEARCH + a Tavily key — the report renders normally either way.
+    if on_stage_started:
+        await on_stage_started("research")
+    dossier = None
+    if model_tier == "frontier":
+        from agents.research_agent import run_deep_research, dossier_research_block
+        dossier = await run_deep_research(
+            contract=contract, smart_llm=smart_llm, smart_model=smart_model,
+        )
+        if dossier and (dossier.findings or dossier.prior_art or dossier.libraries):
+            contract.research_dossier = dossier
+            research_block = dossier_research_block(dossier)
+            # Honest gaps: mandates research could not settle become Confidence Notes.
+            contract.confidence_notes.extend(
+                f"Research could not settle: {u}" for u in dossier.unanswered
+            )
+        else:
+            dossier = None  # empty dossier → fall through to the single-pass path
+
+    if dossier is None:
+        research_findings = await research_node(contract=contract)
+        research_block = _format_research_block(research_findings)
+
+        # Research-gap detection (deterministic): queries that came back with too
+        # little evidence mean the related claims are NOT grounded. Tell the decider
+        # now (so it lowers confidence instead of asserting), and stamp the gaps
+        # into the report's Confidence Notes.
+        gap_queries = research_gaps(contract.research_queries, research_findings)
+        if gap_queries:
+            gap_block = "\n\nRESEARCH GAPS — these queries returned little or no usable evidence; treat any related claim as an Assumption and lower its confidence:\n" + "\n".join(f"- {q}" for q in gap_queries)
+            research_block = research_block + gap_block
+            contract.confidence_notes.extend(
+                f"External research found little or no evidence for: “{q}” — related claims rest on expert judgment, not sources."
+                for q in gap_queries
+            )
+            logger.info(f"contract_pipeline: {len(gap_queries)} research quer(ies) returned insufficient evidence")
+    if on_stage_completed:
+        await on_stage_completed("research")
+
+    # Stage 3 — decide (+ the post-decide known-issues pass; both fold into one UI stage).
     if on_stage_started:
         await on_stage_started("decide")
-    research_findings = await research_node(contract=contract)
-    research_block = _format_research_block(research_findings)
     contract = await decide_node(
         contract=contract,
         firm_context=firm_context,
@@ -714,6 +808,33 @@ async def run_contract_pipeline(
         smart_model=smart_model,
     )
     contract = await known_issues_node(contract=contract, smart_llm=smart_llm, smart_model=smart_model)
+
+    # Deterministic decider-level enforcement — the decide prompt states these
+    # rules, but only a validator makes them real:
+    #  - every team role marked off-roster gets a staffing_gaps entry (firm-fit),
+    #  - estimate bands above the discipline ratio and hedge-verdicts are flagged
+    #    as contract issues → judge context + Confidence Notes (a writer cannot
+    #    prose-fix a 3x band, so these never trigger writer revisions).
+    gaps_added = reconcile_staffing_gaps(contract)
+    if gaps_added:
+        logger.info(f"contract_pipeline: reconcile_staffing_gaps appended {gaps_added} missing gap entr(ies)")
+    # Firm rate-card grounding (deterministic): overwrite the model's per-role
+    # rate with the firm's own rate card and stamp the rate_card_ref, BEFORE the
+    # writers run so any prose that references the cost lines sees the real
+    # numbers. Roles the card doesn't cover keep their estimate + a Confidence
+    # Note. No-op when the firm has no rate card loaded.
+    rate_notes = resolve_rates(contract.cost_lines, rate_cards or [])
+    if rate_notes:
+        contract.confidence_notes.extend(rate_notes)
+        logger.info(f"contract_pipeline: {len(rate_notes)} cost role(s) not on the firm rate card — market estimate kept")
+    blanked = sanitize_service_option_sources(contract)
+    if blanked:
+        logger.info(f"contract_pipeline: blanked {blanked} service-option source_url(s) not in the dossier")
+    contract_issues = validate_cost_bands(contract.cost_lines) + validate_verdict_discipline(contract.feasibility)
+    if contract_issues:
+        contract.confidence_notes.extend(ci.message[0].upper() + ci.message[1:] + "." for ci in contract_issues)
+        logger.info(f"contract_pipeline: validators flagged {len(contract_issues)} contract-level issue(s)")
+
     if on_stage_completed:
         await on_stage_completed("decide")
 
@@ -739,11 +860,11 @@ async def run_contract_pipeline(
         if section.diagrams_required:
             mermaid_issues.extend(validate_mermaid(section.id, body))
         citation_issues.extend(validate_citations(section.id, body))
-    prechecks_context = format_prechecks_for_judge(mermaid_issues, citation_issues)
-    if mermaid_issues or citation_issues:
+    prechecks_context = format_prechecks_for_judge(mermaid_issues, citation_issues, contract_issues)
+    if mermaid_issues or citation_issues or contract_issues:
         logger.info(
             f"contract_pipeline: prechecks flagged {len(mermaid_issues)} mermaid + "
-            f"{len(citation_issues)} citation issue(s)"
+            f"{len(citation_issues)} citation + {len(contract_issues)} contract issue(s)"
         )
 
     # Stage 4 — judge + targeted revisions
@@ -759,6 +880,19 @@ async def run_contract_pipeline(
         smart_llm=smart_llm,
         smart_model=smart_model,
     )
+    # Harvest decider-level defects the judge found (issues prefixed "DECIDER:")
+    # into Confidence Notes — these are contract problems prose cannot fix, so
+    # they surface honestly instead of being papered over by a writer revision.
+    if isinstance(judge_response, dict):
+        for entry in judge_response.get("section_scores") or []:
+            if not isinstance(entry, dict):
+                continue
+            for issue in entry.get("issues") or []:
+                if isinstance(issue, str) and issue.strip().upper().startswith("DECIDER:"):
+                    note = issue.strip()[len("DECIDER:"):].strip()
+                    if note and note not in contract.confidence_notes:
+                        contract.confidence_notes.append(note)
+
     # Judge notes are a debugging aid, not client content. Only embed them (as
     # HTML comments) when DEBUG_MODE is on; otherwise they would leak into the
     # client-facing PDF. The PDF generator also strips HTML comments as a backstop.

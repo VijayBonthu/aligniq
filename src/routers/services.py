@@ -992,6 +992,20 @@ async def update_presales_report(
 # Full 9-agent pipeline — async start + status polling
 # ---------------------------------------------------------------------------
 
+async def _build_structured_crd(
+    presales_id: str,
+    user_id: str,
+    presales: dict,
+    presales_brief_text: str,
+    db: Session,
+) -> str:
+    """Thin wrapper — the implementation moved to database_scripts.build_structured_crd
+    so the chat/stream regenerate paths can build the identical CRD without an import
+    cycle. Kept here so existing callers in this module are unchanged."""
+    from database_scripts import build_structured_crd
+    return await build_structured_crd(presales_id, user_id, presales, presales_brief_text, db)
+
+
 @router.post("/full-pipeline/start", status_code=status.HTTP_202_ACCEPTED)
 async def start_full_pipeline(
     background_tasks: BackgroundTasks,
@@ -1069,6 +1083,10 @@ async def start_full_pipeline(
     )
     title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
 
+    # Structured CRD — settled Q&A/assumptions as typed JSON, distinct from the
+    # evidence document so the planner can tell facts from raw text.
+    crd_text = await _build_structured_crd(presales_id, user_id, presales, presales_brief_text, db)
+
     run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
 
     # Charge the report (allowance, then credits) BEFORE scheduling, tagged with
@@ -1087,7 +1105,16 @@ async def start_full_pipeline(
         document=[enhanced_context],
         title=title,
         model_tier=model_tier,
+        crd_text=crd_text,
     )
+
+    # Finalizing (generating the report) closes the client questionnaire link, so a
+    # client can't reopen and rewrite settled facts after the firm has moved on.
+    try:
+        from database_scripts import revoke_share_token_for_presales
+        revoke_share_token_for_presales(presales_id, db)
+    except Exception as e:  # noqa: BLE001 — non-fatal
+        logger.warning(f"full-pipeline/start: could not auto-revoke client link for {presales_id}: {e}")
 
     return {
         "run_id":          run["run_id"],
@@ -1763,6 +1790,7 @@ async def get_presales_questions_endpoint(
     # Group questions by type and status
     p1_blockers = [q for q in questions if q["question_type"] == "p1_blocker"]
     kickstart = [q for q in questions if q["question_type"] == "kickstart"]
+    follow_ups = [q for q in questions if q["question_type"] == "follow_up"]
     invalid = [q for q in questions if q["status"] == "invalid"]
 
     return {
@@ -1772,6 +1800,7 @@ async def get_presales_questions_endpoint(
             "total": len(questions),
             "p1_blockers": len(p1_blockers),
             "kickstart": len(kickstart),
+            "follow_ups": len(follow_ups),
             "answered": sum(1 for q in questions if q["status"] == "answered"),
             "pending": sum(1 for q in questions if q["status"] == "pending"),
             "invalid": len(invalid)
@@ -1949,23 +1978,43 @@ async def analyze_presales_answers(
             timeout=120
         )
 
-        # Update question statuses based on invalidation
+        # Update question statuses based on invalidation. Deterministic backstop
+        # on top of the prompt rules — invalidation is destructive (a wrongly
+        # killed question silently loses a requirement), so: never invalidate an
+        # ANSWERED question, and cap at 3 per analysis run no matter what the
+        # LLM returned (a past prompt regression mass-invalidated 12 at once).
+        MAX_INVALIDATIONS_PER_RUN = 3
+        applied_invalidations = 0
         for inv_q in analysis_result.invalidated_questions:
+            if applied_invalidations >= MAX_INVALIDATIONS_PER_RUN:
+                logger.warning(
+                    f"Invalidation cap reached for {presales_id}: analyzer returned "
+                    f"{len(analysis_result.invalidated_questions)} invalidations, applied {applied_invalidations}"
+                )
+                break
             question_number = inv_q.get("question_id")
             # Find the actual question_id from question_number
             matching_q = next(
                 (q for q in questions if q["question_number"] == question_number),
                 None
             )
-            if matching_q:
-                await update_question_status(
-                    question_id=matching_q["question_id"],
-                    user_id=user_id,
-                    status_value="invalid",
-                    reason=inv_q.get("reason", ""),
-                    invalidated_by=inv_q.get("invalidated_by", ""),
-                    db=db
+            if not matching_q:
+                continue
+            if matching_q.get("answer"):
+                logger.warning(
+                    f"Refused to invalidate ANSWERED question {question_number} for {presales_id} "
+                    f"(analyzer reason: {inv_q.get('reason', '')!r})"
                 )
+                continue
+            await update_question_status(
+                question_id=matching_q["question_id"],
+                user_id=user_id,
+                status_value="invalid",
+                reason=inv_q.get("reason", ""),
+                invalidated_by=inv_q.get("invalidated_by", ""),
+                db=db
+            )
+            applied_invalidations += 1
 
         # Update question quality flags
         for vague in analysis_result.vague_answers:
@@ -2007,6 +2056,13 @@ async def analyze_presales_answers(
 
         logger.info(f"Analysis complete for {presales_id}: score={analysis_result.readiness_score}")
 
+        # Persist analyzer follow-ups as real questions (F1, F2, ...) so the user
+        # can actually answer them — previously they were returned and discarded.
+        from database_scripts import create_followup_questions
+        created_followups = await create_followup_questions(
+            presales_id, user_id, analysis_result.follow_up_questions, db
+        )
+
         # Get updated questions
         updated_questions = await get_presales_questions(presales_id, user_id, db)
 
@@ -2022,6 +2078,7 @@ async def analyze_presales_answers(
             "invalidated_questions": analysis_result.invalidated_questions,
             "assumptions": analysis_result.assumptions,
             "follow_up_questions": analysis_result.follow_up_questions,
+            "created_followups": created_followups,
             "recommendations": analysis_result.recommendations,
             "questions": updated_questions,
             "can_generate_report": analysis_result.can_generate_report,
@@ -2359,6 +2416,20 @@ async def get_projects_overview(current_user = Depends(require_verified_email), 
         "questions_inbox": overview["questions_inbox"],
         "subscription": subscription,
     }
+
+
+@router.patch('/projects/{chat_history_id}/name')
+async def rename_project(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Set/clear the firm's custom display name for a project card. The LLM title is
+    kept as the searchable fallback. Body: { custom_title: str | "" }."""
+    from database_scripts import set_project_custom_title
+    user_id = current_user["regular_login_token"]["id"]
+    return set_project_custom_title(chat_history_id, user_id, (payload or {}).get("custom_title"), db)
 
 # @router.post('/chat-with-doc')
 # async def conversation_with_doc(request:ChatHistoryDetails,current_user = Depends(token_validator), db:Session=Depends(get_db)):
@@ -4696,142 +4767,31 @@ If you'd like to make modifications, just let me know what you'd like to change 
                     )
                     action = "conflict_detected"
                 else:
-                    # Generate regeneration plan
+                    # Single source of truth: kick off the SAME async pipeline the
+                    # changes-queue button and the chat-with-doc-stream tool use
+                    # (the contract pipeline when USE_CONTRACT_PIPELINE=true). The old
+                    # path here ran legacy LLM section-regen → wrong pipeline. Async,
+                    # so we return a "started" message; the new version lands when done.
                     try:
-                        regen_plan = await generate_regeneration_plan(
-                            original_report_summary=report_summary.summary_report if hasattr(report_summary, 'summary_report') else report_summary,
-                            pending_changes=pending_changes,
-                            conversation_context=conversation_context
+                        from agents.pipeline_runner import kickoff_regeneration
+                        run = await kickoff_regeneration(chat_context["chat_history_id"], user_id, db)
+                        n = len(pending_changes)
+                        llm_response = (
+                            "**Regeneration started** ⏳\n\n"
+                            f"Applying **{n} change{'s' if n != 1 else ''}** through the full pipeline. "
+                            "This takes a couple of minutes — track progress in the pipeline view; "
+                            "the new version will appear here when it's ready."
                         )
-                        logger.info(f"Generated regeneration plan: {regen_plan}")
-
-                        sections_to_update = regen_plan.get("sections_to_regenerate", [])
-
-                        # Phase 2: Actually regenerate the report
-                        try:
-                            # Get the original report content
-                            original_report_content = report_summary.report_content if hasattr(report_summary, 'report_content') else None
-
-                            if not original_report_content:
-                                raise ValueError("Original report content not found")
-
-                            logger.info(f"Starting section regeneration for chat_history_id: {chat_context['chat_history_id']}")
-
-                            # Bind a recorder so regen + summary calls land in llm_call_log.
-                            from utils.llm_metrics import LLMCallRecorder, use_recorder
-                            from database_scripts import get_presales_id_for_chat
-                            _regen_chat_id = chat_context.get('chat_history_id')
-                            _regen_recorder = LLMCallRecorder(
-                                db=db,
-                                chat_history_id=_regen_chat_id,
-                                presales_id=get_presales_id_for_chat(_regen_chat_id, db),
-                                user_id=user_id,
-                            )
-                            with use_recorder(_regen_recorder):
-                                # Regenerate affected sections
-                                regenerated_report = await regenerate_report_sections(
-                                    original_report=original_report_content,
-                                    regeneration_plan=regen_plan,
-                                    pending_changes=pending_changes
-                                )
-
-                                logger.info(f"Section regeneration completed, new report length: {len(regenerated_report)} chars")
-
-                                # Calculate new version number before creating summary
-                                current_version = report_summary.version_number if hasattr(report_summary, 'version_number') else 1
-                                new_version_number = current_version + 1
-
-                                # Create summary for the new report with correct version number
-                                new_summary = await main_report_summary(main_report=regenerated_report, version_number=new_version_number)
-                            logger.info(f"Generated summary for regenerated report (version {new_version_number})")
-
-                            # Create new version
-                            new_version_result = await create_new_report_version(
-                                chat_history_id=chat_context["chat_history_id"],
-                                user_id=current_user["regular_login_token"]["id"],
-                                report_content=regenerated_report,
-                                summary_report=new_summary,
-                                changes_applied=pending_changes,
-                                db=db
-                            )
-
-                            logger.info(f"Created new report version: {new_version_result['version_number']}")
-
-                            # Clear pending changes after successful regeneration
-                            await clear_pending_changes(chat_context["chat_history_id"], db)
-                            logger.info(f"Cleared pending changes for chat_history_id: {chat_context['chat_history_id']}")
-
-                            # Update vector DB with new report content
-                            try:
-                                new_chunks = await chunking.chunk_text(text=regenerated_report)
-                                await vector_db.create_embeddings(
-                                    texts=new_chunks,
-                                    model=settings.EMBEDDING_MODEL,
-                                    chat_history_id=chat_context["chat_history_id"]
-                                )
-                                logger.info(f"Updated vector DB with regenerated report")
-                            except Exception as vec_error:
-                                logger.warning(f"Failed to update vector DB: {str(vec_error)}")
-
-                            # Generate success response with FULL report
-                            llm_response = f"""**Report Regenerated Successfully** ✅
-
-**Version:** {new_version_result['version_number']}
-**Changes Applied:** {len(pending_changes)}
-
-**Sections Updated:**
-{chr(10).join(f"- {section.replace('_', ' ').title()}" for section in sections_to_update)}
-
-**Changes Applied:**
-{chr(10).join(f"- ✓ {c.get('user_request', 'Unknown change')}" for c in pending_changes)}
-
----
-
-## Updated Report
-
-{regenerated_report}
-
----
-
-Your report has been updated with all the requested changes. You can:
-- Ask me questions about the updated report
-- Request more modifications
-- View previous versions by asking "show version history"
-- Rollback to a previous version if needed"""
-
-                            # Update pending_changes_info to reflect cleared state
-                            pending_changes_info = {
-                                "total_pending": 0,
-                                "has_conflicts": False,
-                                "changes_applied": len(pending_changes),
-                                "new_version": new_version_result['version_number'],
-                                "status": "applied"
-                            }
-
-                        except Exception as regen_error:
-                            logger.error(f"Error during regeneration: {str(regen_error)}")
-                            # Fall back to showing the plan if regeneration fails
-                            llm_response = f"""**Report Regeneration Plan** 📋
-
-I'll apply **{len(pending_changes)} pending changes** to your report.
-
-**Sections to Update:**
-{chr(10).join(f"- {section.replace('_', ' ').title()}" for section in sections_to_update)}
-
-**Changes to Apply:**
-{chr(10).join(f"- {c.get('user_request', 'Unknown change')}" for c in pending_changes)}
-
-**Estimated Impact:** {regen_plan.get("estimated_impact", "medium").title()}
-
----
-
-⚠️ **Error:** Regeneration encountered an issue: {str(regen_error)}
-
-Your changes have been saved. Please try again or contact support if the issue persists."""
-
-                    except Exception as e:
-                        logger.error(f"Error generating regeneration plan: {str(e)}")
-                        llm_response = f"I have {len(pending_changes)} pending changes ready to apply, but encountered an error creating the regeneration plan. Please try again."
+                        pending_changes_info = {
+                            "total_pending": 0, "has_conflicts": False,
+                            "changes_applied": n, "run_id": run.get("run_id"),
+                            "status": run.get("status"),
+                        }
+                    except HTTPException as he:
+                        llm_response = f"Couldn't start regeneration: {he.detail}"
+                    except Exception as regen_error:
+                        logger.error(f"Error starting regeneration: {str(regen_error)}")
+                        llm_response = "I couldn't start the regeneration. Your changes are saved — please try again."
 
         # Handle vector store retrieval
         elif action == "retrieve_from_vectorstore":
@@ -5143,104 +5103,14 @@ async def regenerate_report_endpoint(
 ):
     """
     Regenerate the report applying all queued pending changes as mandatory
-    constraints — ASYNC. Reuses the full-pipeline job (run_full_pipeline_async)
-    and pipeline_runs, so the UI tracks progress via /full-pipeline/status and
-    FullPipelineProgress exactly like initial generation (no 10-min blocking call).
-
-    Pending changes are baked into the scheduled run's document, then cleared
-    optimistically (a transaction is recorded for recoverability).
+    constraints — ASYNC. Delegates to the shared `kickoff_regeneration` so this
+    endpoint, the chat "regenerate" action, and the chat-with-doc-stream
+    `regenerate_report` tool all hit the IDENTICAL pipeline (contract pipeline when
+    USE_CONTRACT_PIPELINE=true) and the same pipeline_runs progress tracking.
     """
-    from database_scripts import (
-        create_or_reset_pipeline_run, get_pipeline_run_by_chat,
-        get_pending_changes, clear_pending_changes, record_transaction,
-    )
-    from agents.pipeline_runner import run_full_pipeline_async
-
+    from agents.pipeline_runner import kickoff_regeneration
     user_id = current_user["regular_login_token"]["id"]
-    # A regeneration draws from the same report-generation pool as the initial run.
-    check_report_generation_limit(user_id, db)
-    model_tier = get_model_tier(user_id, db)
-
-    chat = await get_single_user_chat_history(chat_history_id=chat_history_id, user_id=user_id, db=db)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat history not found")
-    document_id = chat.get("document_id")
-    if not document_id:
-        raise HTTPException(status_code=400, detail="Chat is missing document_id")
-
-    pending = await get_pending_changes(chat_history_id, db)
-    if not pending:
-        raise HTTPException(status_code=400, detail="No pending changes to apply. Queue a change first.")
-
-    link = await get_analysis_link(document_id=document_id, user_id=user_id, db=db)
-    if not link or not link.get("presales_id"):
-        raise HTTPException(status_code=400, detail="No presales analysis linked to this chat.")
-    presales_id = link["presales_id"]
-    presales = await get_presales_by_id(presales_id=presales_id, user_id=user_id, db=db)
-    if not presales:
-        raise HTTPException(status_code=404, detail="Presales analysis not found")
-
-    existing = await get_pipeline_run_by_chat(chat_history_id, db)
-    if existing and existing["status"] in ("queued", "running"):
-        return {
-            "run_id": existing["run_id"], "chat_history_id": chat_history_id,
-            "status": existing["status"], "current_stage": existing["current_stage"],
-            "message": "Pipeline already in progress",
-        }
-
-    # Same presales-derived context as initial generation, with the queued changes
-    # prepended as MANDATORY constraints so every agent honors them.
-    raw_messages = chat.get("message") or "[]"
-    try:
-        msgs = json.loads(raw_messages) if isinstance(raw_messages, str) else (raw_messages or [])
-    except json.JSONDecodeError:
-        msgs = []
-    presales_brief_text = ""
-    for m in reversed(msgs):
-        if isinstance(m, dict) and m.get("type") == "presales_brief":
-            presales_brief_text = m.get("content", "")
-            break
-    extracted = presales.get("extracted_requirements") or {}
-    blind_spots = presales.get("blind_spots") or {}
-    constraints_block = "## MANDATORY CHANGES TO APPLY (override prior analysis)\n" + "\n".join(
-        f"- [{c.get('id', 'CHG')}] ({c.get('target_section', 'general')}/{c.get('change_type', 'modify')}) {c.get('user_request', '')}"
-        for c in pending
-    ) + "\n"
-    enhanced_context = (
-        constraints_block + "\n"
-        "## Pre-Sales Analysis Context\n\n"
-        f"### Project Summary\n{extracted.get('project_summary', 'N/A')}\n\n"
-        f"### Technologies Identified\n{json.dumps(extracted.get('technologies_mentioned', []), indent=2)}\n\n"
-        f"### Blind Spots & Risks Identified\n{json.dumps(blind_spots, indent=2)}\n\n"
-        f"### Approved Presales Brief\n{presales_brief_text or '(brief not available — using extracted requirements only)'}\n"
-    )
-    title = (extracted.get("project_summary") or chat.get("title") or "Technical Analysis Report")[:100]
-
-    run = await create_or_reset_pipeline_run(chat_history_id=chat_history_id, user_id=user_id, db=db)
-    consume_report_generation(user_id, db, ref_id=run["run_id"])
-    background_tasks.add_task(
-        run_full_pipeline_async,
-        run_id=run["run_id"], chat_history_id=chat_history_id, user_id=user_id,
-        document_id=document_id, presales_id=presales_id, document=[enhanced_context], title=title,
-        applied_changes=pending, model_tier=model_tier,
-    )
-
-    # Optimistically clear the queue (changes are now in the scheduled document).
-    try:
-        await record_transaction(
-            chat_history_id=chat_history_id, action_type="regenerate",
-            action_data={"applied_changes": pending},
-            description=f"Regenerated applying {len(pending)} change(s)", db=db,
-        )
-        await clear_pending_changes(chat_history_id, db)
-    except Exception as e:
-        logger.warning(f"regenerate: failed to clear pending changes for {chat_history_id}: {e}")
-
-    return {
-        "run_id": run["run_id"], "chat_history_id": chat_history_id,
-        "status": run["status"], "current_stage": run["current_stage"],
-        "applied_changes": len(pending),
-    }
+    return await kickoff_regeneration(chat_history_id, user_id, db)
 
 
 # ============================================================
@@ -5336,6 +5206,77 @@ async def get_version_sections_endpoint(
     except Exception as e:
         logger.error(f"Error getting version sections: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting version sections: {str(e)}")
+
+
+@router.get('/report-versions/{chat_history_id}/change-order')
+async def get_change_order_draft(
+    chat_history_id: str,
+    format: str = "md",
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """Deterministic change-order draft: the signed baseline vs the current/active
+    version. Numbers come from compute_contract_delta (Python), never narrated.
+    `format=md` → {markdown}; `format=pdf` → base64 PDF (branded by tier).
+
+    Literal 'change-order' segment, so registered BEFORE /{version_number} (the
+    same shadowing fix as /metrics and /diff).
+    """
+    from database_scripts import get_signoff_version_number
+    from utils.version_compare import compute_contract_delta, build_change_order_markdown
+    try:
+        baseline_n = get_signoff_version_number(chat_history_id, db)
+        if baseline_n is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No signed baseline yet. Pin a version as the client baseline first (Versions → Pin baseline).",
+            )
+        # Current = the active (default-preferred) version.
+        active = await get_summary_report(chat_history_id, db)
+        current_n = getattr(active, "version_number", None)
+        if current_n is None:
+            raise HTTPException(status_code=404, detail="No active report version found")
+
+        baseline = await get_report_version_by_number(chat_history_id, baseline_n, db)
+        if current_n == baseline_n:
+            # Active IS the baseline — nothing has changed since sign-off.
+            delta = None
+            current_contract = baseline.get("report_contract")
+        else:
+            current = await get_report_version_by_number(chat_history_id, current_n, db)
+            current_contract = current.get("report_contract")
+            delta = compute_contract_delta(baseline.get("report_contract"), current_contract)
+
+        markdown = build_change_order_markdown(
+            delta, baseline_n, current_n,
+            baseline_signoff_at=baseline.get("signoff_at"),
+        )
+
+        if format == "pdf":
+            from utils.subscription import pdf_branding_for
+            import base64
+            _brand = pdf_branding_for(current_user["regular_login_token"]["id"], db)
+            pdf_data = await generate_pdf_from_markdown(
+                markdown_content=markdown, title="Change Order", version=current_n, **_brand,
+            )
+            return {
+                "chat_history_id": chat_history_id,
+                "baseline_version": baseline_n,
+                "current_version": current_n,
+                "pdf_base64": base64.b64encode(pdf_data).decode("utf-8"),
+                "filename": f"change_order_v{baseline_n}_to_v{current_n}.pdf",
+            }
+        return {
+            "chat_history_id": chat_history_id,
+            "baseline_version": baseline_n,
+            "current_version": current_n,
+            "markdown": markdown,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building change-order draft: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error building change-order draft: {str(e)}")
 
 
 @router.get('/report-versions/{chat_history_id}/{version_number}')
@@ -5495,6 +5436,580 @@ async def set_default_report_version(
         raise HTTPException(status_code=500, detail=f"Error setting default version: {str(e)}")
 
 
+@router.post('/report-versions/{chat_history_id}/signoff/{version_number}')
+async def pin_signoff_version(
+    chat_history_id: str,
+    version_number: int,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db)
+):
+    """Pin one version as the client-signoff baseline (one per project). The
+    "since signoff" diff and the change-order draft compute against it. Two path
+    segments, so no collision with /{version_number}."""
+    from database_scripts import set_signoff_version
+    user_id = current_user["regular_login_token"]["id"]
+    try:
+        return await set_signoff_version(chat_history_id, user_id, version_number, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error pinning signoff version {version_number}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error pinning signoff version: {str(e)}")
+
+
+# ============================================================================
+# EDIT-WITHOUT-REGEN (WS-2) — direct edits to the typed contract that skip the
+# full pipeline. The cost editor is fully deterministic (no LLM); answering an
+# open question queues a reviewable change so the report evolves on the next
+# regenerate (reuses the existing pending-change loop).
+# ============================================================================
+
+@router.get('/report-contract/{chat_history_id}/cost')
+async def get_contract_cost(
+    chat_history_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Current cost lines + contingency + computed totals for the active version,
+    so the cost editor can seed its table. 409 for legacy reports with no contract."""
+    from agents.contract import CostLine, Sensitivity
+    from agents.stitcher import compute_cost
+
+    active = await get_summary_report(chat_history_id, db)
+    if not active:
+        raise HTTPException(status_code=404, detail="No report found for this chat")
+    contract = active.report_contract if isinstance(active.report_contract, dict) else None
+    if contract is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This report has no structured cost model to edit (legacy report — regenerate to get one).",
+        )
+    lines, sens = [], []
+    for cl in (contract.get("cost_lines") or []):
+        try:
+            lines.append(CostLine(**cl))
+        except Exception:
+            continue
+    for s in (contract.get("cost_sensitivity") or []):
+        try:
+            sens.append(Sensitivity(**s))
+        except Exception:
+            continue
+    contingency = float(contract.get("contingency_pct", 0) or 0)
+    cost = compute_cost(lines, sens, contingency)
+    return {
+        "version_number": getattr(active, "version_number", None),
+        "cost_lines": [ln.model_dump() for ln in lines],
+        "contingency_pct": contingency,
+        "cost_sensitivity": [s.model_dump() for s in sens],
+        "totals": {
+            "subtotal_low": cost["subtotal_low"], "subtotal_high": cost["subtotal_high"],
+            "grand_low": cost["grand_low"], "grand_high": cost["grand_high"],
+            "worst_case_low": cost["worst_case_low"], "worst_case_high": cost["worst_case_high"],
+            "contingency_pct": cost["contingency_pct"], "adverse_sensitivity_pct": cost["adverse_sensitivity_pct"],
+        },
+    }
+
+
+@router.patch('/report-contract/{chat_history_id}/cost')
+async def patch_contract_cost(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    preview: bool = False,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Edit a report's cost lines / contingency WITHOUT a pipeline regen.
+
+    Deterministic: validate + hydrate, apply the firm rate card (resolve_rates),
+    re-render only the cost table, save a new version. `?preview=true` recomputes
+    the totals without saving (powers the live editor). Numbers are computed in
+    Python — never an LLM.
+
+    Body: { cost_lines: [CostLine...], contingency_pct?: number }
+    """
+    from agents.contract import CostLine, Sensitivity
+    from agents.stitcher import compute_cost, rerender_cost_table
+    from agents.tools import resolve_rates
+    from database_scripts import list_rate_cards
+
+    user_id = current_user["regular_login_token"]["id"]
+    active = await get_summary_report(chat_history_id, db)
+    if not active:
+        raise HTTPException(status_code=404, detail="No report found for this chat")
+    contract = active.report_contract if isinstance(active.report_contract, dict) else None
+    if contract is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This report has no structured cost model to edit (legacy report — regenerate to get one).",
+        )
+
+    try:
+        lines = [CostLine(**cl) for cl in (payload.get("cost_lines") or [])]
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid cost line: {e}")
+    if not lines:
+        raise HTTPException(status_code=422, detail="At least one cost line is required.")
+    try:
+        contingency = float(payload.get("contingency_pct", contract.get("contingency_pct", 0) or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="contingency_pct must be a number.")
+
+    sens: list = []
+    for s in (contract.get("cost_sensitivity") or []):
+        try:
+            sens.append(Sensitivity(**s))
+        except Exception:
+            continue
+
+    # Apply the firm rate card deterministically (same path the pipeline uses).
+    rate_cards: list = []
+    try:
+        user_row = db.query(models.User).filter(models.User.user_id == user_id).first()
+        firm_id = user_row.firm_id if user_row else None
+        if firm_id:
+            rate_cards = list_rate_cards(firm_id, db, active_only=True)
+    except Exception:
+        pass
+    rate_notes = resolve_rates(lines, rate_cards)
+
+    cost = compute_cost(lines, sens, contingency)
+    totals = {
+        "subtotal_low": cost["subtotal_low"], "subtotal_high": cost["subtotal_high"],
+        "grand_low": cost["grand_low"], "grand_high": cost["grand_high"],
+        "worst_case_low": cost["worst_case_low"], "worst_case_high": cost["worst_case_high"],
+        "contingency_pct": cost["contingency_pct"],
+        "adverse_sensitivity_pct": cost["adverse_sensitivity_pct"],
+    }
+    resolved_lines = [ln.model_dump() for ln in lines]
+
+    if preview:
+        return {"preview": True, "totals": totals, "cost_lines": resolved_lines, "rate_notes": rate_notes}
+
+    contract["cost_lines"] = resolved_lines
+    contract["contingency_pct"] = contingency
+    if rate_notes:
+        existing = contract.get("confidence_notes") or []
+        contract["confidence_notes"] = existing + [n for n in rate_notes if n not in existing]
+
+    new_md, replaced = rerender_cost_table(active.report_content or "", lines, sens, contingency)
+
+    result = await create_new_report_version(
+        chat_history_id=chat_history_id,
+        user_id=user_id,
+        report_content=new_md,
+        summary_report=active.summary_report or {},
+        changes_applied=[{"type": "cost_edit", "description": "Manual cost estimate edit"}],
+        db=db,
+        changelog_summary="Manual cost edit",
+        parent_version_id=active.report_version_id,
+        report_contract=contract,
+    )
+    try:
+        await vector_db.embed_report(
+            markdown=new_md, model=settings.EMBEDDING_MODEL, chat_history_id=chat_history_id,
+        )
+    except Exception as vec_error:
+        logger.warning(f"cost-edit: re-embed failed for {chat_history_id}: {vec_error}")
+
+    return {**result, "totals": totals, "cost_table_replaced": replaced}
+
+
+@router.post('/report-contract/{chat_history_id}/answer-question')
+async def answer_open_question(
+    chat_history_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Answer an open question inline and queue it as a reviewable change so the
+    next regenerate evolves the report with the answer (closes the open-question
+    loop the vision doc calls F2). Reuses the pending-change plumbing — human
+    decides when to regenerate.
+
+    Body: { question: str (required), answer: str (required) }
+    """
+    from database_scripts import add_pending_change as db_add_change, record_transaction
+
+    question = (payload or {}).get("question", "").strip()
+    answer = (payload or {}).get("answer", "").strip()
+    if not question or not answer:
+        raise HTTPException(status_code=400, detail="Both question and answer are required.")
+    if len(answer) > 4000:
+        answer = answer[:4000]
+
+    user_request = (
+        f"The client answered an open question. Incorporate this resolved answer into the "
+        f"relevant section(s) and remove it from the open-questions list.\n"
+        f"Q: {question}\nA: {answer}"
+    )
+    change_data = {
+        "user_request": user_request,
+        "target_section": "general",
+        "type": "modify_architecture",
+        "change_type": "modify",
+    }
+    try:
+        result = await db_add_change(chat_history_id, change_data, db)
+        if result.get("status") == "success":
+            await record_transaction(
+                chat_history_id=chat_history_id,
+                action_type="add_change",
+                action_data={"change_id": result.get("change_id"), "user_request": user_request, "change_data": change_data},
+                description=f"Answered open question: {question[:50]}",
+                db=db,
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error queuing open-question answer: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error queuing answer: {str(e)}")
+
+
+# ============================================================================
+# CLIENT QUESTIONNAIRE SHARE LINK (WS-3) — close the email ping-pong loop.
+# The firm shares a public, no-login link; the client answers directly. The
+# opaque token in the URL is the only secret. Public endpoints are CSRF-exempt
+# and per-IP rate-limited (utils/middleware.py).
+# ============================================================================
+
+@router.post('/presales/{presales_id}/share-link')
+async def create_questionnaire_share_link(
+    presales_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Create (or return the existing) public questionnaire link for this analysis."""
+    from database_scripts import create_or_get_share_token
+    user_id = current_user["regular_login_token"]["id"]
+    try:
+        return create_or_get_share_token(presales_id, user_id, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating share link: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating share link: {str(e)}")
+
+
+@router.post('/presales/{presales_id}/mark-link-shared')
+async def mark_questionnaire_link_shared(
+    presales_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Mark the link as shared with the client when email isn't used (the firm sent it
+    manually). Ensures a token exists and stamps client_link_shared_at so the dashboard
+    shows 'sent'. Returns the link for convenience."""
+    from database_scripts import create_or_get_share_token, mark_link_shared
+    user_id = current_user["regular_login_token"]["id"]
+    tok = create_or_get_share_token(presales_id, user_id, db)
+    mark_link_shared(presales_id, user_id, db)
+    return {"token": tok["token"], "link": settings.FRONTEND_URL.rstrip("/") + f"/q/{tok['token']}", "shared": True}
+
+
+@router.delete('/presales/{presales_id}/share-link')
+async def revoke_questionnaire_share_link(
+    presales_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Revoke the public questionnaire link (the URL stops working immediately)."""
+    from database_scripts import revoke_share_token
+    user_id = current_user["regular_login_token"]["id"]
+    try:
+        return revoke_share_token(presales_id, user_id, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error revoking share link: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error revoking share link: {str(e)}")
+
+
+def _firm_name_for_user(user_id: str, db: Session) -> str:
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if u and u.firm_id:
+            f = db.query(models.Firm).filter(models.Firm.firm_id == u.firm_id).first()
+            if f and f.name:
+                return f.name
+    except Exception:
+        pass
+    return "Our team"
+
+
+def _firm_id_for_user(user_id: str, db: Session) -> Optional[str]:
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        return u.firm_id if u else None
+    except Exception:
+        return None
+
+
+@router.post('/presales/{presales_id}/send-client-link')
+async def send_client_questionnaire_link(
+    presales_id: str,
+    payload: dict = Body(...),
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Ensure a share link, store the client's email, and email them the questionnaire.
+    Body: { client_email (required), message? }. Falls back to copy-link if email is
+    not configured (send_email logs instead)."""
+    from database_scripts import create_or_get_share_token, set_client_email, get_firm_email_template_fields, mark_link_shared
+    from utils.email import send_email, render_questionnaire_email
+
+    user_id = current_user["regular_login_token"]["id"]
+    client_email = ((payload or {}).get("client_email") or "").strip()
+    message = ((payload or {}).get("message") or "").strip()[:1000]
+    if not client_email or "@" not in client_email:
+        raise HTTPException(status_code=400, detail="A valid client_email is required.")
+
+    tok = create_or_get_share_token(presales_id, user_id, db)
+    set_client_email(presales_id, user_id, client_email, db)
+    mark_link_shared(presales_id, user_id, db)
+    link = settings.FRONTEND_URL.rstrip("/") + f"/q/{tok['token']}"
+    firm_id = _firm_id_for_user(user_id, db)
+    fields = get_firm_email_template_fields(firm_id, "questionnaire_invite", db)
+    subject, html = render_questionnaire_email(_firm_name_for_user(user_id, db), link, fields=fields, message=message)
+    emailed = await send_email(to=client_email, subject=subject, html=html)
+    return {"token": tok["token"], "link": link, "emailed": bool(emailed)}
+
+
+@router.post('/presales/{presales_id}/send-reminder')
+async def send_client_questionnaire_reminder(
+    presales_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Re-send the questionnaire email to the stored client_email (a reminder)."""
+    from utils.email import send_email, render_questionnaire_email
+    from database_scripts import get_firm_email_template_fields
+
+    user_id = current_user["regular_login_token"]["id"]
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Presales analysis not found")
+    if not row.client_share_token:
+        raise HTTPException(status_code=409, detail="No active link to remind about — send the link first.")
+    if not row.client_email:
+        raise HTTPException(status_code=409, detail="No client email on file — send the link with an email first.")
+
+    link = settings.FRONTEND_URL.rstrip("/") + f"/q/{row.client_share_token}"
+    firm_id = _firm_id_for_user(user_id, db)
+    fields = get_firm_email_template_fields(firm_id, "questionnaire_reminder", db)
+    subject, html = render_questionnaire_email(_firm_name_for_user(user_id, db), link, fields=fields, is_reminder=True)
+    emailed = await send_email(to=row.client_email, subject=subject, html=html)
+    return {"emailed": bool(emailed), "link": link}
+
+
+@router.get('/public/questionnaire/{token}')
+async def public_questionnaire(token: str, db: Session = Depends(get_db)):
+    """PUBLIC, no-login. Returns firm branding + client-safe questions for the link.
+    Never exposes internal analysis (blind spots, impact reasoning, scores)."""
+    from database_scripts import get_presales_by_share_token
+    row = get_presales_by_share_token(token, db)
+    if not row:
+        raise HTTPException(status_code=404, detail="This questionnaire link is not valid or has been revoked.")
+
+    firm = None
+    try:
+        user_row = db.query(models.User).filter(models.User.user_id == row.user_id).first()
+        if user_row and user_row.firm_id:
+            firm_row = db.query(models.Firm).filter(models.Firm.firm_id == user_row.firm_id).first()
+            if firm_row:
+                firm = {"name": firm_row.name, "logo_url": firm_row.logo_url, "primary_color": firm_row.primary_color}
+    except Exception:
+        pass
+
+    qs = db.query(models.PresalesQuestion).filter(
+        models.PresalesQuestion.presales_id == row.presales_id,
+        models.PresalesQuestion.status != models.QuestionStatus.INVALID,
+    ).order_by(models.PresalesQuestion.display_order).all()
+    # Client-safe fields ONLY — question text + category + any existing answer.
+    # `prefilled` flags answers the firm seeded as a starting point: the client can
+    # STILL edit them (the firm's control is revoking the link), it's just a UI hint.
+    questions = [{
+        "question_id": q.question_id,
+        "question_number": q.question_number,
+        "area_or_category": q.area_or_category,
+        "question_text": q.question_text,
+        "answer": q.answer or "",
+        "prefilled": bool((q.answer or "").strip()) and q.status == models.QuestionStatus.ANSWERED and (q.answered_by or "") != "client",
+    } for q in qs]
+    return {
+        "firm": firm,
+        "questions": questions,
+        "count": len(questions),
+        "submitted_at": row.client_submitted_at.isoformat() if row.client_submitted_at else None,
+        "respondent": row.client_respondent if isinstance(row.client_respondent, dict) else None,
+    }
+
+
+@router.post('/public/questionnaire/{token}/answers')
+async def public_questionnaire_submit(
+    token: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC, no-login. Submit client answers; they land as needs-review for the BA.
+    Body: { answers: { question_id: answer_text } }"""
+    from database_scripts import get_presales_by_share_token, submit_client_answers
+    row = get_presales_by_share_token(token, db)
+    if not row:
+        raise HTTPException(status_code=404, detail="This questionnaire link is not valid or has been revoked.")
+    answers = (payload or {}).get("answers")
+    if not isinstance(answers, dict) or not answers:
+        raise HTTPException(status_code=400, detail="No answers submitted.")
+    if len(answers) > 100:
+        raise HTTPException(status_code=400, detail="Too many answers in one submission.")
+    result = await submit_client_answers(row.presales_id, answers, db)
+    return {"status": "ok", **result}
+
+
+@router.post('/public/questionnaire/{token}/check-readiness')
+async def public_check_readiness(
+    token: str,
+    payload: dict = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC, no-login. Ephemeral readiness self-check for the client: runs the
+    same analyzer the firm uses but writes NOTHING (no invalidation, no readiness
+    persistence, no follow-ups). Saves any answers passed first (so the check
+    reflects what they just typed), then returns a client-safe projection:
+    assumptions we'd make, vague-answer nudges, possible contradictions, and a
+    readiness signal."""
+    from database_scripts import get_presales_by_share_token, submit_client_answers, bump_client_check_count
+    from utils.rate_limit import check_public_readiness, mark_public_readiness
+    from agents.answer_analyzer import analyze_answers
+
+    row = get_presales_by_share_token(token, db)
+    if not row:
+        raise HTTPException(status_code=404, detail="This questionnaire link is not valid or has been revoked.")
+
+    # Persist any in-flight answers first (so the check sees them).
+    answers = (payload or {}).get("answers") if isinstance(payload, dict) else None
+    if isinstance(answers, dict) and answers and len(answers) <= 100:
+        await submit_client_answers(row.presales_id, answers, db)
+
+    questions = await get_presales_questions(row.presales_id, row.user_id, db)
+    if not any(q.get("answer") for q in questions):
+        raise HTTPException(status_code=400, detail="Answer at least one question before checking readiness.")
+
+    # --- Abuse / LLM-cost protection on the only unauthenticated LLM endpoint ---
+    # Layer 1 (per-IP) is enforced in middleware. Here:
+    #  Layer 2 — durable per-token LIFETIME cap (DB, never fails open).
+    if (row.client_check_count or 0) >= settings.PUBLIC_READINESS_MAX_CHECKS:
+        raise HTTPException(
+            status_code=429,
+            detail="You've used all the readiness checks for this questionnaire. Submit your answers and the team will review them.",
+        )
+    #  Layer 3 — per-token cooldown + hourly cap (Redis, fail-open; DB cap is the backstop).
+    allowed, retry_after = await check_public_readiness(
+        token, settings.PUBLIC_READINESS_COOLDOWN_SECONDS, settings.PUBLIC_READINESS_HOURLY_CAP,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait a moment before checking again (try in {retry_after}s).",
+            headers={"Retry-After": str(retry_after)},
+        )
+    # Count the attempt BEFORE the LLM call so failures/retries still consume the
+    # budget (no error-retry cost storm), and arm the cooldown.
+    bump_client_check_count(row.presales_id, db)
+    await mark_public_readiness(token, settings.PUBLIC_READINESS_COOLDOWN_SECONDS)
+
+    extracted = row.extracted_requirements or {}
+    try:
+        result = await analyze_answers(
+            document=json.dumps(extracted),
+            scanned_requirements=extracted,
+            questions=questions,
+            timeout=120,
+        )
+    except Exception as e:
+        logger.error(f"public check-readiness analyze failed for presales {row.presales_id}: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't check readiness right now — please try again.")
+
+    # Client-safe projection (no internal scores leaked beyond a friendly label).
+    return {
+        "readiness_status": getattr(result, "readiness_status", "needs_more_info"),
+        "readiness_score": round(float(getattr(result, "readiness_score", 0.0) or 0.0), 2),
+        "assumptions": [
+            {"question_id": a.get("for_question_id", ""), "assumption": a.get("assumption", ""),
+             "risk_level": a.get("risk_level", "")}
+            for a in (getattr(result, "assumptions", []) or []) if isinstance(a, dict) and a.get("assumption")
+        ],
+        "vague_answers": [
+            {"question_id": v.get("question_id") or v.get("for_question_id", ""),
+             "note": v.get("feedback") or v.get("reason") or v.get("note", "Could you add a bit more detail here?")}
+            for v in (getattr(result, "vague_answers", []) or []) if isinstance(v, dict)
+        ],
+        "contradictions": [
+            {"detail": (c.get("description") or c.get("detail") or str(c)) if isinstance(c, dict) else str(c)}
+            for c in (getattr(result, "contradictions", []) or [])
+        ],
+    }
+
+
+@router.post('/public/questionnaire/{token}/submit')
+async def public_questionnaire_finalize(
+    token: str,
+    payload: dict = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC, no-login. Final submit: capture who completed it, save any last
+    answers, stamp the 'client submitted' signal, and best-effort email the firm."""
+    from database_scripts import get_presales_by_share_token, submit_client_answers, mark_client_submitted
+
+    row = get_presales_by_share_token(token, db)
+    if not row:
+        raise HTTPException(status_code=404, detail="This questionnaire link is not valid or has been revoked.")
+
+    payload = payload or {}
+    # Who completed it — required so the firm has a record/proof of submission.
+    resp_in = payload.get("respondent") if isinstance(payload.get("respondent"), dict) else {}
+    respondent = {
+        "name": (resp_in.get("name") or "").strip(),
+        "designation": (resp_in.get("designation") or "").strip(),
+        "email": (resp_in.get("email") or "").strip(),
+    }
+    if not respondent["name"] or "@" not in respondent["email"]:
+        raise HTTPException(status_code=400, detail="Please add your name and a valid email so the team knows who completed this.")
+
+    answers = payload.get("answers") if isinstance(payload.get("answers"), dict) else None
+    if answers and len(answers) <= 100:
+        await submit_client_answers(row.presales_id, answers, db)
+
+    # Notify only on the FIRST submit so repeated submits can't spam the firm's inbox.
+    already_submitted = row.client_submitted_at is not None
+    updated_row = mark_client_submitted(token, db, respondent=respondent)
+    if not updated_row:
+        raise HTTPException(status_code=404, detail="This questionnaire link is not valid or has been revoked.")
+    submitted_at = updated_row.client_submitted_at.isoformat() if updated_row.client_submitted_at else None
+
+    if not already_submitted:
+        try:
+            from utils.email import send_email, client_submission_notice_email_html
+            owner = db.query(models.User).filter(models.User.user_id == row.user_id).first()
+            if owner and owner.email_address:
+                extracted = row.extracted_requirements or {}
+                title = (extracted.get("project_summary") or "your project")[:120]
+                review_url = settings.FRONTEND_URL.rstrip("/") + "/projects"
+                await send_email(
+                    to=owner.email_address,
+                    subject="Your client submitted their questionnaire answers",
+                    html=client_submission_notice_email_html(title, review_url, respondent=respondent),
+                )
+        except Exception as e:  # noqa: BLE001 — notification is best-effort
+            logger.warning(f"public submit: firm notification failed for presales {row.presales_id}: {e}")
+
+    return {"status": "submitted", "submitted_at": submitted_at}
+
+
 # ============================================================================
 # A6 — PRE-MORTEM TAB (v2: on-demand adversarial roundtable thread)
 # ============================================================================
@@ -5542,25 +6057,30 @@ async def get_pre_mortem_sources(
     db: Session = Depends(get_db),
 ):
     """
-    Return the underlying source arrays the panel cites in its evidence chips.
-    Lets the UI render full source text for each evidence ref_index.
+    Return the underlying source arrays the panel cites in its evidence chips,
+    plus the full v2 attack-surface vectors + cost scenarios (so the UI can render
+    each `vector` evidence chip's title/quote/$). Legacy keys kept for old chips.
     """
     from database_scripts import get_summary_report
+    from utils.attack_surface import build_attack_surface
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
 
     report = await get_summary_report(chat_history_id, db)
     if not report or not report.summary_report:
         return {
-            "key_risks": [],
-            "critical_assumptions": [],
-            "open_questions_for_client": [],
+            "key_risks": [], "critical_assumptions": [], "open_questions_for_client": [],
+            "vectors": [], "cost_scenarios": None,
         }
     summary = report.summary_report if isinstance(report.summary_report, dict) else {}
+    contract = report.report_contract if isinstance(report.report_contract, dict) else None
+    surface = build_attack_surface(contract, summary)
     return {
         "key_risks": list(summary.get("key_risks") or []),
         "critical_assumptions": list(summary.get("critical_assumptions") or []),
         "open_questions_for_client": list(summary.get("open_questions_for_client") or []),
+        "vectors": surface["vectors"],
+        "cost_scenarios": surface["cost_scenarios"],
     }
 
 
@@ -5573,9 +6093,21 @@ async def post_pre_mortem_turn(
 ):
     from database_scripts import get_pre_mortem, save_pre_mortem, get_report_version_id
     from utils.pre_mortem import empty_thread, run_turn
+    from utils.subscription import has_feature
     from config import settings as cfg
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
+
+    # Pre-Mortem turns are a plus/pro feature (LLM cost). Reading/triaging an
+    # existing thread stays open on all tiers. 402 with object detail → the axios
+    # interceptor routes it to the UpgradeModal.
+    user_id = current_user["regular_login_token"]["id"]
+    if not has_feature(user_id, "pre_mortem", db):
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "Pre-Mortem is a Plus feature.", "limit_type": "feature_pre_mortem",
+                    "feature": "pre_mortem"},
+        )
 
     user_message = (payload or {}).get("user_message")
     kind = (payload or {}).get("kind", "user_question")
@@ -5683,7 +6215,8 @@ async def pre_mortem_item_action(
             status_code=400,
             detail="turn_id, panelist_id, item_id, action are all required",
         )
-    if action not in ("add_to_client_qs", "track_as_change"):
+    KNOWN = ("add_to_client_qs", "track_as_change", "edit_counter", "mark_defended", "reopen", "mark_came_up")
+    if action not in KNOWN:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
     thread = await get_pre_mortem(chat_history_id, db)
@@ -5694,10 +6227,34 @@ async def pre_mortem_item_action(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found in thread")
 
-    if item.get("status") and item["status"] != "open":
-        return {"thread": thread, "action_result": {"already_applied": True, "status": item["status"]}}
-
     label = panelist_label(thread, panelist_id)
+
+    # Triage / edit actions — allowed regardless of current status.
+    if action == "edit_counter":
+        new_counter = (payload or {}).get("counter_response", "")
+        if not isinstance(new_counter, str) or not new_counter.strip():
+            raise HTTPException(status_code=400, detail="counter_response is required")
+        item["counter_response"] = new_counter.strip()[:2000]
+        item["counter_edited"] = True
+        await save_pre_mortem(chat_history_id, thread, db)
+        return {"thread": thread, "action_result": {"counter_edited": True}}
+    if action == "mark_defended":
+        item["status"] = "defended"
+        await save_pre_mortem(chat_history_id, thread, db)
+        return {"thread": thread, "action_result": {"status": "defended"}}
+    if action == "reopen":
+        item["status"] = "open"
+        await save_pre_mortem(chat_history_id, thread, db)
+        return {"thread": thread, "action_result": {"status": "open"}}
+    if action == "mark_came_up":
+        came = (payload or {}).get("came_up")
+        item["came_up"] = came if came in (True, False, None) else None
+        await save_pre_mortem(chat_history_id, thread, db)
+        return {"thread": thread, "action_result": {"came_up": item["came_up"]}}
+
+    # Loop-closing actions (add_to_client_qs / track_as_change) — once only.
+    if item.get("status") in ("added_to_client_qs", "tracked_as_change"):
+        return {"thread": thread, "action_result": {"already_applied": True, "status": item["status"]}}
     if action == "add_to_client_qs":
         action_result = await add_to_client_questions(chat_history_id, item, label, db)
         item["status"] = "added_to_client_qs"
@@ -5728,6 +6285,52 @@ async def reset_pre_mortem_thread(
     thread = empty_thread(rv_id, model_name)
     await save_pre_mortem(chat_history_id, thread, db)
     return {"thread": thread}
+
+
+@router.get('/pre-mortem/{chat_history_id}/defense-brief')
+async def get_pre_mortem_defense_brief(
+    chat_history_id: str,
+    format: str = "md",
+    group: str = "severity",
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Deterministic Defense Brief (objection → our answer → grounding → status)
+    for the stakeholder meeting. format=md → {markdown}; format=pdf → base64 PDF
+    (branded by tier). Plus/pro feature."""
+    from database_scripts import get_pre_mortem, get_summary_report
+    from utils.attack_surface import build_attack_surface
+    from utils.pre_mortem import build_defense_brief_markdown
+    from utils.subscription import has_feature, pdf_branding_for
+
+    await _premortem_owner_chat(chat_history_id, current_user, db)
+    user_id = current_user["regular_login_token"]["id"]
+    if not has_feature(user_id, "pre_mortem", db):
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "Pre-Mortem is a Plus feature.", "limit_type": "feature_pre_mortem", "feature": "pre_mortem"},
+        )
+
+    thread = await get_pre_mortem(chat_history_id, db)
+    if not thread or not thread.get("turns"):
+        raise HTTPException(status_code=409, detail="No pre-mortem objections yet — run the panel first.")
+
+    report = await get_summary_report(chat_history_id, db)
+    summary = report.summary_report if (report and isinstance(report.summary_report, dict)) else {}
+    contract = report.report_contract if (report and isinstance(report.report_contract, dict)) else None
+    surface = build_attack_surface(contract, summary)
+
+    markdown = build_defense_brief_markdown(thread, surface, group_by=group)
+
+    if format == "pdf":
+        import base64
+        _brand = pdf_branding_for(user_id, db)
+        pdf_data = await generate_pdf_from_markdown(
+            markdown_content=markdown, title="Defense Brief",
+            version=getattr(report, "version_number", 1) or 1, **_brand,
+        )
+        return {"pdf_base64": base64.b64encode(pdf_data).decode("utf-8"), "filename": "defense-brief.pdf"}
+    return {"markdown": markdown}
 
 
 # ============================================================================

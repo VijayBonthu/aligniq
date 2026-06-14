@@ -724,6 +724,12 @@ async def generate_report_with_assumptions(
                 f"- **P1 blocker** ({blocker.get('area', '')}): {blocker.get('blocker', '')} — "
                 f"{blocker.get('why_it_matters', '')}"
             )
+        for flag in blind_spots.get("underplay_flags", []) or []:
+            blind_spot_lines.append(
+                f"- **Underplayed scope** (quote: “{flag.get('quote', '')}”): stated as "
+                f"{flag.get('stated_as', '—')}, usually involves {flag.get('usually_involves', '—')}"
+                + (f" · {flag['effort_note']}" if flag.get("effort_note") else "")
+            )
 
         prompt = ChatPromptTemplate.from_template(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
         chain = prompt | llm_reasoning | StrOutputParser()

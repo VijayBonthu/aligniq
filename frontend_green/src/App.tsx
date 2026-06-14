@@ -13,6 +13,7 @@ import LoginPage from './pages/LoginPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import VerifyEmailPage from './pages/VerifyEmailPage';
 import VerifyEmailRequiredPage from './pages/VerifyEmailRequiredPage';
+import PublicQuestionnaire from './pages/PublicQuestionnaire';
 import Dashboard from './pages/Dashboard';
 import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
@@ -73,6 +74,9 @@ function GlobalUpgradeModal() {
 // the corner. Landing carries its own toggle in the nav, hence it's excluded.
 function PublicThemeToggle() {
   const { pathname } = useLocation();
+  // NOTE: the client questionnaire (/q/:token) is a fixed, firm-branded surface — it
+  // deliberately has NO theme toggle (a floating toggle there only flipped itself, not
+  // the page, which read as "dark mode is broken").
   const onPublic = pathname === '/login' || pathname === '/signup' || pathname === '/reset-password' || pathname === '/verify-email' || pathname === '/verify-email-required' || pathname === '/pricing';
   return onPublic ? <ThemeToggle floating /> : null;
 }
@@ -149,6 +153,7 @@ function App() {
             <Route path="/verify-email" element={<VerifyEmailPage />} />
             <Route path="/verify-email-required" element={<VerifyEmailRequiredPage />} />
             <Route path="/pricing" element={<PricingPage />} />
+            <Route path="/q/:token" element={<PublicQuestionnaire />} />
             <Route path="/terms" element={<TermsPage />} />
             <Route path="/privacy" element={<PrivacyPage />} />
             <Route

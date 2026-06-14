@@ -14,8 +14,10 @@ Do NOT add an LLM-wrapping helper here. Those belong in contract_workflow.py.
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
+from typing import Optional
 
 
 _MERMAID_BLOCK_RE = re.compile(r"```mermaid\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -280,6 +282,7 @@ def validate_citations(section_id: str, markdown: str, window: int = 160) -> lis
 def format_prechecks_for_judge(
     mermaid_issues: list[MermaidIssue],
     citation_issues: list[CitationIssue],
+    contract_issues: list["ContractIssue"] | None = None,
 ) -> str:
     """Merge all deterministic precheck failures into one block for the judge.
 
@@ -303,4 +306,234 @@ def format_prechecks_for_judge(
             lines.extend(msgs)
         parts.append("\n".join(lines))
 
+    if contract_issues:
+        lines = [
+            "CONTRACT-LEVEL ISSUES (decider-level — do NOT ask a section writer to fix these; "
+            "they are already recorded as Confidence Notes. Reflect them in overall_quality_score "
+            "and do not let prose paper over them):"
+        ]
+        for ci in contract_issues:
+            lines.append(f"- [{ci.area}] {ci.message}")
+        parts.append("\n".join(lines))
+
     return "\n\n".join(parts) if parts else "(none — all deterministic checks passed)"
+
+
+# ---------------------------------------------------------------------------
+# Contract-level validators — mechanical enforcement of rules the decide prompt
+# states but a model can quietly ignore (band discipline, verdict discipline,
+# staffing-gap consistency, research coverage). Same precheck → judge pattern,
+# but these are DECIDER-level: a writer cannot fix a 3x estimate band with prose,
+# so the issues surface as Confidence Notes instead of writer revisions.
+# ---------------------------------------------------------------------------
+
+# hours_high / hours_low above this is a refusal to estimate, not an estimate
+# (the decide prompt asks for ≤ ~1.4×; the validator allows a little slack).
+MAX_HOURS_BAND_RATIO = 1.45
+# A go-with-conditions verdict hedged behind more conditions than this reads as
+# "no opinion" (the decide prompt caps at 1-3).
+MAX_VERDICT_CONDITIONS = 3
+# A research query whose findings fall below this is a research gap — related
+# claims are ungrounded and must be treated as assumptions.
+MIN_RESEARCH_RESULTS_PER_QUERY = 2
+
+
+@dataclass(frozen=True)
+class ContractIssue:
+    area: str  # "cost" | "verdict" | "research"
+    message: str
+
+
+def validate_cost_bands(cost_lines, max_ratio: float = MAX_HOURS_BAND_RATIO) -> list[ContractIssue]:
+    """Flag cost lines whose hours band exceeds the discipline ratio.
+
+    Accepts CostLine models or plain dicts (the contract is stored as JSON)."""
+    issues: list[ContractIssue] = []
+    for cl in cost_lines or []:
+        low = getattr(cl, "hours_low", None) if not isinstance(cl, dict) else cl.get("hours_low")
+        high = getattr(cl, "hours_high", None) if not isinstance(cl, dict) else cl.get("hours_high")
+        workstream = getattr(cl, "workstream", "") if not isinstance(cl, dict) else cl.get("workstream", "")
+        role = getattr(cl, "role", "") if not isinstance(cl, dict) else cl.get("role", "")
+        if not low or high is None:
+            continue
+        ratio = high / low if low else float("inf")
+        if ratio > max_ratio:
+            issues.append(ContractIssue(
+                area="cost",
+                message=(
+                    f"estimate band for '{workstream} / {role}' is {low}–{high}h "
+                    f"({ratio:.1f}x > {max_ratio}x) — scope is not understood well enough to "
+                    "estimate; treat as low-confidence until the scope question is resolved"
+                ),
+            ))
+    return issues
+
+
+def validate_verdict_discipline(
+    feasibility, max_conditions: int = MAX_VERDICT_CONDITIONS,
+) -> list[ContractIssue]:
+    """Flag a go-with-conditions verdict hedged behind a wishlist of conditions."""
+    if feasibility is None:
+        return []
+    verdict = getattr(feasibility, "verdict", None) if not isinstance(feasibility, dict) else feasibility.get("verdict")
+    conditions = getattr(feasibility, "conditions", None) if not isinstance(feasibility, dict) else feasibility.get("conditions")
+    conditions = conditions or []
+    if verdict == "go-with-conditions" and len(conditions) > max_conditions:
+        return [ContractIssue(
+            area="verdict",
+            message=(
+                f"'go-with-conditions' carries {len(conditions)} conditions (max {max_conditions}) — "
+                "this reads as no opinion; the verdict is effectively unsettled"
+            ),
+        )]
+    return []
+
+
+def research_gaps(
+    queries: list[str],
+    findings: list[dict],
+    min_results: int = MIN_RESEARCH_RESULTS_PER_QUERY,
+) -> list[str]:
+    """Return the research queries that came back with too little evidence.
+
+    Pure post-hoc check over the findings pool (each finding carries the `query`
+    it answered), so research_node's signature stays untouched."""
+    counts: dict[str, int] = {}
+    for f in findings or []:
+        q = (f or {}).get("query")
+        if q:
+            counts[q] = counts.get(q, 0) + 1
+    return [q for q in (queries or []) if q and counts.get(q, 0) < min_results]
+
+
+def dossier_source_urls(dossier) -> set[str]:
+    """All URLs the research dossier actually consulted — the only URLs any
+    downstream artifact may cite."""
+    urls: set[str] = set()
+    if not dossier:
+        return urls
+    for f in getattr(dossier, "findings", []) or []:
+        if getattr(f, "source_url", ""):
+            urls.add(f.source_url)
+    for p in getattr(dossier, "prior_art", []) or []:
+        if getattr(p, "url", ""):
+            urls.add(p.url)
+    for lib in getattr(dossier, "libraries", []) or []:
+        if getattr(lib, "url", ""):
+            urls.add(lib.url)
+    return urls
+
+
+def sanitize_service_option_sources(contract) -> int:
+    """Blank any service_option.source_url not present in the dossier's sources
+    (or every one, when there is no dossier) — the decider may only cite research
+    it was actually given. Mutates in place; returns how many were blanked."""
+    allowed = dossier_source_urls(getattr(contract, "research_dossier", None))
+    blanked = 0
+    for td in contract.tech_decisions or []:
+        for opt in td.service_options or []:
+            if opt.source_url and opt.source_url not in allowed:
+                opt.source_url = ""
+                blanked += 1
+    return blanked
+
+
+# ---------------------------------------------------------------------------
+# Firm rate-card grounding — the cost table is the report's most-challenged
+# number, so the $/hr is the firm's own rate, never the model's guess. The
+# writer/decider emit role + hours; this overwrites rate_usd from the firm rate
+# card and stamps the rate_card_ref for defensibility. A role the card doesn't
+# cover keeps its market estimate and surfaces as a Confidence Note (honest gap,
+# not a silent wrong number). No-op when the firm has no rate card — today's
+# behavior, the model's estimate stands.
+# ---------------------------------------------------------------------------
+
+# Below this fuzzy role-match ratio we treat the role as absent from the rate
+# card rather than risk pricing a line off an unrelated role. Mirrors the
+# question-dedupe threshold (database_scripts._is_duplicate_question).
+MIN_RATE_MATCH_RATIO = 0.72
+
+
+def _norm_role(s) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _match_rate_row(role: str, seniority: str, rate_cards: list[dict]) -> Optional[dict]:
+    """Best firm rate-card row for a (role, seniority): exact role + seniority,
+    then exact role (any seniority), then a fuzzy role match. None if nothing
+    clears the fuzzy threshold."""
+    if not rate_cards:
+        return None
+    nrole, nsen = _norm_role(role), _norm_role(seniority)
+
+    role_matches = [rc for rc in rate_cards if _norm_role(rc.get("role")) == nrole]
+    if role_matches:
+        for rc in role_matches:
+            if _norm_role(rc.get("seniority")) == nsen:
+                return rc
+        return role_matches[0]
+
+    best, best_ratio = None, 0.0
+    for rc in rate_cards:
+        ratio = difflib.SequenceMatcher(None, nrole, _norm_role(rc.get("role"))).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = rc, ratio
+    return best if best_ratio >= MIN_RATE_MATCH_RATIO else None
+
+
+def resolve_rates(cost_lines, rate_cards: list[dict]) -> list[str]:
+    """Overwrite each cost line's hourly rate with the firm's rate-card rate.
+
+    Deterministic — the model only supplies role + hours; the firm's real $/hr is
+    never left to it. Mutates CostLine instances in place; returns Confidence
+    Notes for any role the rate card does not cover (its estimate is kept). No-op
+    when the firm has no rate card on file.
+    """
+    notes: list[str] = []
+    if not rate_cards or not cost_lines:
+        return notes
+
+    unmatched: dict[str, float] = {}  # role label -> kept estimate (dedupes notes)
+    for cl in cost_lines:
+        role = getattr(cl, "role", "") or ""
+        seniority = getattr(cl, "seniority", "") or ""
+        row = _match_rate_row(role, seniority, rate_cards)
+        if row and isinstance(row.get("hourly_rate_usd"), (int, float)):
+            cl.rate_usd = float(row["hourly_rate_usd"])
+            label = f"{row.get('role', '')}/{row.get('seniority', '')}".strip("/")
+            cl.rate_card_ref = f"firm:{label} v{row.get('version', 1)}"
+        else:
+            label = role + (f" ({seniority})" if seniority else "")
+            unmatched.setdefault(label, float(getattr(cl, "rate_usd", 0.0) or 0.0))
+
+    for label, rate in unmatched.items():
+        notes.append(
+            f"Rate for '{label}' is not on your firm rate card — a market estimate of "
+            f"${rate:,.0f}/hr was used. Add the role to your rate card for a firm-grounded number."
+        )
+    return notes
+
+
+def reconcile_staffing_gaps(contract) -> int:
+    """Deterministic firm-fit cross-check: every team role the decider marked
+    `in_firm_roster=False` MUST have a staffing_gaps entry — don't trust the
+    decider to remember. Appends missing entries in place; returns how many
+    were added. Operates on a ReportContract instance."""
+    from agents.contract import StaffingGap  # local import to avoid a cycle at module load
+
+    covered = {
+        (g.needed_role or "").strip().lower()
+        for g in (contract.staffing_gaps or [])
+    }
+    added = 0
+    for t in contract.team or []:
+        if t.in_firm_roster is False and (t.role or "").strip().lower() not in covered:
+            contract.staffing_gaps.append(StaffingGap(
+                needed_role=t.role,
+                covered_by_firm=False,
+                recommendation="contract",
+                impact="Role is not on the firm rate card — staffing plan (hire/contract/partner) needed before kickoff.",
+            ))
+            covered.add((t.role or "").strip().lower())
+            added += 1
+    return added

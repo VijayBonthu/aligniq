@@ -63,6 +63,12 @@ def _is_expensive(path: str) -> bool:
 
 def _classify(method: str, path: str):
     """Return (bucket_name, limit, per_ip). per_ip=True keys by IP, else by identity."""
+    # Public (unauthenticated) endpoints — the client questionnaire. No identity to
+    # key on, so rate-limit per-IP. Its own (higher) bucket so client autosave has
+    # headroom without weakening the auth/brute-force limit; the LLM-bearing
+    # check-readiness is further capped per-token (Redis + DB lifetime) elsewhere.
+    if path.startswith("/api/v1/public/"):
+        return "public", settings.RATE_LIMIT_PUBLIC, True
     if path in AUTH_PATHS:
         return "auth", settings.RATE_LIMIT_AUTH, True
     if method in ("POST", "PUT", "PATCH") and _is_expensive(path):
@@ -123,7 +129,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # CSRF-exempt: cookieless server-to-server POSTs authenticated by their own
             # secret/signature, where a browser CSRF token can't (and needn't) exist —
             # the Stripe webhook (HMAC) and the X-Admin-Key break-glass admin endpoints.
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp"]:
+            # Public client-questionnaire POSTs come from an anonymous visitor who
+            # holds no CSRF cookie; the opaque share token in the URL is the secret.
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp"] or request.url.path.startswith("/api/v1/public/"):
                 return await call_next(request)
 
             # Validate CSRF token. Return a clean 403 (NOT raise) — an HTTPException

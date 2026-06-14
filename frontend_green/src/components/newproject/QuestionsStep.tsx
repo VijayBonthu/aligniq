@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import * as presalesService from '../../services/presalesService';
+import type { AnalysisAssumption } from './AnalysisStep';
 
 export interface PresalesQuestion {
   question_id?: string;
@@ -35,6 +36,19 @@ interface QuestionsStepProps {
   setAdditionalContext: (v: string) => void;
   onBack: () => void;
   onComplete: () => void;
+  /** Assumptions from the last readiness analysis — rendered inline under the
+   *  unanswered questions they cover, so "can't answer" has a visible cost. */
+  assumptions?: AnalysisAssumption[];
+  /** Per-answer-key "can't answer this — assume for me" marks (lifted to the
+   *  flow so they survive phase changes). */
+  skipped?: Record<string, boolean>;
+  setSkipped?: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  /** Scroll target (DOM anchor id) when arriving via "revise this answer". */
+  focusAnchorId?: string | null;
+  onFocusConsumed?: () => void;
+  /** When the client clicked "Send my answers" (vs. just autosaving). Null = the
+   *  client may have started (autosaved) but has NOT submitted. */
+  clientSubmittedAt?: string | null;
 }
 
 const isP1 = (q: PresalesQuestion) =>
@@ -42,10 +56,19 @@ const isP1 = (q: PresalesQuestion) =>
   q.question_type === 'p1_blocker' ||
   Boolean(q.blocker);
 
+const isFollowUp = (q: PresalesQuestion) => q.question_type === 'follow_up';
+
 const HEDGE =
   /\b(not sure|unsure|idk|i\s?don'?t\s?know|dunno|no idea|tbd|to be decided|maybe|n\/?a)\b/i;
 
 type AnswerState = 'empty' | 'thin' | 'ok';
+
+const shareBtn = (primary: boolean): React.CSSProperties => ({
+  background: primary ? 'var(--accent-soft)' : 'var(--surface)',
+  border: `1px solid ${primary ? 'var(--accent)' : 'var(--border-strong)'}`,
+  color: primary ? 'var(--accent)' : 'var(--fg-dim)',
+  borderRadius: 8, fontSize: 12, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
+});
 
 function answerStateFor(value: string, blocker: boolean): AnswerState {
   const v = value.trim();
@@ -65,17 +88,134 @@ export default function QuestionsStep({
   setAdditionalContext,
   onBack,
   onComplete,
+  assumptions,
+  skipped,
+  setSkipped,
+  focusAnchorId,
+  onFocusConsumed,
+  clientSubmittedAt,
 }: QuestionsStepProps) {
   const [loading, setLoading] = useState(questions.length === 0);
   const [submitting, setSubmitting] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [shareLink, setShareLink] = useState<string | null>(null);
+  const [clientEmail, setClientEmail] = useState('');
+  const [sharing, setSharing] = useState<null | 'send' | 'remind' | 'revoke' | 'copy' | 'mark'>(null);
+  const [markedShared, setMarkedShared] = useState(false);
+  const linkInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Seed answers by positional bucket index (p1_0, question_0, …), matching
-  // the old frontend's contract with POST /presales/:id/questions/answers.
+  // Pre-mint the link as soon as the panel opens so the Copy button can write to the
+  // clipboard SYNCHRONOUSLY within the click (a clipboard write after an `await`
+  // loses the browser's user-activation and silently fails). The 401-refresh round
+  // trip, if any, happens here in the background — not inside the copy gesture.
+  useEffect(() => {
+    if (!shareOpen || shareLink) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { token } = await presalesService.createShareLink(presalesId);
+        if (!cancelled) setShareLink(`${window.location.origin}/q/${token}`);
+      } catch {
+        /* non-fatal — Send/Copy will surface a clear error if it still fails */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [shareOpen, shareLink, presalesId]);
+
+  // A client-answered question surfaces as status 'needs_review' (the firm reviews
+  // it). Count them so we can show a "client submitted" banner.
+  const clientAnswered = questions.filter(
+    (q) => (q.status === 'needs_review') && Boolean((q.answer || '').trim()),
+  ).length;
+
+  const sendLink = async () => {
+    if (!clientEmail.trim() || !clientEmail.includes('@')) { toast.error('Enter a valid client email'); return; }
+    setSharing('send');
+    try {
+      const { link, emailed } = await presalesService.sendClientLink(presalesId, clientEmail.trim());
+      setShareLink(link);
+      toast.success(emailed ? 'Questionnaire emailed to your client' : 'Link ready (email not configured — copy it below)');
+    } catch {
+      toast.error('Could not send the client link');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  const copyLink = () => {
+    // Synchronous within the click — no `await` before the clipboard write (that
+    // loses user-activation). Falls back to selecting the readonly input + execCommand.
+    const url = shareLink;
+    if (!url) { toast.error('Link not ready yet — give it a second.'); return; }
+    const selectFallback = () => {
+      const el = linkInputRef.current;
+      if (el) {
+        el.focus();
+        el.select();
+        try { document.execCommand('copy'); toast.success('Client link copied'); return; } catch { /* fall through */ }
+      }
+      toast.error('Could not copy — select the link below and copy it manually.');
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(url).then(
+        () => toast.success('Client link copied'),
+        () => selectFallback(),
+      );
+    } else {
+      selectFallback();
+    }
+  };
+
+  const markShared = async () => {
+    setSharing('mark');
+    try {
+      const { link } = await presalesService.markLinkShared(presalesId);
+      setShareLink(link);
+      setMarkedShared(true);
+      toast.success('Marked as sent — this project now shows "Link sent".');
+    } catch {
+      toast.error('Could not mark the link as sent');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  const remind = async () => {
+    setSharing('remind');
+    try {
+      const { emailed } = await presalesService.sendReminder(presalesId);
+      toast.success(emailed ? 'Reminder sent' : 'Reminder logged (email not configured)');
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      toast.error(typeof detail === 'string' ? detail : 'Could not send a reminder');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  const revokeLink = async () => {
+    if (!window.confirm('Revoke the client link? The current URL will stop working immediately.')) return;
+    setSharing('revoke');
+    try {
+      await presalesService.revokeShareLink(presalesId);
+      setShareLink(null);
+      toast.success('Client link revoked');
+    } catch {
+      toast.error('Could not revoke the link');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  // Seed answers by positional bucket index (p1_0, question_0, followup_0, …),
+  // matching the old frontend's contract with POST /presales/:id/questions/answers.
   const seedAnswersFromQuestions = (arr: PresalesQuestion[]) => {
     const p1Items: PresalesQuestion[] = [];
     const kItems: PresalesQuestion[] = [];
+    const fItems: PresalesQuestion[] = [];
     for (const q of arr) {
       if (isP1(q)) p1Items.push(q);
+      else if (isFollowUp(q)) fItems.push(q);
       else kItems.push(q);
     }
     setAnswers((prev) => {
@@ -86,6 +226,10 @@ export default function QuestionsStep({
       });
       kItems.forEach((q, i) => {
         const key = `question_${i}`;
+        if (q.answer && !seeded[key]) seeded[key] = q.answer;
+      });
+      fItems.forEach((q, i) => {
+        const key = `followup_${i}`;
         if (q.answer && !seeded[key]) seeded[key] = q.answer;
       });
       return seeded;
@@ -135,15 +279,40 @@ export default function QuestionsStep({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [presalesId, initialQuestions, questions.length]);
 
-  const { p1, kickstart } = useMemo(() => {
+  const { p1, kickstart, followUps } = useMemo(() => {
     const p1List: PresalesQuestion[] = [];
     const kList: PresalesQuestion[] = [];
+    const fList: PresalesQuestion[] = [];
     for (const q of questions) {
       if (isP1(q)) p1List.push(q);
+      else if (isFollowUp(q)) fList.push(q);
       else kList.push(q);
     }
-    return { p1: p1List, kickstart: kList };
+    return { p1: p1List, kickstart: kList, followUps: fList };
   }, [questions]);
+
+  // Assumptions keyed by the question id they cover ("P1-2" / "Q3"), so a card
+  // can show what gets assumed if its question stays unanswered.
+  const assumptionByQuestion = useMemo(() => {
+    const map: Record<string, AnalysisAssumption> = {};
+    for (const a of assumptions || []) {
+      const id = (a.for_question_id || '').trim().toUpperCase();
+      if (id) map[id] = a;
+    }
+    return map;
+  }, [assumptions]);
+
+  // "Revise this answer" arrives with a DOM anchor — scroll once, then clear.
+  useEffect(() => {
+    if (!focusAnchorId || loading) return;
+    const el = document.getElementById(focusAnchorId);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.querySelector('textarea')?.focus({ preventScroll: true });
+    }
+    onFocusConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusAnchorId, loading]);
 
   const total = questions.length;
   const answered = Object.values(answers).filter((v) => v.trim()).length;
@@ -167,16 +336,16 @@ export default function QuestionsStep({
       // F6: submit answers keyed by question_id rather than positional index,
       // so a UI reorder can never silently cross-wire an answer to the wrong question.
       const payload: Array<{ question_id: string; answer: string }> = [];
-      const pushFor = (list: PresalesQuestion[], prefix: 'P1' | 'K') => {
+      const pushFor = (list: PresalesQuestion[], keyPrefix: string) => {
         list.forEach((q, idx) => {
           if (!q.question_id) return;
-          const key = prefix === 'P1' ? `p1_${idx}` : `question_${idx}`;
-          const answer = (answers[key] || '').trim();
+          const answer = (answers[`${keyPrefix}_${idx}`] || '').trim();
           if (answer) payload.push({ question_id: q.question_id, answer });
         });
       };
-      pushFor(p1, 'P1');
-      pushFor(kickstart, 'K');
+      pushFor(p1, 'p1');
+      pushFor(kickstart, 'question');
+      pushFor(followUps, 'followup');
 
       if (payload.length > 0) {
         await presalesService.saveAnswers(presalesId, payload);
@@ -261,6 +430,57 @@ export default function QuestionsStep({
           Answer what you can — the more precise your answers to the critical blockers, the tighter the
           estimate. Anything left blank becomes an explicit, reviewable assumption in the next step.
         </p>
+        {clientSubmittedAt ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--ok-soft)', border: '1px solid var(--border)', color: 'var(--ok)', fontSize: 13 }}>
+            ✓ Client submitted {clientAnswered} answer{clientAnswered === 1 ? '' : 's'} on {new Date(clientSubmittedAt).toLocaleString()} — review them below, then run the readiness analysis.
+          </div>
+        ) : clientAnswered > 0 ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: 13 }}>
+            ✎ Your client has started filling this out ({clientAnswered} answer{clientAnswered === 1 ? '' : 's'} so far) but hasn't submitted yet — you'll see their final answers once they click "Send my answers".
+          </div>
+        ) : null}
+        <div style={{ marginTop: 14 }}>
+          <button
+            onClick={() => setShareOpen((o) => !o)}
+            style={{
+              background: 'var(--surface-2)', border: '1px solid var(--border-strong)', borderRadius: 8,
+              color: 'var(--fg-dim)', fontSize: 12, padding: '7px 13px', cursor: 'pointer',
+              fontFamily: 'var(--font-mono)', letterSpacing: '.03em',
+            }}
+          >
+            ↗ Send to client {shareOpen ? '▾' : '▸'}
+          </button>
+          {shareOpen && (
+            <div style={{ marginTop: 10, padding: 14, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--surface-2)', maxWidth: 560 }}>
+              <p style={{ margin: '0 0 8px', fontSize: 12, color: 'var(--fg-muted)', lineHeight: 1.5 }}>
+                Email your client a no-login link to answer these questions and self-check readiness. Their answers come back here for your review. Org blocks the link? Fill it on their behalf during a call, then revoke.
+              </p>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  type="email"
+                  value={clientEmail}
+                  onChange={(e) => setClientEmail(e.target.value)}
+                  placeholder="client@company.com"
+                  style={{ flex: 1, minWidth: 180, background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 8, color: 'var(--fg)', fontSize: 13, padding: '7px 10px' }}
+                />
+                <button onClick={sendLink} disabled={!!sharing} style={shareBtn(true)}>{sharing === 'send' ? 'Sending…' : 'Send'}</button>
+                <button onClick={copyLink} disabled={!!sharing} style={shareBtn(false)}>{sharing === 'copy' ? '…' : 'Copy link'}</button>
+                <button onClick={markShared} disabled={!!sharing} style={shareBtn(false)} title="Mark as sent when you've shared the link yourself (e.g. email blocked)">{sharing === 'mark' ? '…' : markedShared ? '✓ Marked sent' : 'Mark sent'}</button>
+                <button onClick={remind} disabled={!!sharing} style={shareBtn(false)}>{sharing === 'remind' ? '…' : 'Remind'}</button>
+                <button onClick={revokeLink} disabled={!!sharing} style={shareBtn(false)}>{sharing === 'revoke' ? '…' : 'Revoke'}</button>
+              </div>
+              {shareLink && (
+                <input
+                  ref={linkInputRef}
+                  readOnly
+                  value={shareLink}
+                  onFocus={(e) => e.currentTarget.select()}
+                  style={{ marginTop: 8, width: '100%', boxSizing: 'border-box', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--fg-dim)', fontSize: 11, fontFamily: 'var(--font-mono)', padding: '6px 8px' }}
+                />
+              )}
+            </div>
+          )}
+        </div>
       </header>
 
       <div className="np-questions">
@@ -273,8 +493,29 @@ export default function QuestionsStep({
               accent="var(--danger)"
               questions={p1}
               numberPrefix="P1"
+              keyPrefix="p1"
+              anchorPrefix="p1"
               answers={answers}
               setAnswers={setAnswers}
+              assumptionByQuestion={assumptionByQuestion}
+              skipped={skipped}
+              setSkipped={setSkipped}
+            />
+          )}
+          {followUps.length > 0 && (
+            <QuestionGroup
+              eyebrow={`FOLLOW-UPS · ${followUps.length} FROM YOUR ANSWERS`}
+              note="Your answers raised these — quick to settle now"
+              accent="var(--warn)"
+              questions={followUps}
+              numberPrefix="F"
+              keyPrefix="followup"
+              anchorPrefix="f"
+              answers={answers}
+              setAnswers={setAnswers}
+              assumptionByQuestion={assumptionByQuestion}
+              skipped={skipped}
+              setSkipped={setSkipped}
             />
           )}
           {kickstart.length > 0 && (
@@ -284,8 +525,13 @@ export default function QuestionsStep({
               accent="var(--accent)"
               questions={kickstart}
               numberPrefix="Q"
+              keyPrefix="question"
+              anchorPrefix="q"
               answers={answers}
               setAnswers={setAnswers}
+              assumptionByQuestion={assumptionByQuestion}
+              skipped={skipped}
+              setSkipped={setSkipped}
             />
           )}
 
@@ -490,8 +736,13 @@ interface QuestionGroupProps {
   accent: string;
   questions: PresalesQuestion[];
   numberPrefix: string;
+  keyPrefix: string;
+  anchorPrefix: string;
   answers: Record<string, string>;
   setAnswers: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  assumptionByQuestion?: Record<string, AnalysisAssumption>;
+  skipped?: Record<string, boolean>;
+  setSkipped?: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
 }
 
 function QuestionGroup({
@@ -500,8 +751,13 @@ function QuestionGroup({
   accent,
   questions,
   numberPrefix,
+  keyPrefix,
+  anchorPrefix,
   answers,
   setAnswers,
+  assumptionByQuestion,
+  skipped,
+  setSkipped,
 }: QuestionGroupProps) {
   return (
     <div style={{ marginBottom: 26 }}>
@@ -521,11 +777,12 @@ function QuestionGroup({
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         {questions.map((q, idx) => {
-          const answerKey = numberPrefix === 'P1' ? `p1_${idx}` : `question_${idx}`;
+          const answerKey = `${keyPrefix}_${idx}`;
+          const displayId = (q.question_number || `${numberPrefix}-${idx + 1}`).toUpperCase();
           return (
             <QuestionCard
               key={q.question_id || `${numberPrefix}-${idx}`}
-              anchorId={`q-${numberPrefix === 'P1' ? 'p1' : 'q'}-${idx}`}
+              anchorId={`q-${anchorPrefix}-${idx}`}
               question={q}
               answerKey={answerKey}
               numberPrefix={numberPrefix}
@@ -533,6 +790,13 @@ function QuestionGroup({
               accent={accent}
               answers={answers}
               setAnswers={setAnswers}
+              assumption={assumptionByQuestion?.[displayId]}
+              isSkipped={Boolean(skipped?.[answerKey])}
+              onToggleSkip={
+                setSkipped
+                  ? () => setSkipped((s) => ({ ...s, [answerKey]: !s[answerKey] }))
+                  : undefined
+              }
             />
           );
         })}
@@ -550,6 +814,9 @@ interface QuestionCardProps {
   accent: string;
   answers: Record<string, string>;
   setAnswers: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  assumption?: AnalysisAssumption;
+  isSkipped?: boolean;
+  onToggleSkip?: () => void;
 }
 
 function QuestionCard({
@@ -561,11 +828,15 @@ function QuestionCard({
   accent,
   answers,
   setAnswers,
+  assumption,
+  isSkipped,
+  onToggleSkip,
 }: QuestionCardProps) {
   const value = answers[answerKey] || '';
   const isBlocker = numberPrefix === 'P1';
   const state = answerStateFor(value, isBlocker);
   const hasAssumption = value.includes('[SYSTEM ASSUMPTION]');
+  const skippedNoAnswer = Boolean(isSkipped) && state === 'empty';
 
   const headline = q.blocker || q.question_text || q.question || 'Question';
   const ask = q.blocker ? q.question_text || q.question || '' : '';
@@ -684,13 +955,19 @@ function QuestionCard({
             )}
           </div>
         </div>
-        <StatusPill state={state} blocker={isBlocker} />
+        <StatusPill state={state} blocker={isBlocker} skipped={skippedNoAnswer} />
       </div>
       <div style={{ padding: '0 16px 14px' }}>
         <textarea
           value={value}
           onChange={(e) => setAnswers((p) => ({ ...p, [answerKey]: e.target.value }))}
-          placeholder={isBlocker ? 'Be specific — this one moves the estimate…' : 'Provide your answer here…'}
+          placeholder={
+            skippedNoAnswer
+              ? 'Marked "can’t answer" — we’ll make an explicit assumption you can review.'
+              : isBlocker
+              ? 'Be specific — this one moves the estimate…'
+              : 'Provide your answer here…'
+          }
           rows={2}
           style={{
             width: '100%',
@@ -730,15 +1007,75 @@ function QuestionCard({
             Critical blocker — a fuller answer sharpens the estimate and cuts assumptions.
           </p>
         )}
+        {onToggleSkip && state === 'empty' && (
+          <button
+            type="button"
+            onClick={onToggleSkip}
+            style={{
+              marginTop: 8,
+              padding: '5px 10px',
+              borderRadius: 7,
+              border: `1px solid ${skippedNoAnswer ? 'color-mix(in oklab, var(--warn) 40%, transparent)' : 'var(--border)'}`,
+              background: skippedNoAnswer ? 'color-mix(in oklab, var(--warn) 10%, transparent)' : 'transparent',
+              color: skippedNoAnswer ? 'var(--warn)' : 'var(--fg-muted)',
+              fontSize: 11.5,
+              cursor: 'pointer',
+              fontFamily: 'var(--font-sans)',
+            }}
+          >
+            {skippedNoAnswer ? '✓ Will be assumed — undo' : 'I can’t answer this — assume for me'}
+          </button>
+        )}
+        {state === 'empty' && assumption && (
+          <div
+            style={{
+              display: 'flex',
+              gap: 7,
+              marginTop: 9,
+              padding: '8px 11px',
+              borderRadius: 8,
+              background: 'color-mix(in oklab, var(--warn) 7%, transparent)',
+              border: '1px solid color-mix(in oklab, var(--warn) 24%, transparent)',
+            }}
+          >
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 9,
+                letterSpacing: '.06em',
+                color: 'var(--warn)',
+                textTransform: 'uppercase',
+                flexShrink: 0,
+                marginTop: 2,
+              }}
+            >
+              We’ll assume
+            </span>
+            <div style={{ minWidth: 0 }}>
+              <p style={{ fontSize: 12.5, color: 'var(--fg)', lineHeight: 1.5, margin: 0 }}>
+                {assumption.assumption || assumption.text}
+              </p>
+              {(assumption.risk_level || assumption.impact_if_wrong) && (
+                <p style={{ fontSize: 11, color: 'var(--fg-muted)', lineHeight: 1.45, margin: '3px 0 0' }}>
+                  {assumption.risk_level ? `${assumption.risk_level} risk` : ''}
+                  {assumption.risk_level && assumption.impact_if_wrong ? ' · ' : ''}
+                  {assumption.impact_if_wrong ? `If wrong: ${assumption.impact_if_wrong}` : ''}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function StatusPill({ state, blocker }: { state: AnswerState; blocker: boolean }) {
+function StatusPill({ state, blocker, skipped }: { state: AnswerState; blocker: boolean; skipped?: boolean }) {
   const cfg =
     state === 'ok'
       ? { color: 'var(--ok)', label: 'Answered', dot: true }
+      : skipped
+      ? { color: 'var(--warn)', label: 'Will assume', dot: false }
       : state === 'thin'
       ? { color: 'var(--warn)', label: 'Thin', dot: false }
       : blocker

@@ -303,16 +303,30 @@ async def get_summary_report(chat_history_id:str, db:Session)-> dict:
 # A6 — PRE-MORTEM (adversarial-persona objections cache)
 # ============================================================
 
+def _active_report_version_row(chat_history_id: str, db: Session):
+    """The ACTIVE report_version row: user-selected default if set, else newest.
+    Single source of truth shared by get_summary_report and the pre-mortem helpers
+    so the panel grounds on (and writes to) the SAME version the chat answers from —
+    otherwise positional pre-mortem evidence ids would drift between read and write."""
+    base = db.query(models.ReportVersions).filter(
+        models.ReportVersions.chat_history_id == chat_history_id
+    )
+    row = base.filter(models.ReportVersions.is_default == True).order_by(  # noqa: E712
+        models.ReportVersions.created_at.desc()
+    ).first()
+    if not row:
+        row = base.order_by(models.ReportVersions.created_at.desc()).first()
+    return row
+
+
 async def get_pre_mortem(chat_history_id: str, db: Session) -> Optional[dict]:
     """
-    Return the cached pre_mortem JSON from the latest report_version of this
+    Return the cached pre_mortem JSON from the ACTIVE report_version of this
     chat, or None if no report exists yet, or None if pre_mortem hasn't been
     generated yet for that version.
     """
     try:
-        record = db.query(models.ReportVersions).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
+        record = _active_report_version_row(chat_history_id, db)
         if not record:
             return None
         return copy.deepcopy(record.pre_mortem) if record.pre_mortem else None
@@ -325,14 +339,12 @@ async def get_pre_mortem(chat_history_id: str, db: Session) -> Optional[dict]:
 
 async def save_pre_mortem(chat_history_id: str, pre_mortem: dict, db: Session) -> None:
     """
-    Persist pre_mortem onto the latest report_version row for this chat.
+    Persist pre_mortem onto the ACTIVE report_version row for this chat.
     No locking — last writer wins (acceptable: cost of a duplicate write is
     one wasted LLM call already paid upstream).
     """
     try:
-        record = db.query(models.ReportVersions).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
+        record = _active_report_version_row(chat_history_id, db)
         if not record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -350,12 +362,10 @@ async def save_pre_mortem(chat_history_id: str, pre_mortem: dict, db: Session) -
 
 
 async def get_report_version_id(chat_history_id: str, db: Session) -> Optional[str]:
-    """Return the latest report_version_id for this chat, or None."""
+    """Return the ACTIVE report_version_id for this chat, or None."""
     try:
-        record = db.query(models.ReportVersions.report_version_id).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
-        return record[0] if record else None
+        record = _active_report_version_row(chat_history_id, db)
+        return record.report_version_id if record else None
     except SQLAlchemyError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -927,6 +937,8 @@ async def get_all_report_versions(chat_history_id: str, db: Session) -> list:
                 "label": label,
                 "is_default": bool(record.is_default),
                 "is_latest": record.version_number == records[0].version_number if records else False,
+                "is_client_signoff": bool(getattr(record, "is_client_signoff", False)),
+                "signoff_at": record.signoff_at.isoformat() if getattr(record, "signoff_at", None) else None,
                 # Changelog tracking fields
                 "changes_applied": record.changes_applied,
                 "changelog_summary": record.changelog_summary,
@@ -978,6 +990,8 @@ async def get_report_version_by_number(chat_history_id: str, version_number: int
             "summary_report": record.summary_report,
             "report_contract": record.report_contract,  # typed decisions; powers cross-version delta/rank
             "created_at": record.created_at.isoformat() if record.created_at else None,
+            "is_client_signoff": bool(getattr(record, "is_client_signoff", False)),
+            "signoff_at": record.signoff_at.isoformat() if getattr(record, "signoff_at", None) else None,
             # Changelog tracking fields
             "changes_applied": record.changes_applied,
             "changelog_summary": record.changelog_summary,
@@ -1001,7 +1015,8 @@ async def create_new_report_version(
     changes_applied: list,
     db: Session,
     changelog_summary: str = None,
-    parent_version_id: str = None
+    parent_version_id: str = None,
+    report_contract: dict = None,
 ) -> dict:
     """
     Create a new report version after regeneration.
@@ -1063,6 +1078,7 @@ async def create_new_report_version(
             changes_applied=changes_applied,  # Store the changes that created this version
             changelog_summary=changelog_summary,  # Store the changelog summary
             parent_version_id=parent_version_id,  # Track version lineage
+            report_contract=report_contract,  # Typed decisions; carried/edited so the new version keeps reality-gap/compare/premortem
             deliverable_config=carried_config,  # A5: carried forward when section IDs match
             deliverable_polished_sections=None,  # A5: always reset; polish content is stale
             deliverable_updated_at=datetime.utcnow() if carried_config else None,
@@ -1504,6 +1520,66 @@ async def set_default_version(chat_history_id: str, user_id: str, version_number
         )
 
 
+async def set_signoff_version(chat_history_id: str, user_id: str, version_number: int, db: Session) -> dict:
+    """Pin one version as the client-signoff baseline (the change-order baseline).
+
+    Exactly one baseline per project — clears any prior pin first. The pinned
+    version is what the "since signoff" diff + change-order draft compute against.
+    """
+    from datetime import datetime, timezone
+    try:
+        target_version = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.user_id == user_id,
+            models.ReportVersions.version_number == version_number
+        ).first()
+
+        if not target_version:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Version {version_number} not found for this report"
+            )
+
+        # One baseline per project — clear any prior pin.
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).update({"is_client_signoff": False, "signoff_at": None})
+
+        target_version.is_client_signoff = True
+        target_version.signoff_at = datetime.now(timezone.utc)
+        flag_modified(target_version, "is_client_signoff")
+
+        db.commit()
+        db.refresh(target_version)
+
+        logger.info(f"Pinned version {version_number} as client-signoff baseline for chat_history_id: {chat_history_id}")
+        return {
+            "status": "success",
+            "version_number": version_number,
+            "report_version_id": target_version.report_version_id,
+            "signoff_at": target_version.signoff_at.isoformat(),
+            "message": f"Version {version_number} is now the client-signoff baseline",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error setting signoff version: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error setting signoff version: {str(e)}"
+        )
+
+
+def get_signoff_version_number(chat_history_id: str, db: Session) -> Optional[int]:
+    """Return the version_number pinned as the client-signoff baseline, or None."""
+    row = db.query(models.ReportVersions).filter(
+        models.ReportVersions.chat_history_id == chat_history_id,
+        models.ReportVersions.is_client_signoff == True,  # noqa: E712
+    ).first()
+    return row.version_number if row else None
+
+
 async def get_report_version_content(chat_history_id: str, version_number: int, db: Session) -> str:
     """
     Get the report content for a specific version number.
@@ -1762,7 +1838,10 @@ async def get_presales_analysis(document_id: str, user_id: str, db: Session) -> 
             "status": presales.status,
             "model_used": presales.model_used,
             "processing_time_seconds": presales.processing_time_seconds,
-            "created_at": presales.created_at.isoformat() if presales.created_at else None
+            "created_at": presales.created_at.isoformat() if presales.created_at else None,
+            # Client-questionnaire submission record (proof of who/when).
+            "client_submitted_at": presales.client_submitted_at.isoformat() if presales.client_submitted_at else None,
+            "client_respondent": presales.client_respondent if isinstance(presales.client_respondent, dict) else None,
         }
 
     except SQLAlchemyError as e:
@@ -2368,6 +2447,117 @@ async def create_presales_questions(
         )
 
 
+def _normalize_question_text(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — for fuzzy comparison."""
+    import re as _re
+    return _re.sub(r"\s+", " ", _re.sub(r"[^\w\s]", " ", (text or "").lower())).strip()
+
+
+def _is_duplicate_question(text: str, existing_norms: list) -> bool:
+    """Fuzzy duplicate check: the analyzer re-asks the same gap in new words on
+    every re-run, so exact-match dedupe is not enough. SequenceMatcher on
+    normalized text catches rewordings; 0.72 is deliberately loose — a wrongly
+    suppressed follow-up costs nothing (the gap becomes an assumption), while a
+    duplicate question burns user trust."""
+    from difflib import SequenceMatcher
+    norm = _normalize_question_text(text)
+    if not norm:
+        return True
+    for other in existing_norms:
+        if not other:
+            continue
+        if norm == other or SequenceMatcher(None, norm, other).ratio() >= 0.72:
+            return True
+    return False
+
+
+# The analyzer runs on every visit to the Analysis step; without a ceiling the
+# follow-up list grows 2 per visit forever. Past this many, gaps become
+# assumptions instead of more questions.
+MAX_FOLLOWUPS_PER_PRESALES = 4
+
+
+async def create_followup_questions(
+    presales_id: str,
+    user_id: str,
+    follow_ups: list,
+    db: Session,
+) -> list:
+    """Persist analyzer-generated follow-up questions as real PresalesQuestion rows.
+
+    The answer analyzer returns up to 2 `follow_up_questions` per analysis; until
+    now they were returned to the API response and discarded — the user never got
+    to answer them. Numbered F1, F2, ... (continuing across analyses), appended
+    after existing questions, FUZZY-deduped against every question already on the
+    analysis (any phrasing) and hard-capped at MAX_FOLLOWUPS_PER_PRESALES total,
+    so analysis re-runs can never pile up rewordings of the same gap. Returns the
+    created rows as dicts (empty list when everything was a duplicate)."""
+    try:
+        existing = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.presales_id == presales_id,
+            models.PresalesQuestion.user_id == user_id,
+        ).all()
+        existing_norms = [_normalize_question_text(q.question_text or "") for q in existing]
+        existing_followups = sum(1 for q in existing if q.question_type == models.QuestionType.FOLLOW_UP)
+        next_f_number = existing_followups + 1
+        next_order = max((q.display_order or 0 for q in existing), default=-1) + 1
+
+        created = []
+        for fu in follow_ups or []:
+            if existing_followups + len(created) >= MAX_FOLLOWUPS_PER_PRESALES:
+                logger.info(
+                    f"Follow-up cap ({MAX_FOLLOWUPS_PER_PRESALES}) reached for presales {presales_id}; "
+                    "remaining suggestions dropped — gaps stay covered by assumptions"
+                )
+                break
+            if not isinstance(fu, dict):
+                continue
+            text = (fu.get("question_text") or "").strip()
+            if not text or _is_duplicate_question(text, existing_norms):
+                if text:
+                    logger.info(f"Skipped duplicate follow-up for presales {presales_id}: {text[:80]!r}")
+                continue
+            question = models.PresalesQuestion(
+                presales_id=presales_id,
+                user_id=user_id,
+                question_type=models.QuestionType.FOLLOW_UP,
+                question_number=f"F{next_f_number}",
+                display_order=next_order,
+                area_or_category="follow-up",
+                title=text,
+                description=fu.get("reason", ""),
+                impact_description=(
+                    f"Triggered by your answer to {fu['based_on']}" if fu.get("based_on") else ""
+                ),
+                question_text=text,
+                status=models.QuestionStatus.PENDING,
+            )
+            db.add(question)
+            created.append(question)
+            existing_norms.append(_normalize_question_text(text))
+            next_f_number += 1
+            next_order += 1
+
+        if created:
+            db.commit()
+            logger.info(f"Created {len(created)} follow-up question(s) for presales: {presales_id}")
+        return [
+            {
+                "question_id": q.question_id,
+                "question_number": q.question_number,
+                "question_text": q.question_text,
+                "question_type": q.question_type,
+            }
+            for q in created
+        ]
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error creating follow-up questions: {str(e)}")
+        # Follow-ups are enrichment — never fail the analyze call over them.
+        return []
+
+
 async def get_presales_questions(
     presales_id: str,
     user_id: str,
@@ -2430,6 +2620,275 @@ async def get_presales_questions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving questions: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Client questionnaire share link (WS-3) — a public, no-login surface for the
+# client to answer the firm's questions. The opaque token is the only secret.
+# ---------------------------------------------------------------------------
+
+def create_or_get_share_token(presales_id: str, user_id: str, db: Session) -> dict:
+    """Ensure a share token exists for this presales analysis (owner-scoped); return it."""
+    import uuid
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    if not row.client_share_token:
+        row.client_share_token = uuid.uuid4().hex
+        db.commit()
+    return {"token": row.client_share_token, "presales_id": presales_id}
+
+
+def revoke_share_token(presales_id: str, user_id: str, db: Session) -> dict:
+    """Null the share token (owner-scoped) — the public link stops working immediately."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    row.client_share_token = None
+    db.commit()
+    return {"status": "revoked", "presales_id": presales_id}
+
+
+def get_presales_by_share_token(token: str, db: Session):
+    """Return the PresalesAnalysis ORM row for a share token, or None. No user scope —
+    the token IS the authorization."""
+    if not token:
+        return None
+    return db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.client_share_token == token
+    ).first()
+
+
+async def submit_client_answers(presales_id: str, answers: dict, db: Session) -> dict:
+    """Write client-submitted answers (public, no user scope — the token authorized
+    the caller). Marks each as answered_by='client' + status=NEEDS_REVIEW so the BA
+    reviews before they feed the report. Mirrors update_question_answers minus the
+    owner check; never invalidates or touches firm-only fields.
+
+    The client may edit any answer (incl. firm pre-fills); the firm's control is the
+    revoke link, not per-field locks. Skips unchanged answers (autosave re-sends the
+    whole form)."""
+    from datetime import datetime
+    try:
+        updated = 0
+        for question_id, answer in (answers or {}).items():
+            ans = (answer or "").strip()
+            if not ans:
+                continue
+            if len(ans) > 4000:
+                ans = ans[:4000]
+            q = db.query(models.PresalesQuestion).filter(
+                models.PresalesQuestion.question_id == question_id,
+                models.PresalesQuestion.presales_id == presales_id,
+            ).first()
+            if not q:
+                continue
+            # The client may edit ANY answer — including ones the firm pre-filled as a
+            # starting point. The firm's control against unwanted edits is revoking the
+            # link (manual + auto-on-finalize), not per-field locks. A client edit flips
+            # the question to client/needs_review so the firm reviews it.
+            # Autosave re-sends the whole form; skip unchanged answers so we don't spam
+            # history rows or redundant writes on every keystroke pause.
+            if (q.answer or "") == ans:
+                continue
+            db.add(models.PresalesAnswerHistory(
+                question_id=question_id, presales_id=presales_id,
+                previous_answer=q.answer, new_answer=ans,
+                change_type="updated" if q.answer else "created", changed_by="client",
+            ))
+            q.answer = ans
+            q.answered_at = datetime.utcnow()
+            q.answered_by = "client"
+            q.status = models.QuestionStatus.NEEDS_REVIEW
+            updated += 1
+        db.commit()
+        logger.info(f"Client submitted {updated} answer(s) for presales {presales_id}")
+        return {"updated_count": updated}
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error submitting client answers: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error submitting answers: {str(e)}")
+
+
+def mark_link_shared(presales_id: str, user_id: str, db: Session) -> None:
+    """Stamp client_link_shared_at (owner-scoped) — set when the firm emails the link
+    OR marks it manually shared. Drives the dashboard 'sent' status. Idempotent-ish:
+    only sets it the first time (preserves the original share moment)."""
+    from datetime import datetime, timezone
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    if not row.client_link_shared_at:
+        row.client_link_shared_at = datetime.now(timezone.utc)
+        db.commit()
+
+
+def set_project_custom_title(chat_history_id: str, user_id: str, custom_title: Optional[str], db: Session) -> dict:
+    """Set/clear the firm's display name for a project card (owner-scoped). The LLM
+    `title` is left intact as the searchable fallback."""
+    row = db.query(models.ChatHistory).filter(
+        models.ChatHistory.chat_history_id == chat_history_id,
+        models.ChatHistory.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    name = (custom_title or "").strip()[:200]
+    row.custom_title = name or None
+    db.commit()
+    return {"chat_history_id": chat_history_id, "custom_title": row.custom_title, "title": row.title}
+
+
+def set_client_email(presales_id: str, user_id: str, email: str, db: Session) -> None:
+    """Store the client's email on the presales row (owner-scoped) for reminders."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    row.client_email = (email or "").strip()[:320] or None
+    db.commit()
+
+
+def get_firm_email_template_fields(firm_id: Optional[str], template_key: str, db: Session) -> dict:
+    """Return the per-firm override fields for a client-email template key, or {}.
+    Only the text fields are stored; the GroundedIQ shell is applied at render."""
+    if not firm_id:
+        return {}
+    row = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+    tmpls = (row.email_templates if row and isinstance(row.email_templates, dict) else None) or {}
+    fields = tmpls.get(template_key)
+    return fields if isinstance(fields, dict) else {}
+
+
+def set_firm_email_template(firm_id: str, template_key: str, fields: dict, db: Session) -> dict:
+    """Upsert (staff-only) the override fields for one firm + template key. Only known
+    text fields are stored; everything else is ignored (no raw HTML, no brand override)."""
+    from sqlalchemy.orm.attributes import flag_modified
+    ALLOWED = {"subject", "heading", "intro", "button_label", "signoff"}
+    row = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Firm not found")
+    tmpls = dict(row.email_templates) if isinstance(row.email_templates, dict) else {}
+    clean = {k: (str(v)[:2000] if v is not None else "") for k, v in (fields or {}).items() if k in ALLOWED}
+    tmpls[template_key] = clean
+    row.email_templates = tmpls
+    flag_modified(row, "email_templates")
+    db.commit()
+    return clean
+
+
+def list_firms(search: Optional[str], db: Session, limit: int = 50) -> list:
+    """Searchable firm list for the admin console dropdown (id + name)."""
+    q = db.query(models.Firm.firm_id, models.Firm.name)
+    if search and search.strip():
+        q = q.filter(models.Firm.name.ilike(f"%{search.strip()}%"))
+    rows = q.order_by(models.Firm.name).limit(max(1, min(limit, 200))).all()
+    return [{"firm_id": fid, "name": name} for fid, name in rows]
+
+
+def bump_client_check_count(presales_id: str, db: Session) -> int:
+    """Increment and return the durable lifetime readiness-check counter for a
+    presales link. Called when a public 'Check readiness' decides to run the LLM,
+    so even failed/abusive attempts count against the per-token ceiling."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id
+    ).first()
+    if not row:
+        return 0
+    row.client_check_count = (row.client_check_count or 0) + 1
+    db.commit()
+    return row.client_check_count
+
+
+def mark_client_submitted(token: str, db: Session, respondent: Optional[dict] = None):
+    """Stamp client_submitted_at (+ who completed it) on the presales row for a share
+    token (public). Returns the row, or None if the token is invalid/revoked."""
+    from datetime import datetime, timezone
+    from sqlalchemy.orm.attributes import flag_modified
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.client_share_token == token
+    ).first()
+    if not row:
+        return None
+    row.client_submitted_at = datetime.now(timezone.utc)
+    if isinstance(respondent, dict) and (respondent.get("name") or respondent.get("email")):
+        row.client_respondent = {
+            "name": (respondent.get("name") or "").strip()[:160],
+            "designation": (respondent.get("designation") or "").strip()[:160],
+            "email": (respondent.get("email") or "").strip()[:320],
+        }
+        flag_modified(row, "client_respondent")
+    db.commit()
+    return row
+
+
+def revoke_share_token_for_presales(presales_id: str, db: Session) -> None:
+    """Null the share token for a presales WITHOUT a user scope — used by the
+    pipeline kickoff to auto-close the client link when the report is generated."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id
+    ).first()
+    if row and row.client_share_token:
+        row.client_share_token = None
+        db.commit()
+
+
+async def build_structured_crd(
+    presales_id: str, user_id: str, presales: dict, presales_brief_text: str, db: Session,
+) -> str:
+    """Build the structured CRD block the contract planner consumes (settled Q&A +
+    accepted assumptions + open questions + approved brief, as typed JSON).
+
+    Lives here (not in routers/services) so BOTH the REST regenerate endpoint and
+    the chat/stream regenerate paths can build the identical CRD without an import
+    cycle. Never raises: any failure degrades to the brief alone."""
+    try:
+        questions = await get_presales_questions(presales_id, user_id, db, include_invalid=False)
+    except Exception as e:  # noqa: BLE001 — CRD enrichment must not block the run
+        logger.warning(f"build_structured_crd: question fetch failed for {presales_id}: {e}")
+        questions = []
+
+    confirmed = [
+        {"question": q["question_text"], "answer": q["answer"],
+         "source": q["question_number"], "category": q.get("area_or_category") or ""}
+        for q in questions if q.get("answer") and q.get("status") == "answered"
+    ]
+    open_questions = [
+        {"question": q["question_text"], "source": q["question_number"],
+         "severity_hint": "blocker" if q.get("question_type") == "p1_blocker" else "high"}
+        for q in questions if not q.get("answer")
+    ]
+    assumptions = [
+        {"assumption": a.get("assumption", ""), "risk_level": a.get("risk_level", ""),
+         "basis": a.get("basis", ""), "impact_if_wrong": a.get("impact_if_wrong", ""),
+         "for_question_id": a.get("for_question_id", "")}
+        for a in (presales.get("assumptions_list") or [])
+        if isinstance(a, dict) and a.get("assumption")
+    ]
+    parts = [
+        "## CONFIRMED Q&A (settled facts — copy each into client_qa with its `source` id)",
+        json.dumps(confirmed, indent=2, ensure_ascii=False) if confirmed else "(none — no questions answered yet)",
+        "",
+        "## ACCEPTED ASSUMPTIONS (resolved facts with provenance — inherit into global_assumptions as 'Assumption (accepted): ...'; do NOT re-open as questions)",
+        json.dumps(assumptions, indent=2, ensure_ascii=False) if assumptions else "(none)",
+        "",
+        "## OPEN / UNANSWERED QUESTIONS (unresolved — fold into open_questions_for_client; never invent answers)",
+        json.dumps(open_questions, indent=2, ensure_ascii=False) if open_questions else "(none — everything was answered)",
+        "",
+        "## APPROVED PRESALES BRIEF (human-reviewed markdown)",
+        presales_brief_text or "(brief not available)",
+    ]
+    return "\n".join(parts)
 
 
 async def update_question_answers(
@@ -3994,6 +4453,21 @@ async def fetch_projects_overview(user_id: str, db: Session) -> dict:
             )
             vague_counts = {pid: cnt for pid, cnt in vague_rows}
 
+        # Which presales have CLIENT-submitted answers (autosave or final) — drives the
+        # "client started" dashboard status (distinct from "submitted").
+        client_started_ids: set = set()
+        if presales_ids:
+            for (pid,) in (
+                db.query(models.PresalesQuestion.presales_id)
+                .filter(
+                    models.PresalesQuestion.presales_id.in_(presales_ids),
+                    models.PresalesQuestion.answered_by == "client",
+                )
+                .distinct()
+                .all()
+            ):
+                client_started_ids.add(pid)
+
         # --- 5. Default ReportVersion per chat (for pending_changes count) --
         default_versions = (
             db.query(models.ReportVersions)
@@ -4078,10 +4552,23 @@ async def fetch_projects_overview(user_id: str, db: Session) -> dict:
             except Exception:
                 last_preview = ""
 
+            # Client-questionnaire status for the dashboard badge.
+            q_status = "none"
+            if pa:
+                if pa.client_submitted_at:
+                    q_status = "submitted"
+                elif presales_id in client_started_ids:
+                    q_status = "started"
+                elif pa.client_link_shared_at or pa.client_share_token:
+                    q_status = "sent"
+
             projects.append({
                 "chat_history_id": c.chat_history_id,
                 "document_id": c.document_id,
                 "title": c.title or "Untitled project",
+                "custom_title": c.custom_title,
+                "questionnaire_status": q_status,
+                "client_submitted_at": pa.client_submitted_at.isoformat() if (pa and pa.client_submitted_at) else None,
                 "analysis_mode": analysis_mode,
                 "presales_id": presales_id,
                 "full_report_generated": bool(link.full_report_generated) if link else False,
@@ -4203,6 +4690,7 @@ PIPELINE_STAGES_ORDER = [
 # and the same pipeline_runs.stages_completed JSONB column.
 CONTRACT_PIPELINE_STAGES_ORDER = [
     "plan",
+    "research",
     "decide",
     "write_sections",
     "judge_and_finalize",

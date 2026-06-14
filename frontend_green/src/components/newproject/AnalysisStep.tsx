@@ -19,14 +19,26 @@ interface AnalysisStepProps {
   onBack: () => void;
   onApplyAssumptions: (assumptions: AnalysisAssumption[]) => void;
   onGenerateReport: (assumptions: AnalysisAssumption[], readinessStatus?: string) => void;
+  /** Lifts the analysis result to the flow so the Questions step can render
+   *  inline assumption previews under unanswered questions. */
+  onData?: (data: AnalysisData) => void;
+  /** Jump back to the Questions step focused on one question ("Q3" / "P1-2" / "F1"). */
+  onReviseAnswer?: (displayId?: string) => void;
 }
 
-interface AnalysisData {
+export interface AnalysisData {
   readiness?: {
     score?: number;
     status?: string;
     summary?: string;
   };
+  created_followups?: Array<{
+    question_id?: string;
+    question_number?: string;
+    question_text?: string;
+  }>;
+  /** Refreshed question list (includes any newly created follow-ups). */
+  questions?: unknown[];
   contradictions?: Array<{
     question_text?: string;
     description?: string;
@@ -74,6 +86,8 @@ export default function AnalysisStep({
   onBack,
   onApplyAssumptions,
   onGenerateReport,
+  onData,
+  onReviseAnswer,
 }: AnalysisStepProps) {
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<AnalysisData | null>(null);
@@ -88,7 +102,10 @@ export default function AnalysisStep({
       setError(null);
       try {
         const res = await presalesService.analyze(presalesId);
-        if (!cancelled) setData(res as AnalysisData);
+        if (!cancelled) {
+          setData(res as AnalysisData);
+          onData?.(res as AnalysisData);
+        }
       } catch (err) {
         console.error('Analyze failed', err);
         if (!cancelled) {
@@ -291,6 +308,54 @@ export default function AnalysisStep({
         </div>
       )}
 
+      {(data.created_followups?.length ?? 0) > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            gap: 10,
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            padding: '12px 14px',
+            borderRadius: 10,
+            background: 'color-mix(in oklab, var(--warn) 7%, transparent)',
+            border: '1px solid color-mix(in oklab, var(--warn) 26%, transparent)',
+            marginBottom: 16,
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <p style={{ fontSize: 13, color: 'var(--fg)', fontWeight: 500, margin: 0 }}>
+              {data.created_followups!.length === 1
+                ? 'Your answers raised 1 follow-up question'
+                : `Your answers raised ${data.created_followups!.length} follow-up questions`}
+            </p>
+            <p style={{ fontSize: 12, color: 'var(--fg-muted)', margin: '2px 0 0' }}>
+              Quick to settle now — each one you answer is one less assumption in the brief.
+            </p>
+          </div>
+          {onReviseAnswer && (
+            <button
+              type="button"
+              onClick={() => onReviseAnswer(data.created_followups?.[0]?.question_number)}
+              style={{
+                flexShrink: 0,
+                padding: '7px 13px',
+                borderRadius: 8,
+                border: 'none',
+                background: 'var(--warn)',
+                color: '#1a1a1a',
+                fontSize: 12.5,
+                fontWeight: 600,
+                cursor: 'pointer',
+                fontFamily: 'var(--font-sans)',
+              }}
+            >
+              Answer follow-ups →
+            </button>
+          )}
+        </div>
+      )}
+
       {contradictions.length > 0 && (
         <IssueGroup
           title={`Contradictions · ${contradictions.length}`}
@@ -308,9 +373,12 @@ export default function AnalysisStep({
           title={`Vague answers · ${vague.length}`}
           accent="var(--warn)"
           items={vague.map((v) => ({
-            heading: v.question_text || 'Vague answer',
+            heading: v.question_text || v.question_id || 'Vague answer',
             body: v.issue,
             suggestion: v.suggestion || v.expected_format,
+            action: onReviseAnswer
+              ? { label: 'Revise this answer →', onClick: () => onReviseAnswer(v.question_id) }
+              : undefined,
           }))}
         />
       )}
@@ -876,6 +944,7 @@ interface IssueItem {
   body?: string;
   suggestion?: string;
   badge?: string;
+  action?: { label: string; onClick: () => void };
 }
 
 function IssueGroup({
@@ -975,6 +1044,26 @@ function IssueGroup({
                   <span style={{ color: 'var(--accent)' }}>→ </span>
                   {it.suggestion}
                 </p>
+              )}
+              {it.action && (
+                <button
+                  type="button"
+                  onClick={it.action.onClick}
+                  style={{
+                    marginTop: 8,
+                    padding: '5px 10px',
+                    borderRadius: 7,
+                    border: '1px solid var(--border-strong)',
+                    background: 'transparent',
+                    color: 'var(--fg)',
+                    fontSize: 11.5,
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                    fontFamily: 'var(--font-sans)',
+                  }}
+                >
+                  {it.action.label}
+                </button>
               )}
             </div>
           ))}

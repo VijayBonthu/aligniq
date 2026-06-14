@@ -263,6 +263,131 @@ def _timeline_milestone_delta(contract_a: dict, contract_b: dict) -> Optional[di
     return {"changed": changed, "added": added, "removed": removed}
 
 
+def _fmt_money(x) -> str:
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return "—"
+
+
+def _fmt_signed_money(x) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        return "—"
+    return ("+" if v >= 0 else "−") + f"${abs(v):,.0f}"
+
+
+def build_change_order_markdown(
+    delta: Optional[dict],
+    baseline_n: int,
+    current_n: int,
+    *,
+    baseline_signoff_at: Optional[str] = None,
+    intro: Optional[str] = None,
+) -> str:
+    """Deterministic change-order draft from a compute_contract_delta result.
+
+    Every number comes from `delta` (Python-computed, never narrated). `intro` is
+    an optional caller-supplied framing paragraph (e.g. a short cheap-LLM cover
+    line) — kept as a parameter so this function stays pure and testable. The
+    output drops into the Deliverable Builder as a custom section or exports as a
+    standalone PDF.
+    """
+    signoff_note = f" (signed off {baseline_signoff_at[:10]})" if baseline_signoff_at else ""
+    lines = [
+        "## Change Order — Scope Since Sign-off",
+        "",
+        f"_Comparing the signed baseline (v{baseline_n}{signoff_note}) to the current scope (v{current_n})._",
+        "",
+    ]
+    if intro:
+        lines += [intro.strip(), ""]
+
+    if not delta:
+        lines += ["No structured decisions are available to compare on these versions.", ""]
+        return "\n".join(lines)
+
+    changed_anything = False
+
+    cost = delta.get("cost")
+    if cost and (cost.get("delta_low") or cost.get("delta_high")):
+        changed_anything = True
+        pct = cost.get("pct")
+        pct_s = f" ({'+' if (pct or 0) >= 0 else ''}{pct:.0f}%)" if pct is not None else ""
+        lines += [
+            "### Cost impact",
+            "",
+            f"- Baseline: {_fmt_money(cost['a_low'])} – {_fmt_money(cost['a_high'])}",
+            f"- Current: {_fmt_money(cost['b_low'])} – {_fmt_money(cost['b_high'])}",
+            f"- **Change: {_fmt_signed_money(cost['delta_low'])} – {_fmt_signed_money(cost['delta_high'])}{pct_s}**",
+            "",
+        ]
+
+    timeline = delta.get("timeline")
+    if timeline and (timeline.get("delta_low") or timeline.get("delta_high")):
+        changed_anything = True
+        lines += [
+            "### Timeline impact",
+            "",
+            f"- Baseline: {timeline['a_low']}–{timeline['a_high']} weeks",
+            f"- Current: {timeline['b_low']}–{timeline['b_high']} weeks",
+            f"- **Change: {timeline['delta_low']:+d} to {timeline['delta_high']:+d} weeks**",
+            "",
+        ]
+
+    swaps = delta.get("tech_swaps") or []
+    if swaps:
+        changed_anything = True
+        lines += ["### Technology / approach changes", ""]
+        for s in swaps:
+            if s.get("type") == "added":
+                lines.append(f"- **{s['layer']}**: added {s['to']}")
+            elif s.get("type") == "removed":
+                lines.append(f"- **{s['layer']}**: removed {s['from']}")
+            else:
+                lines.append(f"- **{s['layer']}**: {s['from']} → {s['to']}")
+            if s.get("rationale"):
+                lines.append(f"  - {s['rationale']}")
+        lines.append("")
+
+    team = delta.get("team")
+    if team and (team.get("added") or team.get("removed")):
+        changed_anything = True
+        lines += ["### Team changes", ""]
+        for r in team.get("added") or []:
+            lines.append(f"- Added: {r.get('label') or r.get('role')}")
+        for r in team.get("removed") or []:
+            lines.append(f"- Removed: {r.get('label') or r.get('role')}")
+        lines.append("")
+
+    staffing = delta.get("staffing")
+    if staffing and (staffing.get("new_gaps") or staffing.get("resolved_gaps")):
+        changed_anything = True
+        lines += ["### Staffing implications", ""]
+        for g in staffing.get("new_gaps") or []:
+            rec = f" — {g.get('recommendation')}" if g.get("recommendation") else ""
+            lines.append(f"- New gap: {g.get('needed_role')}{rec}")
+        for role in staffing.get("resolved_gaps") or []:
+            lines.append(f"- Resolved: {role}")
+        lines.append("")
+
+    verdict = delta.get("verdict")
+    if verdict:
+        changed_anything = True
+        lines += [
+            "### Feasibility verdict",
+            "",
+            f"- Changed from **{verdict.get('from') or '—'}** to **{verdict.get('to') or '—'}**",
+            "",
+        ]
+
+    if not changed_anything:
+        lines += ["No material scope change between the signed baseline and the current version.", ""]
+
+    return "\n".join(lines)
+
+
 def compute_contract_delta(contract_a: dict, contract_b: dict) -> Optional[dict]:
     """Pairwise typed delta a -> b: cost, timeline, tech swaps (w/ rationale), verdict,
     team roster, staffing gaps, per-milestone timeline.

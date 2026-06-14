@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
-import { isAxiosError } from 'axios';
+import { notifyError } from '../../services/api';
 import {
   listVersions,
   setDefaultVersion,
+  signoffVersion,
   type ReportVersionMeta,
 } from '../../services/chatActionsService';
 
@@ -48,12 +49,7 @@ export default function VersionsPanel({ chatHistoryId, open, onClose, onChanged,
     if (open) void load();
   }, [open, load]);
 
-  const handleErr = (err: unknown, fallback: string) => {
-    const detail =
-      (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
-      (err instanceof Error ? err.message : fallback);
-    toast.error(detail);
-  };
+  const handleErr = (err: unknown, fallback: string) => notifyError(err, fallback);
 
   const makeDefault = async (n: number) => {
     setBusy(true);
@@ -70,6 +66,19 @@ export default function VersionsPanel({ chatHistoryId, open, onClose, onChanged,
     } finally {
       setBusy(false);
       setSwitchingTo(null);
+    }
+  };
+
+  const pinBaseline = async (n: number) => {
+    setBusy(true);
+    try {
+      await signoffVersion(chatHistoryId, n);
+      await load();
+      toast.success(`v${n} pinned as the client baseline`);
+    } catch (err) {
+      handleErr(err, 'Could not pin baseline');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -119,38 +128,46 @@ export default function VersionsPanel({ chatHistoryId, open, onClose, onChanged,
               // the whole list reads as "locked, working".
               const dimmed = busy && !switching;
               return (
-                <button
-                  key={v.version_number}
-                  onClick={() => !active && !busy && makeDefault(v.version_number)}
-                  disabled={busy || active}
-                  style={{
-                    ...row,
-                    cursor: busy ? 'progress' : active ? 'default' : 'pointer',
-                    opacity: dimmed ? 0.45 : 1,
-                  }}
-                  title={active ? 'Active version' : 'Make this the active version'}
-                >
-                  {switching ? (
-                    <span style={spinner} aria-label="Switching" />
-                  ) : (
-                    <span style={{ ...radio, ...(active ? radioOn : {}) }}>
-                      {active ? '●' : '○'}
-                    </span>
-                  )}
-                  <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                    <p style={vTitle}>
-                      v{v.version_number}
-                      {active && <span style={activeBadge}>ACTIVE</span>}
-                      {v.is_latest && !active && <span style={latestBadge}>latest</span>}
-                    </p>
-                    <p style={vLabel}>{v.label || v.summary || `Version ${v.version_number}`}</p>
+                <div key={v.version_number} style={{ ...rowWrap, opacity: dimmed ? 0.45 : 1 }}>
+                  <button
+                    onClick={() => !active && !busy && makeDefault(v.version_number)}
+                    disabled={busy || active}
+                    style={{ ...rowBtn, cursor: busy ? 'progress' : active ? 'default' : 'pointer' }}
+                    title={active ? 'Active version' : 'Make this the active version'}
+                  >
                     {switching ? (
-                      <p style={switchingLabel}>Switching…</p>
+                      <span style={spinner} aria-label="Switching" />
                     ) : (
-                      v.created_at && <p style={ts}>{new Date(v.created_at).toLocaleString()}</p>
+                      <span style={{ ...radio, ...(active ? radioOn : {}) }}>
+                        {active ? '●' : '○'}
+                      </span>
                     )}
-                  </div>
-                </button>
+                    <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                      <p style={vTitle}>
+                        v{v.version_number}
+                        {active && <span style={activeBadge}>ACTIVE</span>}
+                        {v.is_client_signoff && <span style={baselineBadge} title={v.signoff_at ? `Signed off ${new Date(v.signoff_at).toLocaleDateString()}` : 'Client baseline'}>★ BASELINE</span>}
+                        {v.is_latest && !active && <span style={latestBadge}>latest</span>}
+                      </p>
+                      <p style={vLabel}>{v.label || v.summary || `Version ${v.version_number}`}</p>
+                      {switching ? (
+                        <p style={switchingLabel}>Switching…</p>
+                      ) : (
+                        v.created_at && <p style={ts}>{new Date(v.created_at).toLocaleString()}</p>
+                      )}
+                    </div>
+                  </button>
+                  {!v.is_client_signoff && (
+                    <button
+                      onClick={() => !busy && pinBaseline(v.version_number)}
+                      disabled={busy}
+                      style={pinBtn}
+                      title="Pin as the client-signoff baseline (the change-order baseline)"
+                    >
+                      Pin baseline
+                    </button>
+                  )}
+                </div>
               );
             })
           )}
@@ -196,9 +213,18 @@ const titleStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: 
 const closeBtn: React.CSSProperties = { background: 'none', border: 'none', color: 'var(--fg-muted)', cursor: 'pointer', fontSize: 13 };
 const hint: React.CSSProperties = { flexShrink: 0, margin: 0, padding: '10px 14px', fontSize: 11, color: 'var(--fg-muted)', lineHeight: 1.4, borderBottom: '1px solid var(--border)' };
 const muted: React.CSSProperties = { fontSize: 12, color: 'var(--fg-muted)', lineHeight: 1.5, padding: '14px 0' };
-const row: React.CSSProperties = {
-  display: 'flex', gap: 10, alignItems: 'flex-start', padding: '12px 0', width: '100%',
-  background: 'none', border: 'none', borderRadius: 0, borderBottom: '1px solid var(--border)',
+const rowWrap: React.CSSProperties = {
+  display: 'flex', gap: 8, alignItems: 'flex-start', width: '100%',
+  borderBottom: '1px solid var(--border)',
+};
+const rowBtn: React.CSSProperties = {
+  display: 'flex', gap: 10, alignItems: 'flex-start', padding: '12px 0', flex: 1, minWidth: 0,
+  background: 'none', border: 'none', borderRadius: 0, textAlign: 'left',
+};
+const pinBtn: React.CSSProperties = {
+  flexShrink: 0, alignSelf: 'center', background: 'var(--surface-2)', border: '1px solid var(--border-strong)',
+  borderRadius: 8, color: 'var(--fg-dim)', fontSize: 10, padding: '5px 9px', cursor: 'pointer',
+  fontFamily: 'var(--font-mono)', letterSpacing: '.03em',
 };
 const radio: React.CSSProperties = { flexShrink: 0, fontSize: 14, color: 'var(--fg-muted)', lineHeight: '18px' };
 const radioOn: React.CSSProperties = { color: 'var(--accent)' };
@@ -211,6 +237,7 @@ const switchingLabel: React.CSSProperties = { margin: '3px 0 0', fontSize: 11, c
 const vTitle: React.CSSProperties = { margin: 0, fontSize: 13, fontWeight: 600, color: 'var(--fg)', display: 'flex', alignItems: 'center', gap: 6 };
 const activeBadge: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: 8, padding: '2px 5px', borderRadius: 999, background: 'var(--accent-soft)', color: 'var(--accent)', letterSpacing: '.06em' };
 const latestBadge: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: 8, padding: '2px 5px', borderRadius: 999, background: 'var(--surface-2)', color: 'var(--fg-muted)', letterSpacing: '.06em' };
+const baselineBadge: React.CSSProperties = { fontFamily: 'var(--font-mono)', fontSize: 8, padding: '2px 5px', borderRadius: 999, background: 'var(--ok-soft)', color: 'var(--ok)', letterSpacing: '.06em' };
 const vLabel: React.CSSProperties = { margin: '3px 0 0', fontSize: 12, color: 'var(--fg-dim)', lineHeight: 1.4 };
 const ts: React.CSSProperties = { margin: '3px 0 0', fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--fg-muted)' };
 const cmpBox: React.CSSProperties = { flexShrink: 0, padding: 14, borderTop: '1px solid var(--border)', background: 'var(--surface-2)' };

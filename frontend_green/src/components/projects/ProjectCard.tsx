@@ -1,13 +1,17 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'react-hot-toast';
 import ScoreRing from '../ui/ScoreRing';
 import StatusDot, { type StatusKind } from '../ui/StatusDot';
 import { Tag } from '../ui/Chips';
+import { renameProject } from '../../services/projectsService';
+import { notifyError } from '../../services/api';
 import type { ProjectRow, ReadinessStatus } from '../../types/overview';
 
 interface Props {
   project: ProjectRow;
   delay?: number;
+  onRenamed?: (chatHistoryId: string, customTitle: string | null) => void;
 }
 
 function timeAgo(iso: string | null): string {
@@ -78,9 +82,26 @@ function Stat({ icon, val, color }: { icon: 'msg' | 'warn' | 'q'; val: number; c
   );
 }
 
-export default function ProjectCard({ project, delay = 0 }: Props) {
+export default function ProjectCard({ project, delay = 0, onRenamed }: Props) {
   const navigate = useNavigate();
   const [hov, setHov] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [nameDraft, setNameDraft] = useState(project.custom_title || '');
+  const [savingName, setSavingName] = useState(false);
+
+  const saveName = async () => {
+    setSavingName(true);
+    try {
+      const res = await renameProject(project.chat_history_id, nameDraft.trim());
+      onRenamed?.(project.chat_history_id, res.custom_title);
+      setEditing(false);
+      toast.success('Project renamed');
+    } catch (e) {
+      notifyError(e, 'Could not rename the project');
+    } finally {
+      setSavingName(false);
+    }
+  };
 
   const scorePct = Math.round(project.readiness.score * 100);
   const isPipelineLive =
@@ -104,6 +125,13 @@ export default function ProjectCard({ project, delay = 0 }: Props) {
   const questions = kickPending;
 
   const modeTag = project.analysis_mode === 'presales' ? 'PRE-SALES' : 'FULL REPORT';
+
+  const QSTATUS: Record<string, { label: string; color: string; bg: string }> = {
+    sent: { label: 'Link sent', color: 'var(--fg-dim)', bg: 'var(--surface-2)' },
+    started: { label: 'Client filling…', color: 'var(--accent)', bg: 'var(--accent-soft)' },
+    submitted: { label: '✓ Client submitted', color: 'var(--ok)', bg: 'var(--ok-soft)' },
+  };
+  const qBadge = QSTATUS[project.questionnaire_status];
 
   return (
     <div
@@ -171,20 +199,55 @@ export default function ProjectCard({ project, delay = 0 }: Props) {
           >
             {modeTag}
           </p>
-          <h3
-            style={{
-              fontSize: 14.5,
-              fontWeight: 600,
-              color: 'var(--fg)',
-              lineHeight: 1.3,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              margin: 0,
-            }}
-          >
-            {project.title}
-          </h3>
+          {editing ? (
+            <input
+              autoFocus
+              value={nameDraft}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') void saveName();
+                if (e.key === 'Escape') { setEditing(false); setNameDraft(project.custom_title || ''); }
+              }}
+              onBlur={() => { if (!savingName) void saveName(); }}
+              placeholder={project.title}
+              style={{
+                width: '100%', boxSizing: 'border-box', fontSize: 14.5, fontWeight: 600,
+                background: 'var(--surface-2)', border: '1px solid var(--accent)', borderRadius: 6,
+                color: 'var(--fg)', padding: '4px 8px', fontFamily: 'var(--font-sans)',
+              }}
+            />
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <h3
+                style={{
+                  fontSize: 14.5, fontWeight: 600, color: 'var(--fg)', lineHeight: 1.3,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0,
+                }}
+              >
+                {project.custom_title || project.title}
+              </h3>
+              <button
+                onClick={(e) => { e.stopPropagation(); setNameDraft(project.custom_title || ''); setEditing(true); }}
+                title="Rename project"
+                aria-label="Rename project"
+                style={{
+                  flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 2,
+                  color: 'var(--fg-muted)', opacity: hov ? 1 : 0, transition: 'opacity .15s', lineHeight: 0,
+                }}
+              >
+                <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            </div>
+          )}
+          {project.custom_title && !editing && (
+            <p style={{ margin: '2px 0 0', fontSize: 10, color: 'var(--fg-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {project.title}
+            </p>
+          )}
         </div>
         <ScoreRing score={scorePct} size={38} />
       </div>
@@ -205,6 +268,14 @@ export default function ProjectCard({ project, delay = 0 }: Props) {
         </p>
       )}
       <div style={{ display: 'flex', gap: 5, marginBottom: 12, flexWrap: 'wrap' }}>
+        {qBadge && (
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: '.04em', padding: '2px 7px',
+            borderRadius: 999, color: qBadge.color, background: qBadge.bg, border: '1px solid var(--border)',
+          }}>
+            {qBadge.label}
+          </span>
+        )}
         {project.pending_changes.total > 0 && (
           <Tag>
             {project.pending_changes.total} pending
