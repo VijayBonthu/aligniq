@@ -38,7 +38,17 @@ jobs:
           cache: "npm"
           cache-dependency-path: frontend_green/package-lock.json
 
-      - run: npm ci
+      # `npm ci` on Linux can hit npm/cli#4828 — it installs from the lockfile but
+      # skips the platform-specific rollup binary (@rollup/rollup-linux-x64-gnu),
+      # so vite/rollup then fail with "Cannot find module". Self-heal: on failure,
+      # drop node_modules + lockfile and let `npm install` resolve the right binary.
+      - name: Install dependencies
+        run: |
+          npm ci --no-audit --no-fund || {
+            echo "::warning::npm ci failed (rollup optional-dep bug npm/cli#4828) — clean reinstall"
+            rm -rf node_modules package-lock.json
+            npm install --no-audit --no-fund
+          }
 
       # Vite inlines VITE_* at build time, so anything the SPA needs baked in must
       # be set here. VITE_API_URL and VITE_TURNSTILE_SITE_KEY are per-environment
