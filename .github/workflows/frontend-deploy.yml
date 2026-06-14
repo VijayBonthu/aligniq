@@ -32,23 +32,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NOTE: npm cache intentionally NOT enabled here. npm/cli#4828 can persist a
+      # bad optional-dep state in ~/.npm, so a restored cache makes even a clean
+      # reinstall keep skipping the rollup binary. Fresh install every run is worth
+      # the ~30s to keep the build deterministic.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: frontend_green/package-lock.json
 
-      # `npm ci` on Linux can hit npm/cli#4828 — it installs from the lockfile but
-      # skips the platform-specific rollup binary (@rollup/rollup-linux-x64-gnu),
-      # so vite/rollup then fail with "Cannot find module". Self-heal: on failure,
-      # drop node_modules + lockfile and let `npm install` resolve the right binary.
+      # `npm ci` on Linux hits npm/cli#4828 — it installs from the lockfile but
+      # SKIPS the platform-specific rollup binary (@rollup/rollup-linux-x64-gnu),
+      # so vite/rollup fail with "Cannot find module". The bundled npm (10.8) has
+      # the bug; npm 10.9+ fixed it. So: upgrade npm, wipe any partial state, and
+      # do a clean install that resolves the correct native binary for the runner.
       - name: Install dependencies
         run: |
-          npm ci --no-audit --no-fund || {
-            echo "::warning::npm ci failed (rollup optional-dep bug npm/cli#4828) — clean reinstall"
-            rm -rf node_modules package-lock.json
-            npm install --no-audit --no-fund
-          }
+          npm install -g npm@latest
+          rm -rf node_modules package-lock.json
+          npm install --no-audit --no-fund
 
       # Vite inlines VITE_* at build time, so anything the SPA needs baked in must
       # be set here. VITE_API_URL and VITE_TURNSTILE_SITE_KEY are per-environment
