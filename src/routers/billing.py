@@ -175,7 +175,7 @@ async def create_checkout_session(
         if TIER_RANK.get(tier, 0) < TIER_RANK.get(current_tier, 0):
             portal = stripe.billing_portal.Session.create(
                 customer=user.stripe_customer_id,
-                return_url=f"{settings.FRONTEND_URL}/dashboard",
+                return_url=f"{settings.FRONTEND_URL}/projects",
             )
             return {"requires_portal": True, "portal_url": portal.url}
 
@@ -201,7 +201,7 @@ async def create_checkout_session(
         payment_method_types=["card"],
         line_items=[{"price": target_price, "quantity": 1}],
         mode="subscription",
-        success_url=f"{settings.FRONTEND_URL}/dashboard?upgrade=success",
+        success_url=f"{settings.FRONTEND_URL}/projects?upgrade=success",
         cancel_url=f"{settings.FRONTEND_URL}/pricing?upgrade=cancelled",
         metadata={"user_id": user_id, "tier": tier},
     )
@@ -265,7 +265,7 @@ async def get_portal_url(
         )
     portal = stripe.billing_portal.Session.create(
         customer=user.stripe_customer_id,
-        return_url=f"{settings.FRONTEND_URL}/dashboard",
+        return_url=f"{settings.FRONTEND_URL}/projects",
     )
     return {"portal_url": portal.url}
 
