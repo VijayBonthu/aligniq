@@ -55,13 +55,24 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   # Trigger pull+restart AND run `alembic upgrade head` on the prod box via SSM.
+  # SendCommand supports resource scoping → lock it to this instance + the doc.
   statement {
-    sid     = "SSMRunCommand"
-    actions = ["ssm:SendCommand", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    sid     = "SSMSendCommand"
+    actions = ["ssm:SendCommand"]
     resources = [
       aws_instance.api.arn,
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
+  }
+
+  # Poll the command result. ssm:GetCommandInvocation / ssm:ListCommandInvocations
+  # do NOT support resource-level permissions — they must be granted on "*". If
+  # scoped to ARNs they return AccessDenied, which the deploy workflow's poll loop
+  # swallows as "Pending" and then times out even though the command succeeded.
+  statement {
+    sid       = "SSMPoll"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    resources = ["*"]
   }
 
   statement {
