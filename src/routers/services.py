@@ -4356,8 +4356,11 @@ Just ask me anything about your report!
                     if wants_pdf:
                         try:
                             # Branding policy by tier: free → watermark, pro → firm white-label.
-                            from utils.subscription import pdf_branding_for
-                            _brand = pdf_branding_for(current_user["regular_login_token"]["id"], db)
+                            # Drop the free watermark if this report was paid for with credits.
+                            from utils.subscription import pdf_branding_for, has_credit_funded_report
+                            _uid = current_user["regular_login_token"]["id"]
+                            _suppress = has_credit_funded_report(_uid, chat_context["chat_history_id"], db)
+                            _brand = pdf_branding_for(_uid, db, suppress_watermark=_suppress)
                             # Generate PDF on-the-fly
                             pdf_data = await generate_pdf_from_markdown(
                                 markdown_content=report_content,
@@ -5253,9 +5256,10 @@ async def get_change_order_draft(
         )
 
         if format == "pdf":
-            from utils.subscription import pdf_branding_for
+            from utils.subscription import pdf_branding_for, has_credit_funded_report
             import base64
-            _brand = pdf_branding_for(current_user["regular_login_token"]["id"], db)
+            _uid = current_user["regular_login_token"]["id"]
+            _brand = pdf_branding_for(_uid, db, suppress_watermark=has_credit_funded_report(_uid, chat_history_id, db))
             pdf_data = await generate_pdf_from_markdown(
                 markdown_content=markdown, title="Change Order", version=current_n, **_brand,
             )

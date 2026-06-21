@@ -64,6 +64,12 @@ export default function NewProjectFlow() {
   const checkChatLimit = (): boolean => {
     if (subscription && subscription.limits.max_chats !== null
         && subscription.usage.chats >= subscription.limits.max_chats) {
+      // Credits are a universal top-up: if the wallet covers at least a presales
+      // brief (the cheapest billable action), allow the project — the backend bills
+      // each in-project action allowance-first, then credits.
+      const balance = subscription.credits?.balance ?? 0;
+      const presalesCost = subscription.credits?.costs?.presales ?? Infinity;
+      if (balance >= presalesCost) return true;
       showLimitHit({
         limit_type: 'max_chats',
         current: subscription.usage.chats,
@@ -310,6 +316,13 @@ export default function NewProjectFlow() {
   const checkRegenLimit = (): boolean => {
     if (subscription && subscription.limits.monthly_report_regen !== null
         && subscription.usage.report_regenerations_used >= subscription.limits.monthly_report_regen) {
+      // Yield to credits the same way the backend does: a report generation is
+      // funded allowance-first then credits, costed by the tier's model.
+      const balance = subscription.credits?.balance ?? 0;
+      const costKey = subscription.tier === 'plus' || subscription.tier === 'pro'
+        ? 'report_frontier' : 'report_lite';
+      const reportCost = subscription.credits?.costs?.[costKey] ?? Infinity;
+      if (balance >= reportCost) return true;
       showLimitHit({
         limit_type: 'monthly_report_regen',
         current: subscription.usage.report_regenerations_used,

@@ -29,8 +29,9 @@ import models
 #                       (whale-guarded); pro is unlimited (contact-sales — margin
 #                       is sized per contract, not by a fixed cap).
 #   presales_per_month  the cheap presales brief, metered separately.
-#   credit_overage      True → exhausting an allowance draws prepaid credits;
-#                       False (free) → hard cap, prompt to upgrade.
+#   credit_overage      True → exhausting an allowance draws prepaid credits (all
+#                       tiers). A user with a zero balance still hard-caps and is
+#                       prompted to upgrade — that's the free conversion funnel.
 #   white_label         plus/pro: the firm's logo/colours on exported PDFs.
 #   features            entitlement flags gated via has_feature().
 # Prices: basic $30, plus $70 (top self-serve + white-label). pro = contact-sales
@@ -43,7 +44,7 @@ TIER_LIMITS: dict[str, dict] = {
         "report_generations_per_month": 1,
         "presales_per_month": 3,
         "monthly_report_regen": 1,          # legacy alias kept in sync; do not rely on
-        "credit_overage": False,            # free hard-caps → upgrade (the conversion funnel)
+        "credit_overage": True,             # draws prepaid credits after the free allowance (pay-as-you-go); a 0-balance free user still hard-caps → upgrade
         "white_label": False,
         "features": [],
     },
@@ -154,16 +155,20 @@ def has_feature(user_id: str, feature: str, db: Session) -> bool:
     return feature in (_limits_for(_get_user(user_id, db)).get("features") or [])
 
 
-def pdf_branding_for(user_id: str, db: Session) -> dict:
+def pdf_branding_for(user_id: str, db: Session, *, suppress_watermark: bool = False) -> dict:
     """Branding policy for an exported PDF, keyed off the effective tier:
     free → a watermark (export isn't a clean deliverable → upgrade nudge);
     white-label tiers (pro) → the firm's name + primary colour. Returns kwargs
-    ready to splat into utils.pdf_generator.generate_pdf_from_markdown."""
+    ready to splat into utils.pdf_generator.generate_pdf_from_markdown.
+
+    `suppress_watermark=True` drops the free-tier watermark — used when the free
+    user actually paid prepaid credits for this report (see has_credit_funded_report),
+    so a deliverable they bought exports clean."""
     user = _get_user(user_id, db)
     tier = get_effective_tier(user)
     limits = _limits_for(user)
     brand = {"brand_name": "GroundedIQ", "accent_hex": None, "watermark_text": None}
-    if tier == "free":
+    if tier == "free" and not suppress_watermark:
         brand["watermark_text"] = "PREVIEW"
     if limits.get("white_label") and getattr(user, "firm_id", None):
         firm = db.query(models.Firm).filter(models.Firm.firm_id == user.firm_id).first()
@@ -219,13 +224,24 @@ def check_chat_limit(user_id: str, db: Session) -> None:
         .count()
     )
     if count >= limits["max_chats"]:
+        # Credits are the universal top-up: if the user holds enough to run at least
+        # the cheapest billable action (a presales brief), let them create the
+        # project — every in-project action still bills allowance-first then credits,
+        # and an empty project they can't afford to use is pointless. A wallet that
+        # can't even cover a presales falls through to the upgrade/recharge prompt.
+        presales_cost = _credits_for("presales")
+        balance = get_credit_balance(user_id, db)
+        if balance >= presales_cost:
+            return
         raise HTTPException(
             status_code=402,
             detail={
-                "error": "Project limit for this billing period reached. Upgrade to create more.",
+                "error": "Project limit for this billing period reached. Recharge credits or upgrade to create more.",
                 "limit_type": "max_chats",
                 "current": count,
                 "limit": limits["max_chats"],
+                "credit_cost": presales_cost,
+                "credit_balance": balance,
                 "upgrade_url": "/pricing",
             },
         )
@@ -512,6 +528,37 @@ def refund_report_generation(user_id: str, run_id: Optional[str], db: Session) -
         {"uid": user_id},
     )
     db.commit()
+
+
+def has_credit_funded_report(user_id: str, chat_history_id: str, db: Session) -> bool:
+    """True if the user paid prepaid credits (net of refunds) for a report in this
+    project — used to drop the free-tier PREVIEW watermark from a report they
+    actually bought. Report debits are tagged action='report', ref_id=<run_id>, and
+    a run_id is stable per chat (create_or_reset_pipeline_run updates the row in
+    place), so the project's single pipeline_runs.run_id keys the lookup. Net < 0
+    means there's unrefunded report spend."""
+    run = (
+        db.query(models.PipelineRun.run_id)
+        .filter(
+            models.PipelineRun.chat_history_id == chat_history_id,
+            models.PipelineRun.user_id == user_id,
+        )
+        .first()
+    )
+    if not run:
+        return False
+    net = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(delta), 0)
+              FROM credit_ledger
+             WHERE ref_id = :rid
+               AND (action = 'report' OR reason = 'refund')
+            """
+        ),
+        {"rid": run[0]},
+    ).scalar()
+    return (net or 0) < 0
 
 
 # ------------------------------------------------------------------
