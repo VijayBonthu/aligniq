@@ -14,6 +14,7 @@ import {
   type JiraIssue,
   type JiraUser,
 } from '../../services/chatActionsService';
+import LockedFeature from '../billing/LockedFeature';
 
 type Format = 'pdf' | 'docx';
 type Mode = 'new' | 'existing';
@@ -382,9 +383,11 @@ export default function JiraSendPanel({ open, onClose, defaultTitle, buildBlob }
 
             <div style={footer}>
               <button onClick={onClose} style={ghostBtn}>Cancel</button>
-              <button onClick={send} disabled={sending || !projectKey} style={primaryBtn}>
-                {sending ? 'Sending…' : `Attach ${format.toUpperCase()} → Jira`}
-              </button>
+              <LockedFeature feature="jira">
+                <button onClick={send} disabled={sending || !projectKey} style={primaryBtn}>
+                  {sending ? 'Sending…' : `Attach ${format.toUpperCase()} → Jira`}
+                </button>
+              </LockedFeature>
             </div>
           </>
         )}

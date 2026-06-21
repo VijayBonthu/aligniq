@@ -98,6 +98,7 @@ _ACTION_COGS_USD: dict[str, float] = {
     "report_lite":     0.65,
     "section_regen":   0.20,
     "presales":        0.30,
+    "chat_message":    0.02,   # real COGS is fractions of a cent; the _credits_for floor makes this 1 credit/msg — margin-safe even on a heavy frontier turn (~$0.02 < $0.10)
 }
 
 
@@ -260,17 +261,28 @@ def check_message_limit(chat_history_id: str, user_id: str, db: Session) -> None
     )
     if not chat:
         return
-    if chat.message_count >= limits["messages_per_chat"]:
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "error": "Message limit reached for this chat. Upgrade to send more messages.",
-                "limit_type": "messages_per_chat",
-                "current": chat.message_count,
-                "limit": limits["messages_per_chat"],
-                "upgrade_url": "/pricing",
-            },
-        )
+    if chat.message_count < limits["messages_per_chat"]:
+        return
+    # Per-chat allowance spent — fall back to prepaid credits (allowance-first, like
+    # presales/reports). consume_message() does the actual debit after the turn.
+    cost = _credits_for("chat_message")
+    if limits.get("credit_overage") and get_credit_balance(user_id, db) >= cost:
+        return
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "error": "Message limit reached for this chat. Recharge credits or upgrade to send more."
+                     if limits.get("credit_overage")
+                     else "Message limit reached for this chat. Upgrade to send more messages.",
+            "limit_type": "messages_per_chat",
+            "current": chat.message_count,
+            "limit": limits["messages_per_chat"],
+            "credit_overage": bool(limits.get("credit_overage")),
+            "credit_cost": cost,
+            "credit_balance": get_credit_balance(user_id, db),
+            "upgrade_url": "/pricing",
+        },
+    )
 
 
 def get_or_create_usage_period(user_id: str, db: Session) -> models.UsageTracking:
@@ -641,6 +653,51 @@ def increment_message_count(chat_history_id: str, user_id: str, db: Session) -> 
     db.commit()
     row = result.fetchone()
     return row[0] if row else 0
+
+
+def consume_message(chat_history_id: str, user_id: str, db: Session) -> str:
+    """Count one user turn and charge it. Within the per-chat allowance it's free
+    ('allowance'); beyond it we debit prepaid credits ('credits'), flat 1 credit/msg
+    (margin-safe — worst-case turn COGS ~$0.02 << $0.10). Mirrors consume_presales,
+    but the 'allowance' here is the lifetime per-chat message_count, not a period
+    counter. increment_message_count runs either way so the tally stays accurate.
+    check_message_limit (called earlier) already gated, so the debit is best-effort:
+    a rare concurrent-stream race may deliver one uncharged message."""
+    limits = _limits_for(_get_user(user_id, db))
+    limit = limits.get("messages_per_chat")
+    new_count = increment_message_count(chat_history_id, user_id, db)
+    if limit is None:
+        return "unlimited"
+    if (new_count - 1) < limit:
+        return "allowance"
+    if limits.get("credit_overage") and debit_credits(
+        user_id, _credits_for("chat_message"), "chat_message", db, ref_id=chat_history_id
+    ):
+        return "credits"
+    return "allowance"  # check gated this; don't drop the delivered message on a debit race
+
+
+def require_feature(user_id: str, feature: str, db: Session, *, label: str) -> None:
+    """Raise HTTP 402 if the user's effective tier doesn't unlock `feature`. Tier
+    features are subscription-only — NEVER purchasable with credits (unlike usage
+    caps). `required_tier` is the cheapest tier whose feature set includes it."""
+    if has_feature(user_id, feature, db):
+        return
+    order = ["free", "basic", "plus", "pro"]
+    required_tier = next(
+        (t for t in order if feature in (TIER_LIMITS.get(t, {}).get("features") or [])),
+        "plus",
+    )
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "error": f"{label} is a {required_tier.capitalize()} feature.",
+            "limit_type": f"feature_{feature}",
+            "feature": feature,
+            "required_tier": required_tier,
+            "upgrade_url": "/pricing",
+        },
+    )
 
 
 def increment_regen_count(user_id: str, db: Session) -> int:

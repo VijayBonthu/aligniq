@@ -290,6 +290,8 @@ async def create_jira_from_report(
     }
     Returns: { epic_key, epic, issue_keys, issues, scope, project_key }
     """
+    from utils.subscription import require_feature
+    require_feature(current_user["regular_login_token"]["id"], "jira", db, label="Jira push")
     integ = await _integ(current_user, db)
 
     chat_history_id = (payload or {}).get("chat_history_id")

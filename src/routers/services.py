@@ -10,6 +10,7 @@ from utils.subscription import (
     increment_message_count, increment_regen_count, get_usage_summary,
     check_report_generation_limit, consume_report_generation,
     check_presales_limit, consume_presales, get_model_tier, has_feature,
+    consume_message, require_feature,
 )
 from utils.chat_history import save_chat_history, delete_chat_history, get_user_chat_history_details,get_single_user_chat_history, save_chat_with_doc, save_report_version
 from getdata import ExtractText
@@ -1734,7 +1735,7 @@ async def presales_chat(
                 logger.info(f"Saved conversation to chat_history_id: {chat_history_id}")
                 # Count this user turn against the per-chat message ceiling.
                 # Atomic UPDATE...RETURNING; one increment per turn (matches /chat-with-doc).
-                increment_message_count(chat_history_id, user_id, db)
+                consume_message(chat_history_id, user_id, db)
             except Exception as e:
                 logger.warning(f"Could not save conversation history: {str(e)}")
 
@@ -3002,7 +3003,7 @@ async def conversation_with_doc_v2(
         # almost certainly miss one. message_count tracks "user turns submitted",
         # so once we accept the request we count it; the LLM cost is downstream.
         check_message_limit(request.chat_history_id, request.user_id, db)
-        increment_message_count(request.chat_history_id, request.user_id, db)
+        consume_message(request.chat_history_id, request.user_id, db)
 
         # 2. Extract ONLY selected messages for processing
         selected_messages = [msg for msg in chat_context["message"] if msg.get("selected", True)]
@@ -5365,6 +5366,7 @@ async def compare_versions(
     Returns diff statistics + the two executive summaries + changelogs.
     """
     try:
+        require_feature(current_user["regular_login_token"]["id"], "version_compare", db, label="Version compare")
         diff = await get_report_diff(chat_history_id, version_a, version_b, db)
         # Enrich with each version's changelog so the comparison is meaningful,
         # not just line counts.
@@ -6366,6 +6368,7 @@ async def get_deliverable_sections(
     from utils.report_sections import parse_sections, default_excluded_ids
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
+    require_feature(current_user["regular_login_token"]["id"], "deliverable_builder", db, label="Deliverable Builder")
 
     state = await get_deliverable_state(chat_history_id, db)
     if not state or not state.get("report_content"):
@@ -6394,6 +6397,7 @@ async def put_deliverable_config(
     from utils.report_sections import parse_sections
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
+    require_feature(current_user["regular_login_token"]["id"], "deliverable_builder", db, label="Deliverable Builder")
 
     state = await get_deliverable_state(chat_history_id, db)
     if not state or not state.get("report_content"):
@@ -6432,6 +6436,7 @@ async def post_deliverable_polish(
     from utils.deliverable_polish import polish_section
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
+    require_feature(current_user["regular_login_token"]["id"], "section_regen", db, label="Section polish")
 
     state = await get_deliverable_state(chat_history_id, db)
     if not state or not state.get("report_content"):
@@ -6466,6 +6471,7 @@ async def delete_deliverable_polish(
     from database_scripts import revert_polished_section
 
     await _premortem_owner_chat(chat_history_id, current_user, db)
+    require_feature(current_user["regular_login_token"]["id"], "section_regen", db, label="Section polish")
     return await revert_polished_section(chat_history_id, section_id, db)
 
 
@@ -6582,7 +6588,7 @@ async def conversation_with_doc_v3(
             }
             chat_context["message"].append(new_assistant_message)
             await save_chat_history(chat=chat_context, db=db)
-            increment_message_count(chat_history_id, user_id, db)
+            consume_message(chat_history_id, user_id, db)
 
             # Return response
             return {
@@ -6706,7 +6712,7 @@ async def conversation_with_doc_v3(
 
         chat_context["message"].append(new_assistant_message)
         await save_chat_history(chat=chat_context, db=db)
-        increment_message_count(chat_history_id, user_id, db)
+        consume_message(chat_history_id, user_id, db)
 
         # 7. RETURN RESPONSE
         api_response = {
@@ -6917,7 +6923,7 @@ async def conversation_with_doc_stream(
                     new_assistant_message["saved_label"] = saved_label
                 chat_context["message"].append(new_assistant_message)
                 await save_chat_history(chat=chat_context, db=db)
-                increment_message_count(chat_history_id, user_id, db)
+                consume_message(chat_history_id, user_id, db)
                 logger.info(f"Streaming chat saved for {chat_history_id}")
 
         except Exception as e:

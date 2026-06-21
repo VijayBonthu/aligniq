@@ -9,6 +9,7 @@ export interface TierLimits {
   model_tier?: 'lite' | 'frontier';
   white_label?: boolean;
   credit_overage?: boolean;
+  features?: string[];   // entitlement flags for the effective tier (e.g. "version_compare", "jira")
 }
 
 export interface SubscriptionUsage {

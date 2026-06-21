@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { DeliverableSection, PolishedSection } from '../../types/deliverable';
 import SectionEditor from './SectionEditor';
+import LockedFeature from '../billing/LockedFeature';
 
 interface Props {
   section: DeliverableSection;
@@ -121,14 +122,16 @@ export default function SectionRow({
           >
             {editing ? 'Done' : 'Edit'}
           </button>
-          <button
-            onClick={() => onPolish(section.id)}
-            disabled={!included || polishing}
-            style={btnStyle(included && !polishing, polishing)}
-            title="Run a single LLM Polish pass on this section"
-          >
-            {polishing ? 'Polishing…' : 'Polish'}
-          </button>
+          <LockedFeature feature="section_regen">
+            <button
+              onClick={() => onPolish(section.id)}
+              disabled={!included || polishing}
+              style={btnStyle(included && !polishing, polishing)}
+              title="Run a single LLM Polish pass on this section"
+            >
+              {polishing ? 'Polishing…' : 'Polish'}
+            </button>
+          </LockedFeature>
           {polished && (
             <button
               onClick={() => onRevertPolish(section.id)}

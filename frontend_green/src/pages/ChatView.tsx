@@ -12,6 +12,7 @@ import ToolActivity from '../components/chat/ToolActivity';
 import PendingChangesPanel from '../components/chat/PendingChangesPanel';
 import VersionsPanel from '../components/chat/VersionsPanel';
 import CostEditor from '../components/chat/CostEditor';
+import LockedFeature from '../components/billing/LockedFeature';
 
 type TabKey = 'chat' | 'premortem';
 
@@ -239,7 +240,13 @@ export default function ChatView() {
   const messageLimit = subscription?.limits?.messages_per_chat ?? null;
   const messagesRemaining =
     messageLimit == null ? null : Math.max(0, messageLimit - messageCount);
-  const atCap = messagesRemaining === 0;
+  // Per-chat allowance spent. Credits extend it (1/message), so only hard-block
+  // (the upgrade nudge) when the wallet can't cover a message either.
+  const overCap = messagesRemaining === 0;
+  const messageCreditCost = subscription?.credits?.costs?.chat_message ?? Infinity;
+  const creditsCoverMessage = (subscription?.credits?.balance ?? 0) >= messageCreditCost;
+  const atCap = overCap && !creditsCoverMessage;
+  const onCredits = overCap && creditsCoverMessage;
 
   // Re-fetch the persisted chat so the rendered full_report swaps to the active
   // version after the user picks a different default in the Versions panel.
@@ -471,6 +478,7 @@ export default function ChatView() {
             />
             FULL REPORT
           </span>
+          <LockedFeature feature="deliverable_builder">
           <button
             onClick={() => reportReady && navigate(`/deliverable/${chatHistoryId}`)}
             disabled={!reportReady}
@@ -501,6 +509,7 @@ export default function ChatView() {
             </svg>
             Build Deliverable
           </button>
+          </LockedFeature>
           <button
             onClick={() => { if (reportReady) { setChangeDraft(undefined); setPendingOpen(true); } }}
             disabled={!reportReady}
@@ -561,6 +570,7 @@ export default function ChatView() {
               onClick={() => setTab('chat')}
               label="Chat"
             />
+            <LockedFeature feature="pre_mortem" variant="badge">
             <TabButton
               active={tab === 'premortem'}
               onClick={() => reportReady && setTab('premortem')}
@@ -572,6 +582,7 @@ export default function ChatView() {
                   : 'Pre-Mortem becomes available once the full pipeline finishes'
               }
             />
+            </LockedFeature>
           </div>
           <button
             onClick={() => setContextMode((p) => !p)}
@@ -1033,6 +1044,8 @@ export default function ChatView() {
                   letterSpacing: '.04em',
                   color: atCap
                     ? 'var(--danger)'
+                    : onCredits
+                    ? 'var(--accent)'
                     : (messagesRemaining ?? messageLimit) <= Math.max(1, Math.floor(messageLimit * 0.2))
                     ? 'var(--warn)'
                     : 'var(--fg-muted)',
@@ -1041,6 +1054,8 @@ export default function ChatView() {
                 <span>
                   {atCap
                     ? `Message limit reached for this chat (${messageCount}/${messageLimit})`
+                    : onCredits
+                    ? `Allowance used · paying with credits (${messageCreditCost}/msg, balance ${subscription?.credits?.balance ?? 0})`
                     : `${messageCount} / ${messageLimit} messages used`}
                 </span>
                 {atCap && (

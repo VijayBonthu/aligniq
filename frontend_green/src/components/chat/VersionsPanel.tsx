@@ -8,6 +8,7 @@ import {
   signoffVersion,
   type ReportVersionMeta,
 } from '../../services/chatActionsService';
+import LockedFeature from '../billing/LockedFeature';
 
 interface Props {
   chatHistoryId: string;
@@ -185,7 +186,9 @@ export default function VersionsPanel({ chatHistoryId, open, onClose, onChanged,
               </select>
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-              <button onClick={goCompare} disabled={busy} style={{ ...cmpBtn, flex: 1 }}>Compare ↗</button>
+              <LockedFeature feature="version_compare" style={{ flex: 1 }}>
+                <button onClick={goCompare} disabled={busy} style={{ ...cmpBtn, flex: 1, width: '100%' }}>Compare ↗</button>
+              </LockedFeature>
               {onAskInChat && (
                 <button onClick={askInChat} disabled={busy} style={{ ...cmpBtn, flex: 1 }}>Ask in chat</button>
               )}

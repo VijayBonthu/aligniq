@@ -33,6 +33,9 @@ interface AuthContextType {
   login: (accessToken: string) => Promise<boolean>;
   logout: () => void;
   refreshSubscription: () => Promise<void>;
+  // True if the user's effective tier unlocks `feature` (e.g. "version_compare", "jira").
+  // Tier features are subscription-only — never purchasable with credits.
+  hasFeature: (feature: string) => boolean;
   limitHit: LimitHitDetail | null;
   showLimitHit: (detail: LimitHitDetail) => void;
   clearLimitHit: () => void;
@@ -46,6 +49,7 @@ const defaultValue: AuthContextType = {
   login: async () => false,
   logout: () => {},
   refreshSubscription: async () => {},
+  hasFeature: () => false,
   limitHit: null,
   showLimitHit: () => {},
   clearLimitHit: () => {},
@@ -66,6 +70,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const showLimitHit = useCallback((detail: LimitHitDetail) => setLimitHit(detail), []);
   const clearLimitHit = useCallback(() => setLimitHit(null), []);
+  const hasFeature = useCallback(
+    (feature: string) => !!subscription?.limits?.features?.includes(feature),
+    [subscription],
+  );
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -158,7 +166,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   return (
     <AuthContext.Provider value={{
       isAuthenticated, authReady, user, subscription, login, logout, refreshSubscription,
-      limitHit, showLimitHit, clearLimitHit,
+      hasFeature, limitHit, showLimitHit, clearLimitHit,
     }}>
       {children}
     </AuthContext.Provider>
