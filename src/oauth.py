@@ -237,6 +237,12 @@ class GitHubOAuth:
             "scope": "read:user user:email",
             "state": state,
             "allow_signup": "true",
+            # Force GitHub's account picker on every sign-in. Without this, a user who is
+            # still logged into github.com and has already authorized this OAuth app gets
+            # redirected straight back with a code (no screen), silently re-logging them
+            # into the same account — so they can never pick a different one. Mirrors the
+            # prompt="consent" we send to Google/Jira.
+            "prompt": "select_account",
         }
         return f"{self.AUTHORIZE_URL}?{urlencode(params)}", state
 
