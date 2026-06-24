@@ -57,7 +57,7 @@ variable "db_username" {
 }
 
 variable "db_password" {
-  description = "Postgres master password. Generate fresh for prod (`openssl rand -base64 24`) — never reuse staging. Pass via terraform.tfvars (gitignored)."
+  description = "Postgres master password. Generate fresh for prod with `openssl rand -hex 32` (do NOT use base64 — RDS forbids slash, at-sign, quote and space, and base64 emits '/') — never reuse staging. Pass via terraform.tfvars (gitignored)."
   type        = string
   sensitive   = true
 }
