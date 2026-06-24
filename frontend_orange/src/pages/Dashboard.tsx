@@ -683,11 +683,18 @@ const Dashboard: React.FC = () => {
 
     try {
       const answers = collectFrontendAnswers();
+      // saveAnswers now takes AnswerSubmission[]; this legacy panel keys answers
+      // positionally (p1_n / question_n), which the backend still accepts during
+      // the deprecation window. Reshape to the array form so it type-checks.
+      const submissions = Object.entries(answers).map(([question_id, answer]) => ({
+        question_id,
+        answer,
+      }));
 
       // Skip the save call entirely when nothing is filled — the analyze
       // endpoint will auto-generate assumptions for every unanswered question.
-      if (Object.keys(answers).length > 0) {
-        await presalesService.saveAnswers(activeConversation.presales_id, answers);
+      if (submissions.length > 0) {
+        await presalesService.saveAnswers(activeConversation.presales_id, submissions);
       }
 
       const data = await presalesService.analyze(activeConversation.presales_id);

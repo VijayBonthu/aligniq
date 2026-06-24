@@ -48,6 +48,10 @@ class ToolChatAgent:
         tool_context.chat_history_id = chat_history_id
         tool_context.db = db
         tool_context.user_id = user_id
+        # Reset the per-turn report cache (see StreamingToolChatAgent): the global
+        # tool_context must not serve a prior request's detached report row.
+        tool_context._report_cache_key = None
+        tool_context._report = None
 
         # Initialize tools and create tool map for execution
         self.tools = get_all_tools()
@@ -280,12 +284,17 @@ async def get_report_context_summary(chat_history_id: str, db) -> Optional[str]:
             return "No report has been generated yet."
 
         has_report = bool(report.report_content)
-        version = getattr(report, 'version', 1)
+        # ReportVersions exposes version_number (not 'version'); the default-preferred
+        # get_summary_report row IS the active version.
+        version = getattr(report, 'version_number', None)
 
         summary_parts = []
 
         if has_report:
-            summary_parts.append(f"Report version {version} is available.")
+            if version is not None:
+                summary_parts.append(f"Active report version: v{version} (the current default).")
+            else:
+                summary_parts.append("Report is available.")
         else:
             summary_parts.append("Report generation may be in progress.")
 

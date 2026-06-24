@@ -2,32 +2,28 @@ import type { CSSProperties } from 'react';
 import type { PipelineRunSnapshot } from '../../services/fullPipelineService';
 
 /**
- * Per-stage progress for the 9-agent full pipeline.
+ * Per-stage progress for the full pipeline.
+ *
+ * Two pipeline modes are supported (selected backend-side by USE_CONTRACT_PIPELINE):
+ *   - legacy: 8-agent linear pipeline.
+ *   - contract: 4-stage plan -> decide -> parallel writers -> judge.
+ *
+ * Mode is inferred from the stage ids present in the snapshot — no extra
+ * backend field needed. Stage orders MUST match `PIPELINE_STAGES_ORDER` and
+ * `CONTRACT_PIPELINE_STAGES_ORDER` in `src/database_scripts.py`.
  *
  * Visual treatment ported from
  * `design/extracted/aligniq (1)/New Project Flow.html` (ProcessingSteps block).
  * Each row is one of three states: pending / active (RUNNING) / done (DONE).
- *
- * Stage order MUST match `STAGE_ORDER` in `src/agents/pipeline_runner.py`.
  */
 
-type StageId =
-  | 'requirements_analyzer'
-  | 'ambiguity_resolver'
-  | 'validator_agent'
-  | 'solution_architectures'
-  | 'critic_agent'
-  | 'evidence_gather_agent'
-  | 'feasibility_estimator'
-  | 'ba_final_report_generation';
-
 interface StageDef {
-  id: StageId;
+  id: string;
   label: string;
   icon: string;
 }
 
-const STAGES: StageDef[] = [
+const LEGACY_STAGES: StageDef[] = [
   { id: 'requirements_analyzer',       label: 'Analyzing requirements',       icon: '📋' },
   { id: 'ambiguity_resolver',          label: 'Resolving ambiguities',         icon: '🔍' },
   { id: 'validator_agent',             label: 'Validating consistency',        icon: '✓' },
@@ -38,13 +34,43 @@ const STAGES: StageDef[] = [
   { id: 'ba_final_report_generation',  label: 'Generating final report',        icon: '📄' },
 ];
 
+const CONTRACT_STAGES: StageDef[] = [
+  { id: 'plan',                label: 'Planning report contract',         icon: '🧠' },
+  { id: 'decide',              label: 'Deciding solution & estimate',     icon: '📐' },
+  { id: 'write_sections',      label: 'Writing sections in parallel',     icon: '✍' },
+  { id: 'judge_and_finalize',  label: 'Judging and finalizing',           icon: '⚖' },
+];
+
+const CONTRACT_STAGE_IDS = new Set(CONTRACT_STAGES.map((s) => s.id));
+
+function pickStages(snapshot: PipelineRunSnapshot): {
+  stages: StageDef[];
+  isContract: boolean;
+} {
+  const seen = [
+    snapshot.current_stage,
+    ...(snapshot.stages_completed || []).map((s) => s.stage),
+  ].filter(Boolean) as string[];
+  const isContract = seen.some((s) => CONTRACT_STAGE_IDS.has(s));
+  return { stages: isContract ? CONTRACT_STAGES : LEGACY_STAGES, isContract };
+}
+
 interface Props {
   snapshot: PipelineRunSnapshot;
 }
 
 export default function PipelineProgress({ snapshot }: Props) {
+  const { stages, isContract } = pickStages(snapshot);
   const completedSet = new Set((snapshot.stages_completed || []).map((s) => s.stage));
   const current = snapshot.current_stage;
+  // While `queued` (e.g., just-clicked Retry or just-launched), the runner
+  // hasn't called mark_stage_started yet so current_stage may be null/stale.
+  // Render a spinner on the first not-yet-completed stage so the page is
+  // never silent. Once the runner ticks, normal `current_stage` takes over.
+  const queuedNext =
+    snapshot.status === 'queued' && !current
+      ? stages.find((s) => !completedSet.has(s.id))?.id ?? null
+      : null;
 
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: '32px 24px' }}>
@@ -59,20 +85,23 @@ export default function PipelineProgress({ snapshot }: Props) {
           marginBottom: 18,
         }}
       >
-        9-AGENT PIPELINE RUNNING
+        {isContract ? 'CONTRACT PIPELINE RUNNING' : '8-AGENT PIPELINE RUNNING'}
       </p>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {STAGES.map((stage) => {
+        {stages.map((stage) => {
           const isDone = completedSet.has(stage.id);
-          const isActive = !isDone && stage.id === current;
-          const showLoop = stage.id === 'critic_agent' && (snapshot.loop_count || 0) > 0;
+          const isActive =
+            !isDone && (stage.id === current || stage.id === queuedNext);
+          const showLoop =
+            !isContract && stage.id === 'critic_agent' && (snapshot.loop_count || 0) > 0;
           return (
             <StageRow
               key={stage.id}
               stage={stage}
               state={isDone ? 'done' : isActive ? 'active' : 'pending'}
               loopBadge={showLoop ? `loop ${snapshot.loop_count}/3` : null}
+              activeLabel={stage.id === queuedNext ? 'STARTING' : 'RUNNING'}
             />
           );
         })}
@@ -85,10 +114,12 @@ function StageRow({
   stage,
   state,
   loopBadge,
+  activeLabel = 'RUNNING',
 }: {
   stage: StageDef;
   state: 'pending' | 'active' | 'done';
   loopBadge: string | null;
+  activeLabel?: string;
 }) {
   const rowStyle: CSSProperties = {
     display: 'flex',
@@ -187,7 +218,7 @@ function StageRow({
             animation: 'pulse 2s ease-in-out infinite',
           }}
         >
-          RUNNING
+          {activeLabel}
         </span>
       )}
       {state === 'done' && (

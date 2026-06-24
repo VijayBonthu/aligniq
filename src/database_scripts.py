@@ -4,14 +4,18 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from p_model_type import Registration_login
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from utils.token_generation import hash_passwords
 from utils.report_sections import parse_sections
+from utils.email_validation import is_disposable_email
+from config import settings
 from fastapi import HTTPException, status
 from utils.logger import logger
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import copy
+import json
 import uuid
+from utils.ids import new_id
 from typing import Optional
 
 class UserCreationError(Exception):
@@ -40,17 +44,27 @@ async def create_user(user_data:dict,provider:str, db:Session):
             full_name = user_data["name"],
             picture = user_data["picture"],
             provider = provider,
+            company = user_data.get("company"),
             subscription_tier = "free",
             subscription_status = "active",
         )
-        try: 
+        try:
             db.add(user_details)
             db.commit()
             db.refresh(user_details)
-            
+
         except SQLAlchemyError as e:
-            db.rollback() 
+            db.rollback()
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"unable to create details: {str(e.args), str(e.code)}")
+
+        # Auto-assign a 1-person firm (Bet 3). Failure here is non-fatal — the user
+        # still gets a working account, but firm-admin features will no-op until
+        # a firm is assigned manually or via the migration backfill.
+        try:
+            ensure_firm_for_new_user(user_details.user_id, db)
+            db.refresh(user_details)
+        except Exception as fe:  # noqa: BLE001
+            logger.error(f"ensure_firm_for_new_user failed at signup for {user_details.user_id}: {fe}")
 
         if user_details.provider == "Local":
             h_pass = hash_passwords(password=user_data["password"]) 
@@ -67,7 +81,167 @@ async def create_user(user_data:dict,provider:str, db:Session):
         return user_details
     return user_details
 
-def get_user_details(email_address:str, db:Session): 
+async def get_or_create_oauth_user(user_data: dict, provider: str, db: Session, *, ip=None, user_agent=None, device_id=None):
+    """Login path for social providers (Google/GitHub/Microsoft): one human = one
+    account, keyed by VERIFIED email. If a user already exists for this email — under
+    ANY provider, including a Local password account — we sign them into THAT account
+    (link by verified email) instead of spawning a duplicate row with its own firm/
+    projects. Only when no account exists for the email do we create one (reusing
+    create_user, so firm auto-assignment etc. stay identical).
+
+    Safe because every caller passes a provider-verified email (the OAuth classes reject
+    accounts without one). create_user still owns the Local /registration path unchanged."""
+    if not user_data or not user_data.get("email"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Required details not provided")
+    email = user_data["email"].strip().lower()
+    try:
+        # Case-insensitive match: Local signup stores the email as typed (e.g.
+        # "Ada@Acme.com"), so an exact == on the lowercased OAuth email would miss it
+        # and spawn a duplicate account instead of linking. Email is the identity.
+        existing = db.query(models.User).filter(func.lower(models.User.email_address) == email).first()
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"unable to connect to DB {e}")
+    if existing:
+        # Pre-hijack guard, then record this provider as a linked identity.
+        _neutralize_unverified_local(existing, db)
+        record_identity(existing.user_id, provider, user_data.get("id"), email, db)
+        return existing
+    # Creating a NEW account → block disposable/throwaway emails. Matters most for GitHub,
+    # where a user can attach an arbitrary verified email (Google/Microsoft are their own
+    # domains). Existing-account links above are never blocked.
+    if is_disposable_email(email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please sign up with a permanent (non-disposable) email address.",
+        )
+    # create_user's (email, provider) duplicate guard can't fire here — no row has this email.
+    new_user = await create_user(user_data=user_data, provider=provider, db=db)
+    record_identity(new_user.user_id, provider, user_data.get("id"), email, db)
+    record_signup_event(new_user, email, ip, device_id, user_agent, provider, db)
+    return new_user
+
+
+def record_signup_event(user, email, ip, device_id, user_agent, provider, db):
+    """Audit-log an account creation and soft-flag it when device/IP signup velocity over
+    the last 24h exceeds the configured thresholds. Flag-only — NEVER blocks (the device/IP
+    signal is spoofable). Best-effort: failures are logged, not raised, so abuse tracking
+    can't break signup."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        flagged = False
+        if device_id:
+            dev_count = db.query(models.SignupEvent).filter(
+                models.SignupEvent.device_id == device_id,
+                models.SignupEvent.created_at >= since,
+            ).count()
+            if dev_count >= settings.SIGNUP_MAX_PER_DEVICE_PER_DAY:
+                flagged = True
+        if ip:
+            ip_count = db.query(models.SignupEvent).filter(
+                models.SignupEvent.ip == ip,
+                models.SignupEvent.created_at >= since,
+            ).count()
+            if ip_count >= settings.SIGNUP_MAX_PER_IP_PER_DAY:
+                flagged = True
+        event = models.SignupEvent(
+            user_id=getattr(user, "user_id", None),
+            email=email,
+            ip=ip,
+            device_id=device_id,
+            user_agent=((user_agent or "")[:500] or None),
+            provider=provider,
+            flagged=flagged,
+        )
+        db.add(event)
+        db.commit()
+        if flagged:
+            logger.warning(
+                f"Flagged signup (velocity): user={getattr(user, 'user_id', None)} "
+                f"ip={ip} device={device_id} provider={provider}"
+            )
+        return event
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"record_signup_event failed: {e}")
+        return None
+
+
+def _neutralize_unverified_local(user, db) -> None:
+    """Account pre-hijacking guard. A verified OAuth login matched an EXISTING account;
+    if that account was never verified, the OAuth owner (who proved control of the
+    mailbox) is the rightful owner. Mark it verified and revoke any unverified local
+    password, so a password an attacker pre-registered on the victim's email can't
+    survive the real owner signing in. Verified accounts are left untouched — a
+    legitimate user who confirmed their email keeps their password when they link OAuth."""
+    if user.verified_email:
+        return
+    try:
+        login_row = db.query(models.LoginDetails).filter(
+            models.LoginDetails.user_id == user.user_id
+        ).first()
+        if login_row:
+            db.delete(login_row)
+            logger.warning(
+                f"Revoked unverified local password for user {user.user_id} on verified OAuth takeover"
+            )
+        user.verified_email = True
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"_neutralize_unverified_local failed for {user.user_id}: {e}")
+
+
+def record_identity(user_id: str, provider: str, provider_user_id, email, db) -> Optional[object]:
+    """Upsert the (user, provider) login identity — one row per provider per user. Best
+    effort: identity tracking must never block a login, so failures are logged, not raised."""
+    try:
+        existing = db.query(models.UserIdentity).filter(
+            models.UserIdentity.user_id == user_id,
+            models.UserIdentity.provider == provider,
+        ).first()
+        if existing:
+            changed = False
+            if provider_user_id and existing.provider_user_id != str(provider_user_id):
+                existing.provider_user_id = str(provider_user_id); changed = True
+            if email and existing.email != email:
+                existing.email = email; changed = True
+            if changed:
+                db.commit()
+            return existing
+        ident = models.UserIdentity(
+            user_id=user_id,
+            provider=provider,
+            provider_user_id=str(provider_user_id) if provider_user_id else None,
+            email=(email or None),
+        )
+        db.add(ident)
+        db.commit()
+        return ident
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"record_identity failed for {user_id}/{provider}: {e}")
+        return None
+
+
+def get_linked_identities(user_id: str, db) -> list:
+    """Linked login methods for a user (for a Connected-accounts surface)."""
+    try:
+        rows = db.query(models.UserIdentity).filter(
+            models.UserIdentity.user_id == user_id
+        ).order_by(models.UserIdentity.created_at).all()
+    except SQLAlchemyError as e:
+        logger.error(f"get_linked_identities failed for {user_id}: {e}")
+        return []
+    return [
+        {
+            "provider": r.provider,
+            "email": r.email,
+            "linked_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+def get_user_details(email_address:str, db:Session):
     try:
         query = db.query(models.User.email_address,
                         models.User.user_id,
@@ -80,8 +254,13 @@ def get_user_details(email_address:str, db:Session):
                         ).join(
                             models.LoginDetails,
                             models.User.user_id == models.LoginDetails.user_id) 
+        # Match Local accounts case-insensitively, REGARDLESS of verification status.
+        # (The old `verified_email == "False"` clause excluded verified users, so once the
+        # email-verification gate flipped verified_email=true, login could no longer find
+        # them. Verification is enforced by require_verified_email/ProtectedRoute, not here.)
         record = query.filter(and_(
-            models.User.provider=="Local", models.User.verified_email == "False", models.User.email_address == email_address
+            models.User.provider == "Local",
+            func.lower(models.User.email_address) == (email_address or "").strip().lower(),
         )).first()
     except SQLAlchemyError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Something wrong with our service, please try again later")
@@ -106,9 +285,15 @@ async def user_documents(doc_data:dict, db:Session) -> dict:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"unable to create document data {str(e)}")
     
 async def get_summary_report(chat_history_id:str, db:Session)-> dict:
+    """Return the ACTIVE report version for a chat — the user-selected default
+    when one is set, otherwise the newest. This is the single source of truth the
+    chat answers from, so marking a version default makes every answer (and the
+    re-embedded vector store) reflect that version instead of the latest."""
     try:
-        query = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == chat_history_id).order_by(models.ReportVersions.created_at.desc())
-        record = query.first()
+        base = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == chat_history_id)
+        record = base.filter(models.ReportVersions.is_default == True).order_by(models.ReportVersions.created_at.desc()).first()
+        if not record:
+            record = base.order_by(models.ReportVersions.created_at.desc()).first()
         return record
     except SQLAlchemyError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error occured with the DB, chat history id: {chat_history_id}, error: {str(e)}")
@@ -118,16 +303,30 @@ async def get_summary_report(chat_history_id:str, db:Session)-> dict:
 # A6 — PRE-MORTEM (adversarial-persona objections cache)
 # ============================================================
 
+def _active_report_version_row(chat_history_id: str, db: Session):
+    """The ACTIVE report_version row: user-selected default if set, else newest.
+    Single source of truth shared by get_summary_report and the pre-mortem helpers
+    so the panel grounds on (and writes to) the SAME version the chat answers from —
+    otherwise positional pre-mortem evidence ids would drift between read and write."""
+    base = db.query(models.ReportVersions).filter(
+        models.ReportVersions.chat_history_id == chat_history_id
+    )
+    row = base.filter(models.ReportVersions.is_default == True).order_by(  # noqa: E712
+        models.ReportVersions.created_at.desc()
+    ).first()
+    if not row:
+        row = base.order_by(models.ReportVersions.created_at.desc()).first()
+    return row
+
+
 async def get_pre_mortem(chat_history_id: str, db: Session) -> Optional[dict]:
     """
-    Return the cached pre_mortem JSON from the latest report_version of this
+    Return the cached pre_mortem JSON from the ACTIVE report_version of this
     chat, or None if no report exists yet, or None if pre_mortem hasn't been
     generated yet for that version.
     """
     try:
-        record = db.query(models.ReportVersions).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
+        record = _active_report_version_row(chat_history_id, db)
         if not record:
             return None
         return copy.deepcopy(record.pre_mortem) if record.pre_mortem else None
@@ -140,14 +339,12 @@ async def get_pre_mortem(chat_history_id: str, db: Session) -> Optional[dict]:
 
 async def save_pre_mortem(chat_history_id: str, pre_mortem: dict, db: Session) -> None:
     """
-    Persist pre_mortem onto the latest report_version row for this chat.
+    Persist pre_mortem onto the ACTIVE report_version row for this chat.
     No locking — last writer wins (acceptable: cost of a duplicate write is
     one wasted LLM call already paid upstream).
     """
     try:
-        record = db.query(models.ReportVersions).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
+        record = _active_report_version_row(chat_history_id, db)
         if not record:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -165,12 +362,10 @@ async def save_pre_mortem(chat_history_id: str, pre_mortem: dict, db: Session) -
 
 
 async def get_report_version_id(chat_history_id: str, db: Session) -> Optional[str]:
-    """Return the latest report_version_id for this chat, or None."""
+    """Return the ACTIVE report_version_id for this chat, or None."""
     try:
-        record = db.query(models.ReportVersions.report_version_id).filter(
-            models.ReportVersions.chat_history_id == chat_history_id
-        ).order_by(models.ReportVersions.created_at.desc()).first()
-        return record[0] if record else None
+        record = _active_report_version_row(chat_history_id, db)
+        return record.report_version_id if record else None
     except SQLAlchemyError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -720,13 +915,30 @@ async def get_all_report_versions(chat_history_id: str, db: Session) -> list:
 
         versions = []
         for record in records:
+            exec_summary = record.summary_report.get("executive_summary") if record.summary_report else None
+            # A short, identifiable name for the version: prefer the changelog of
+            # what changed; else the first line of the exec summary; else a number.
+            if record.changelog_summary:
+                label = record.changelog_summary
+            elif record.version_number == 1:
+                label = "Initial report"
+            elif exec_summary:
+                first_line = exec_summary.strip().split("\n")[0]
+                label = (first_line[:90] + "…") if len(first_line) > 90 else first_line
+            else:
+                label = f"Version {record.version_number}"
+
             versions.append({
                 "report_version_id": record.report_version_id,
                 "version_number": record.version_number,
                 "version": record.version_number,  # Alias for compatibility
                 "created_at": record.created_at.isoformat() if record.created_at else None,
-                "summary": record.summary_report.get("executive_summary", "No summary available") if record.summary_report else "No summary",
+                "summary": exec_summary or "No summary available",
+                "label": label,
+                "is_default": bool(record.is_default),
                 "is_latest": record.version_number == records[0].version_number if records else False,
+                "is_client_signoff": bool(getattr(record, "is_client_signoff", False)),
+                "signoff_at": record.signoff_at.isoformat() if getattr(record, "signoff_at", None) else None,
                 # Changelog tracking fields
                 "changes_applied": record.changes_applied,
                 "changelog_summary": record.changelog_summary,
@@ -776,7 +988,10 @@ async def get_report_version_by_number(chat_history_id: str, version_number: int
             "version_number": record.version_number,
             "report_content": record.report_content,
             "summary_report": record.summary_report,
+            "report_contract": record.report_contract,  # typed decisions; powers cross-version delta/rank
             "created_at": record.created_at.isoformat() if record.created_at else None,
+            "is_client_signoff": bool(getattr(record, "is_client_signoff", False)),
+            "signoff_at": record.signoff_at.isoformat() if getattr(record, "signoff_at", None) else None,
             # Changelog tracking fields
             "changes_applied": record.changes_applied,
             "changelog_summary": record.changelog_summary,
@@ -800,7 +1015,8 @@ async def create_new_report_version(
     changes_applied: list,
     db: Session,
     changelog_summary: str = None,
-    parent_version_id: str = None
+    parent_version_id: str = None,
+    report_contract: dict = None,
 ) -> dict:
     """
     Create a new report version after regeneration.
@@ -852,7 +1068,7 @@ async def create_new_report_version(
 
         # Create new version record with changelog tracking
         new_version = models.ReportVersions(
-            report_version_id=str(uuid.uuid4()),
+            report_version_id=new_id(),
             chat_history_id=chat_history_id,
             user_id=user_id,
             version_number=new_version_number,
@@ -862,6 +1078,7 @@ async def create_new_report_version(
             changes_applied=changes_applied,  # Store the changes that created this version
             changelog_summary=changelog_summary,  # Store the changelog summary
             parent_version_id=parent_version_id,  # Track version lineage
+            report_contract=report_contract,  # Typed decisions; carried/edited so the new version keeps reality-gap/compare/premortem
             deliverable_config=carried_config,  # A5: carried forward when section IDs match
             deliverable_polished_sections=None,  # A5: always reset; polish content is stale
             deliverable_updated_at=datetime.utcnow() if carried_config else None,
@@ -1081,7 +1298,7 @@ async def rollback_to_version(
 
         # Create new version with target's content
         rollback_version = models.ReportVersions(
-            report_version_id=str(uuid.uuid4()),
+            report_version_id=new_id(),
             chat_history_id=chat_history_id,
             user_id=user_id,
             version_number=new_version_number,
@@ -1301,6 +1518,66 @@ async def set_default_version(chat_history_id: str, user_id: str, version_number
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error setting default version: {str(e)}"
         )
+
+
+async def set_signoff_version(chat_history_id: str, user_id: str, version_number: int, db: Session) -> dict:
+    """Pin one version as the client-signoff baseline (the change-order baseline).
+
+    Exactly one baseline per project — clears any prior pin first. The pinned
+    version is what the "since signoff" diff + change-order draft compute against.
+    """
+    from datetime import datetime, timezone
+    try:
+        target_version = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id,
+            models.ReportVersions.user_id == user_id,
+            models.ReportVersions.version_number == version_number
+        ).first()
+
+        if not target_version:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Version {version_number} not found for this report"
+            )
+
+        # One baseline per project — clear any prior pin.
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_history_id
+        ).update({"is_client_signoff": False, "signoff_at": None})
+
+        target_version.is_client_signoff = True
+        target_version.signoff_at = datetime.now(timezone.utc)
+        flag_modified(target_version, "is_client_signoff")
+
+        db.commit()
+        db.refresh(target_version)
+
+        logger.info(f"Pinned version {version_number} as client-signoff baseline for chat_history_id: {chat_history_id}")
+        return {
+            "status": "success",
+            "version_number": version_number,
+            "report_version_id": target_version.report_version_id,
+            "signoff_at": target_version.signoff_at.isoformat(),
+            "message": f"Version {version_number} is now the client-signoff baseline",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error setting signoff version: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error setting signoff version: {str(e)}"
+        )
+
+
+def get_signoff_version_number(chat_history_id: str, db: Session) -> Optional[int]:
+    """Return the version_number pinned as the client-signoff baseline, or None."""
+    row = db.query(models.ReportVersions).filter(
+        models.ReportVersions.chat_history_id == chat_history_id,
+        models.ReportVersions.is_client_signoff == True,  # noqa: E712
+    ).first()
+    return row.version_number if row else None
 
 
 async def get_report_version_content(chat_history_id: str, version_number: int, db: Session) -> str:
@@ -1561,7 +1838,10 @@ async def get_presales_analysis(document_id: str, user_id: str, db: Session) -> 
             "status": presales.status,
             "model_used": presales.model_used,
             "processing_time_seconds": presales.processing_time_seconds,
-            "created_at": presales.created_at.isoformat() if presales.created_at else None
+            "created_at": presales.created_at.isoformat() if presales.created_at else None,
+            # Client-questionnaire submission record (proof of who/when).
+            "client_submitted_at": presales.client_submitted_at.isoformat() if presales.client_submitted_at else None,
+            "client_respondent": presales.client_respondent if isinstance(presales.client_respondent, dict) else None,
         }
 
     except SQLAlchemyError as e:
@@ -2167,6 +2447,117 @@ async def create_presales_questions(
         )
 
 
+def _normalize_question_text(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — for fuzzy comparison."""
+    import re as _re
+    return _re.sub(r"\s+", " ", _re.sub(r"[^\w\s]", " ", (text or "").lower())).strip()
+
+
+def _is_duplicate_question(text: str, existing_norms: list) -> bool:
+    """Fuzzy duplicate check: the analyzer re-asks the same gap in new words on
+    every re-run, so exact-match dedupe is not enough. SequenceMatcher on
+    normalized text catches rewordings; 0.72 is deliberately loose — a wrongly
+    suppressed follow-up costs nothing (the gap becomes an assumption), while a
+    duplicate question burns user trust."""
+    from difflib import SequenceMatcher
+    norm = _normalize_question_text(text)
+    if not norm:
+        return True
+    for other in existing_norms:
+        if not other:
+            continue
+        if norm == other or SequenceMatcher(None, norm, other).ratio() >= 0.72:
+            return True
+    return False
+
+
+# The analyzer runs on every visit to the Analysis step; without a ceiling the
+# follow-up list grows 2 per visit forever. Past this many, gaps become
+# assumptions instead of more questions.
+MAX_FOLLOWUPS_PER_PRESALES = 4
+
+
+async def create_followup_questions(
+    presales_id: str,
+    user_id: str,
+    follow_ups: list,
+    db: Session,
+) -> list:
+    """Persist analyzer-generated follow-up questions as real PresalesQuestion rows.
+
+    The answer analyzer returns up to 2 `follow_up_questions` per analysis; until
+    now they were returned to the API response and discarded — the user never got
+    to answer them. Numbered F1, F2, ... (continuing across analyses), appended
+    after existing questions, FUZZY-deduped against every question already on the
+    analysis (any phrasing) and hard-capped at MAX_FOLLOWUPS_PER_PRESALES total,
+    so analysis re-runs can never pile up rewordings of the same gap. Returns the
+    created rows as dicts (empty list when everything was a duplicate)."""
+    try:
+        existing = db.query(models.PresalesQuestion).filter(
+            models.PresalesQuestion.presales_id == presales_id,
+            models.PresalesQuestion.user_id == user_id,
+        ).all()
+        existing_norms = [_normalize_question_text(q.question_text or "") for q in existing]
+        existing_followups = sum(1 for q in existing if q.question_type == models.QuestionType.FOLLOW_UP)
+        next_f_number = existing_followups + 1
+        next_order = max((q.display_order or 0 for q in existing), default=-1) + 1
+
+        created = []
+        for fu in follow_ups or []:
+            if existing_followups + len(created) >= MAX_FOLLOWUPS_PER_PRESALES:
+                logger.info(
+                    f"Follow-up cap ({MAX_FOLLOWUPS_PER_PRESALES}) reached for presales {presales_id}; "
+                    "remaining suggestions dropped — gaps stay covered by assumptions"
+                )
+                break
+            if not isinstance(fu, dict):
+                continue
+            text = (fu.get("question_text") or "").strip()
+            if not text or _is_duplicate_question(text, existing_norms):
+                if text:
+                    logger.info(f"Skipped duplicate follow-up for presales {presales_id}: {text[:80]!r}")
+                continue
+            question = models.PresalesQuestion(
+                presales_id=presales_id,
+                user_id=user_id,
+                question_type=models.QuestionType.FOLLOW_UP,
+                question_number=f"F{next_f_number}",
+                display_order=next_order,
+                area_or_category="follow-up",
+                title=text,
+                description=fu.get("reason", ""),
+                impact_description=(
+                    f"Triggered by your answer to {fu['based_on']}" if fu.get("based_on") else ""
+                ),
+                question_text=text,
+                status=models.QuestionStatus.PENDING,
+            )
+            db.add(question)
+            created.append(question)
+            existing_norms.append(_normalize_question_text(text))
+            next_f_number += 1
+            next_order += 1
+
+        if created:
+            db.commit()
+            logger.info(f"Created {len(created)} follow-up question(s) for presales: {presales_id}")
+        return [
+            {
+                "question_id": q.question_id,
+                "question_number": q.question_number,
+                "question_text": q.question_text,
+                "question_type": q.question_type,
+            }
+            for q in created
+        ]
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error creating follow-up questions: {str(e)}")
+        # Follow-ups are enrichment — never fail the analyze call over them.
+        return []
+
+
 async def get_presales_questions(
     presales_id: str,
     user_id: str,
@@ -2229,6 +2620,275 @@ async def get_presales_questions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving questions: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Client questionnaire share link (WS-3) — a public, no-login surface for the
+# client to answer the firm's questions. The opaque token is the only secret.
+# ---------------------------------------------------------------------------
+
+def create_or_get_share_token(presales_id: str, user_id: str, db: Session) -> dict:
+    """Ensure a share token exists for this presales analysis (owner-scoped); return it."""
+    import uuid
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    if not row.client_share_token:
+        row.client_share_token = uuid.uuid4().hex
+        db.commit()
+    return {"token": row.client_share_token, "presales_id": presales_id}
+
+
+def revoke_share_token(presales_id: str, user_id: str, db: Session) -> dict:
+    """Null the share token (owner-scoped) — the public link stops working immediately."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    row.client_share_token = None
+    db.commit()
+    return {"status": "revoked", "presales_id": presales_id}
+
+
+def get_presales_by_share_token(token: str, db: Session):
+    """Return the PresalesAnalysis ORM row for a share token, or None. No user scope —
+    the token IS the authorization."""
+    if not token:
+        return None
+    return db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.client_share_token == token
+    ).first()
+
+
+async def submit_client_answers(presales_id: str, answers: dict, db: Session) -> dict:
+    """Write client-submitted answers (public, no user scope — the token authorized
+    the caller). Marks each as answered_by='client' + status=NEEDS_REVIEW so the BA
+    reviews before they feed the report. Mirrors update_question_answers minus the
+    owner check; never invalidates or touches firm-only fields.
+
+    The client may edit any answer (incl. firm pre-fills); the firm's control is the
+    revoke link, not per-field locks. Skips unchanged answers (autosave re-sends the
+    whole form)."""
+    from datetime import datetime
+    try:
+        updated = 0
+        for question_id, answer in (answers or {}).items():
+            ans = (answer or "").strip()
+            if not ans:
+                continue
+            if len(ans) > 4000:
+                ans = ans[:4000]
+            q = db.query(models.PresalesQuestion).filter(
+                models.PresalesQuestion.question_id == question_id,
+                models.PresalesQuestion.presales_id == presales_id,
+            ).first()
+            if not q:
+                continue
+            # The client may edit ANY answer — including ones the firm pre-filled as a
+            # starting point. The firm's control against unwanted edits is revoking the
+            # link (manual + auto-on-finalize), not per-field locks. A client edit flips
+            # the question to client/needs_review so the firm reviews it.
+            # Autosave re-sends the whole form; skip unchanged answers so we don't spam
+            # history rows or redundant writes on every keystroke pause.
+            if (q.answer or "") == ans:
+                continue
+            db.add(models.PresalesAnswerHistory(
+                question_id=question_id, presales_id=presales_id,
+                previous_answer=q.answer, new_answer=ans,
+                change_type="updated" if q.answer else "created", changed_by="client",
+            ))
+            q.answer = ans
+            q.answered_at = datetime.utcnow()
+            q.answered_by = "client"
+            q.status = models.QuestionStatus.NEEDS_REVIEW
+            updated += 1
+        db.commit()
+        logger.info(f"Client submitted {updated} answer(s) for presales {presales_id}")
+        return {"updated_count": updated}
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error submitting client answers: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error submitting answers: {str(e)}")
+
+
+def mark_link_shared(presales_id: str, user_id: str, db: Session) -> None:
+    """Stamp client_link_shared_at (owner-scoped) — set when the firm emails the link
+    OR marks it manually shared. Drives the dashboard 'sent' status. Idempotent-ish:
+    only sets it the first time (preserves the original share moment)."""
+    from datetime import datetime, timezone
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    if not row.client_link_shared_at:
+        row.client_link_shared_at = datetime.now(timezone.utc)
+        db.commit()
+
+
+def set_project_custom_title(chat_history_id: str, user_id: str, custom_title: Optional[str], db: Session) -> dict:
+    """Set/clear the firm's display name for a project card (owner-scoped). The LLM
+    `title` is left intact as the searchable fallback."""
+    row = db.query(models.ChatHistory).filter(
+        models.ChatHistory.chat_history_id == chat_history_id,
+        models.ChatHistory.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    name = (custom_title or "").strip()[:200]
+    row.custom_title = name or None
+    db.commit()
+    return {"chat_history_id": chat_history_id, "custom_title": row.custom_title, "title": row.title}
+
+
+def set_client_email(presales_id: str, user_id: str, email: str, db: Session) -> None:
+    """Store the client's email on the presales row (owner-scoped) for reminders."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    row.client_email = (email or "").strip()[:320] or None
+    db.commit()
+
+
+def get_firm_email_template_fields(firm_id: Optional[str], template_key: str, db: Session) -> dict:
+    """Return the per-firm override fields for a client-email template key, or {}.
+    Only the text fields are stored; the GroundedIQ shell is applied at render."""
+    if not firm_id:
+        return {}
+    row = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+    tmpls = (row.email_templates if row and isinstance(row.email_templates, dict) else None) or {}
+    fields = tmpls.get(template_key)
+    return fields if isinstance(fields, dict) else {}
+
+
+def set_firm_email_template(firm_id: str, template_key: str, fields: dict, db: Session) -> dict:
+    """Upsert (staff-only) the override fields for one firm + template key. Only known
+    text fields are stored; everything else is ignored (no raw HTML, no brand override)."""
+    from sqlalchemy.orm.attributes import flag_modified
+    ALLOWED = {"subject", "heading", "intro", "button_label", "signoff"}
+    row = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Firm not found")
+    tmpls = dict(row.email_templates) if isinstance(row.email_templates, dict) else {}
+    clean = {k: (str(v)[:2000] if v is not None else "") for k, v in (fields or {}).items() if k in ALLOWED}
+    tmpls[template_key] = clean
+    row.email_templates = tmpls
+    flag_modified(row, "email_templates")
+    db.commit()
+    return clean
+
+
+def list_firms(search: Optional[str], db: Session, limit: int = 50) -> list:
+    """Searchable firm list for the admin console dropdown (id + name)."""
+    q = db.query(models.Firm.firm_id, models.Firm.name)
+    if search and search.strip():
+        q = q.filter(models.Firm.name.ilike(f"%{search.strip()}%"))
+    rows = q.order_by(models.Firm.name).limit(max(1, min(limit, 200))).all()
+    return [{"firm_id": fid, "name": name} for fid, name in rows]
+
+
+def bump_client_check_count(presales_id: str, db: Session) -> int:
+    """Increment and return the durable lifetime readiness-check counter for a
+    presales link. Called when a public 'Check readiness' decides to run the LLM,
+    so even failed/abusive attempts count against the per-token ceiling."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id
+    ).first()
+    if not row:
+        return 0
+    row.client_check_count = (row.client_check_count or 0) + 1
+    db.commit()
+    return row.client_check_count
+
+
+def mark_client_submitted(token: str, db: Session, respondent: Optional[dict] = None):
+    """Stamp client_submitted_at (+ who completed it) on the presales row for a share
+    token (public). Returns the row, or None if the token is invalid/revoked."""
+    from datetime import datetime, timezone
+    from sqlalchemy.orm.attributes import flag_modified
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.client_share_token == token
+    ).first()
+    if not row:
+        return None
+    row.client_submitted_at = datetime.now(timezone.utc)
+    if isinstance(respondent, dict) and (respondent.get("name") or respondent.get("email")):
+        row.client_respondent = {
+            "name": (respondent.get("name") or "").strip()[:160],
+            "designation": (respondent.get("designation") or "").strip()[:160],
+            "email": (respondent.get("email") or "").strip()[:320],
+        }
+        flag_modified(row, "client_respondent")
+    db.commit()
+    return row
+
+
+def revoke_share_token_for_presales(presales_id: str, db: Session) -> None:
+    """Null the share token for a presales WITHOUT a user scope — used by the
+    pipeline kickoff to auto-close the client link when the report is generated."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id
+    ).first()
+    if row and row.client_share_token:
+        row.client_share_token = None
+        db.commit()
+
+
+async def build_structured_crd(
+    presales_id: str, user_id: str, presales: dict, presales_brief_text: str, db: Session,
+) -> str:
+    """Build the structured CRD block the contract planner consumes (settled Q&A +
+    accepted assumptions + open questions + approved brief, as typed JSON).
+
+    Lives here (not in routers/services) so BOTH the REST regenerate endpoint and
+    the chat/stream regenerate paths can build the identical CRD without an import
+    cycle. Never raises: any failure degrades to the brief alone."""
+    try:
+        questions = await get_presales_questions(presales_id, user_id, db, include_invalid=False)
+    except Exception as e:  # noqa: BLE001 — CRD enrichment must not block the run
+        logger.warning(f"build_structured_crd: question fetch failed for {presales_id}: {e}")
+        questions = []
+
+    confirmed = [
+        {"question": q["question_text"], "answer": q["answer"],
+         "source": q["question_number"], "category": q.get("area_or_category") or ""}
+        for q in questions if q.get("answer") and q.get("status") == "answered"
+    ]
+    open_questions = [
+        {"question": q["question_text"], "source": q["question_number"],
+         "severity_hint": "blocker" if q.get("question_type") == "p1_blocker" else "high"}
+        for q in questions if not q.get("answer")
+    ]
+    assumptions = [
+        {"assumption": a.get("assumption", ""), "risk_level": a.get("risk_level", ""),
+         "basis": a.get("basis", ""), "impact_if_wrong": a.get("impact_if_wrong", ""),
+         "for_question_id": a.get("for_question_id", "")}
+        for a in (presales.get("assumptions_list") or [])
+        if isinstance(a, dict) and a.get("assumption")
+    ]
+    parts = [
+        "## CONFIRMED Q&A (settled facts — copy each into client_qa with its `source` id)",
+        json.dumps(confirmed, indent=2, ensure_ascii=False) if confirmed else "(none — no questions answered yet)",
+        "",
+        "## ACCEPTED ASSUMPTIONS (resolved facts with provenance — inherit into global_assumptions as 'Assumption (accepted): ...'; do NOT re-open as questions)",
+        json.dumps(assumptions, indent=2, ensure_ascii=False) if assumptions else "(none)",
+        "",
+        "## OPEN / UNANSWERED QUESTIONS (unresolved — fold into open_questions_for_client; never invent answers)",
+        json.dumps(open_questions, indent=2, ensure_ascii=False) if open_questions else "(none — everything was answered)",
+        "",
+        "## APPROVED PRESALES BRIEF (human-reviewed markdown)",
+        presales_brief_text or "(brief not available)",
+    ]
+    return "\n".join(parts)
 
 
 async def update_question_answers(
@@ -3242,7 +3902,7 @@ async def record_transaction(
 
         # Create new transaction record
         transaction = models.TransactionHistory(
-            id=str(uuid.uuid4()),
+            id=new_id(),
             chat_history_id=chat_history_id,
             action_type=action_type,
             action_description=description,
@@ -3793,6 +4453,21 @@ async def fetch_projects_overview(user_id: str, db: Session) -> dict:
             )
             vague_counts = {pid: cnt for pid, cnt in vague_rows}
 
+        # Which presales have CLIENT-submitted answers (autosave or final) — drives the
+        # "client started" dashboard status (distinct from "submitted").
+        client_started_ids: set = set()
+        if presales_ids:
+            for (pid,) in (
+                db.query(models.PresalesQuestion.presales_id)
+                .filter(
+                    models.PresalesQuestion.presales_id.in_(presales_ids),
+                    models.PresalesQuestion.answered_by == "client",
+                )
+                .distinct()
+                .all()
+            ):
+                client_started_ids.add(pid)
+
         # --- 5. Default ReportVersion per chat (for pending_changes count) --
         default_versions = (
             db.query(models.ReportVersions)
@@ -3877,10 +4552,23 @@ async def fetch_projects_overview(user_id: str, db: Session) -> dict:
             except Exception:
                 last_preview = ""
 
+            # Client-questionnaire status for the dashboard badge.
+            q_status = "none"
+            if pa:
+                if pa.client_submitted_at:
+                    q_status = "submitted"
+                elif presales_id in client_started_ids:
+                    q_status = "started"
+                elif pa.client_link_shared_at or pa.client_share_token:
+                    q_status = "sent"
+
             projects.append({
                 "chat_history_id": c.chat_history_id,
                 "document_id": c.document_id,
                 "title": c.title or "Untitled project",
+                "custom_title": c.custom_title,
+                "questionnaire_status": q_status,
+                "client_submitted_at": pa.client_submitted_at.isoformat() if (pa and pa.client_submitted_at) else None,
                 "analysis_mode": analysis_mode,
                 "presales_id": presales_id,
                 "full_report_generated": bool(link.full_report_generated) if link else False,
@@ -3997,6 +4685,22 @@ PIPELINE_STAGES_ORDER = [
     "ba_final_report_generation",
 ]
 
+# Stages for the contract pipeline (USE_CONTRACT_PIPELINE=true). Kept here next
+# to PIPELINE_STAGES_ORDER so it's obvious both lists drive the same UI surface
+# and the same pipeline_runs.stages_completed JSONB column.
+CONTRACT_PIPELINE_STAGES_ORDER = [
+    "plan",
+    "research",
+    "decide",
+    "write_sections",
+    "judge_and_finalize",
+]
+
+
+def stages_order_for_mode(use_contract_pipeline: bool) -> list[str]:
+    """Pick the stage list the runner / frontend should drive against."""
+    return CONTRACT_PIPELINE_STAGES_ORDER if use_contract_pipeline else PIPELINE_STAGES_ORDER
+
 
 def _serialize_pipeline_run(run: "models.PipelineRun") -> dict:
     return {
@@ -4010,14 +4714,26 @@ def _serialize_pipeline_run(run: "models.PipelineRun") -> dict:
         "error": run.error,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        # Bet 2.C — resume support
+        "last_completed_node": getattr(run, "last_completed_node", None),
+        "state_snapshot": getattr(run, "state_snapshot", None),
     }
 
 
-async def create_or_reset_pipeline_run(chat_history_id: str, user_id: str, db: Session) -> dict:
+async def create_or_reset_pipeline_run(
+    chat_history_id: str,
+    user_id: str,
+    db: Session,
+    *,
+    preserve_snapshot: bool = False,
+) -> dict:
     """
     Insert a new pipeline_runs row for the project, or reset an existing one
     back to status='queued' (used on retry after a failure). Always returns
     the run in queued state with empty stages_completed.
+
+    `preserve_snapshot=True` keeps state_snapshot + last_completed_node so the
+    /full-pipeline/resume endpoint can hand them to the runner.
     """
     try:
         run = (
@@ -4027,15 +4743,23 @@ async def create_or_reset_pipeline_run(chat_history_id: str, user_id: str, db: S
         )
         if run:
             run.status = models.PipelineRunStatus.QUEUED
-            run.current_stage = None
-            run.stages_completed = []
-            run.loop_count = 0
             run.error = None
             run.completed_at = None
-            flag_modified(run, "stages_completed")
+            if not preserve_snapshot:
+                # Full restart — clear progress and snapshot.
+                run.current_stage = None
+                run.stages_completed = []
+                run.loop_count = 0
+                run.state_snapshot = None
+                run.last_completed_node = None
+                flag_modified(run, "stages_completed")
+            # else (resume): preserve current_stage / stages_completed / loop_count
+            # so the UI keeps showing completed steps. The runner re-streams the
+            # graph and each already-completed node short-circuits via
+            # completed_nodes; new mark_stage_* calls overwrite as needed.
         else:
             run = models.PipelineRun(
-                run_id=str(uuid.uuid4()),
+                run_id=new_id(),
                 chat_history_id=chat_history_id,
                 user_id=user_id,
                 status=models.PipelineRunStatus.QUEUED,
@@ -4112,19 +4836,70 @@ async def increment_loop_count(run_id: str, db: Session) -> None:
 
 
 async def complete_pipeline_run(run_id: str, db: Session) -> None:
-    """Mark a pipeline run as successfully completed."""
+    """Mark a pipeline run as successfully completed and freeze its COGS roll-up."""
     from datetime import datetime
+    from sqlalchemy import func
     try:
         run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
         if not run:
             return
+        # Materialize the cost roll-up from the append-only ledger so billing reads
+        # are O(1) and frozen at completion (immune to later price-table changes).
+        total, count = (
+            db.query(
+                func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0.0),
+                func.count(models.LLMCallLog.id),
+            )
+            .filter(models.LLMCallLog.pipeline_run_id == run_id)
+            .one()
+        )
+        run.total_cost_usd = float(total or 0.0)
+        run.total_calls = int(count or 0)
         run.status = models.PipelineRunStatus.COMPLETED
         run.current_stage = None
         run.completed_at = datetime.utcnow()
         db.commit()
+        logger.info(
+            f"complete_pipeline_run {run_id}: {run.total_calls} LLM calls, "
+            f"${run.total_cost_usd:.4f} COGS"
+        )
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"complete_pipeline_run failed for {run_id}: {e}")
+
+
+async def update_presales_cost_total(presales_id: str, db: Session) -> tuple[float, int]:
+    """Materialize SUM/COUNT of llm_call_log onto presales_analysis for a project.
+
+    Call after the initial scan saves, and again at the end of brief generation,
+    so presales_analysis.total_cost_usd tracks the full project COGS (scan + brief
+    + presales chat). The per-call detail stays in llm_call_log. Returns the
+    (total_cost_usd, total_calls) it wrote.
+    """
+    from sqlalchemy import func
+    try:
+        total, count = (
+            db.query(
+                func.coalesce(func.sum(models.LLMCallLog.cost_usd), 0.0),
+                func.count(models.LLMCallLog.id),
+            )
+            .filter(models.LLMCallLog.presales_id == presales_id)
+            .one()
+        )
+        pre = (
+            db.query(models.PresalesAnalysis)
+            .filter(models.PresalesAnalysis.presales_id == presales_id)
+            .first()
+        )
+        if pre:
+            pre.total_cost_usd = float(total or 0.0)
+            pre.total_calls = int(count or 0)
+            db.commit()
+        return float(total or 0.0), int(count or 0)
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"update_presales_cost_total failed for {presales_id}: {e}")
+        return 0.0, 0
 
 
 async def fail_pipeline_run(run_id: str, error_msg: str, db: Session) -> None:
@@ -4141,6 +4916,85 @@ async def fail_pipeline_run(run_id: str, error_msg: str, db: Session) -> None:
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(f"fail_pipeline_run failed for {run_id}: {e}")
+
+
+async def persist_state_snapshot(
+    run_id: str,
+    state_subset: dict,
+    node_name: str,
+    db: Session,
+) -> None:
+    """
+    Bet 2.C — checkpoint the LangGraph state after a node completes.
+
+    `state_subset` is a dict of state keys the runner wants to persist for
+    resume. The current allowlist (set in pipeline_runner.run_full_pipeline_async)
+    covers every downstream-consumed key: req_analysis, solution_archi,
+    critic_report, evidence_report, feasibility_report, loop_count,
+    current_loop_node, completed_nodes. Non-JSON values (LangChain BaseMessage
+    objects, etc.) are coerced via `_coerce_state_for_snapshot`.
+
+    On failure mid-pipeline this snapshot lets /full-pipeline/resume hydrate a
+    fresh run with the work the previous run produced, so already-completed
+    nodes short-circuit instead of re-calling the LLM.
+    """
+    try:
+        run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+        if not run:
+            logger.warning(f"persist_state_snapshot: run_id {run_id} not found")
+            return
+        # Strip non-JSON-serializable values defensively. LangChain messages are
+        # the usual offender (BaseMessage objects), so coerce them to plain dicts.
+        try:
+            json.dumps(state_subset)
+            payload = state_subset
+        except (TypeError, ValueError):
+            payload = _coerce_state_for_snapshot(state_subset)
+        run.state_snapshot = payload
+        run.last_completed_node = node_name[:64] if node_name else None
+        flag_modified(run, "state_snapshot")
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"persist_state_snapshot failed for {run_id}/{node_name}: {e}")
+
+
+def _coerce_state_for_snapshot(state: dict) -> dict:
+    """Best-effort JSON coercion of a LangGraph state dict for the snapshot column."""
+    def _coerce(v):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, list):
+            return [_coerce(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): _coerce(x) for k, x in v.items()}
+        # langchain Message objects expose .content; everything else falls back to str.
+        content = getattr(v, "content", None)
+        if content is not None:
+            return {"type": v.__class__.__name__, "content": str(content)}
+        return str(v)
+    return {str(k): _coerce(v) for k, v in (state or {}).items()}
+
+
+async def get_resumable_run(chat_history_id: str, db: Session):
+    """
+    Bet 2.C — return a failed run only if it has a checkpoint to resume from.
+
+    Returns the serialized run or None. Callers use this to gate the
+    /full-pipeline/resume endpoint (409 when not resumable).
+    """
+    try:
+        run = (
+            db.query(models.PipelineRun)
+            .filter(models.PipelineRun.chat_history_id == chat_history_id)
+            .filter(models.PipelineRun.status == models.PipelineRunStatus.FAILED)
+            .filter(models.PipelineRun.last_completed_node.isnot(None))
+            .first()
+        )
+        return _serialize_pipeline_run(run) if run else None
+    except SQLAlchemyError as e:
+        logger.error(f"get_resumable_run failed for {chat_history_id}: {e}")
+        return None
 
 
 async def get_pipeline_run_by_chat(chat_history_id: str, db: Session):
@@ -4171,3 +5025,509 @@ async def get_pipeline_status_map(chat_history_ids: list, db: Session) -> dict:
     except SQLAlchemyError as e:
         logger.error(f"get_pipeline_status_map failed: {e}")
         return {}
+
+
+# ============================================================================
+# FIRM CONTEXT (Bet 3, migration 019)
+# ============================================================================
+
+def _serialize_firm(firm) -> dict:
+    return {
+        "firm_id": firm.firm_id,
+        "name": firm.name,
+        "logo_url": firm.logo_url,
+        "primary_color": firm.primary_color,
+        "created_at": firm.created_at.isoformat() if firm.created_at else None,
+    }
+
+
+def _serialize_rate_card(r) -> dict:
+    return {
+        "rate_id": r.rate_id,
+        "firm_id": r.firm_id,
+        "role": r.role,
+        "seniority": r.seniority,
+        "region": r.region,
+        "hourly_rate_usd": float(r.hourly_rate_usd) if r.hourly_rate_usd is not None else None,
+        "version": r.version,
+        "active": r.active,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _serialize_team_template(t) -> dict:
+    return {
+        "template_id": t.template_id,
+        "firm_id": t.firm_id,
+        "template_name": t.template_name,
+        "engagement_type": t.engagement_type,
+        "roles": t.roles or [],
+        "notes": t.notes,
+        "active": t.active,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+def _serialize_tech_pref(p) -> dict:
+    return {
+        "pref_id": p.pref_id,
+        "firm_id": p.firm_id,
+        "category": p.category,
+        "preferred": p.preferred or [],
+        "anti_preferred": p.anti_preferred or [],
+        "rationale": p.rationale,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+def _serialize_past_project(p) -> dict:
+    return {
+        "project_id": p.project_id,
+        "firm_id": p.firm_id,
+        "project_name": p.project_name,
+        "client_name": p.client_name,
+        "engagement_type": p.engagement_type,
+        "start_date": p.start_date.isoformat() if p.start_date else None,
+        "end_date": p.end_date.isoformat() if p.end_date else None,
+        "summary": p.summary,
+        "original_brief_md": p.original_brief_md,
+        "final_report_md": p.final_report_md,
+        "retrospective_md": p.retrospective_md,
+        "effort_estimated_weeks": float(p.effort_estimated_weeks) if p.effort_estimated_weeks is not None else None,
+        "effort_actual_weeks": float(p.effort_actual_weeks) if p.effort_actual_weeks is not None else None,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+# ---- Firm membership ----
+
+def get_firm_for_user(user_id: str, db: Session) -> Optional[dict]:
+    """Returns the firm row + the user's firm_role, or None if user has no firm yet."""
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not u or not u.firm_id:
+            return None
+        firm = db.query(models.Firm).filter(models.Firm.firm_id == u.firm_id).first()
+        if not firm:
+            return None
+        return {**_serialize_firm(firm), "firm_role": u.firm_role}
+    except SQLAlchemyError as e:
+        logger.error(f"get_firm_for_user failed for {user_id}: {e}")
+        return None
+
+
+def ensure_firm_for_new_user(user_id: str, db: Session) -> Optional[str]:
+    """
+    Idempotently ensure the user has a firm. If not, create a 1-person firm named
+    after the user and assign firm_admin. Returns the firm_id.
+
+    Called from signup flows so every new user can immediately use the admin UI.
+    """
+    try:
+        u = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not u:
+            return None
+        if u.firm_id:
+            return u.firm_id
+
+        firm_name = (u.full_name or u.email_address or "My firm").strip()
+        if not firm_name.endswith("firm") and not firm_name.endswith("Firm"):
+            firm_name = f"{firm_name}'s firm"
+
+        firm = models.Firm(name=firm_name)
+        db.add(firm)
+        db.flush()  # populate firm.firm_id
+
+        u.firm_id = firm.firm_id
+        u.firm_role = "firm_admin"
+        db.commit()
+        db.refresh(u)
+        return u.firm_id
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"ensure_firm_for_new_user failed for {user_id}: {e}")
+        return None
+
+
+def update_firm(firm_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        firm = db.query(models.Firm).filter(models.Firm.firm_id == firm_id).first()
+        if not firm:
+            return None
+        for k in ("name", "logo_url", "primary_color"):
+            if k in updates and updates[k] is not None:
+                setattr(firm, k, updates[k])
+        db.commit()
+        db.refresh(firm)
+        return _serialize_firm(firm)
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"update_firm failed for {firm_id}: {e}")
+        return None
+
+
+# ---- Rate cards ----
+
+def list_rate_cards(firm_id: str, db: Session, active_only: bool = True) -> list:
+    q = db.query(models.FirmRateCard).filter(models.FirmRateCard.firm_id == firm_id)
+    if active_only:
+        q = q.filter(models.FirmRateCard.active == True)  # noqa: E712
+    return [_serialize_rate_card(r) for r in q.order_by(models.FirmRateCard.role, models.FirmRateCard.seniority).all()]
+
+
+def create_rate_card(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmRateCard(
+            firm_id=firm_id,
+            role=data["role"],
+            seniority=data["seniority"],
+            region=data["region"],
+            hourly_rate_usd=data["hourly_rate_usd"],
+            version=data.get("version", 1),
+            active=data.get("active", True),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_rate_card(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_rate_card failed: {e}")
+
+
+def update_rate_card(firm_id: str, rate_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmRateCard)
+            .filter(models.FirmRateCard.firm_id == firm_id,
+                    models.FirmRateCard.rate_id == rate_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("role", "seniority", "region", "hourly_rate_usd", "version", "active"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        db.commit()
+        db.refresh(row)
+        return _serialize_rate_card(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_rate_card failed: {e}")
+
+
+def delete_rate_card(firm_id: str, rate_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmRateCard)
+            .filter(models.FirmRateCard.firm_id == firm_id,
+                    models.FirmRateCard.rate_id == rate_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_rate_card failed: {e}")
+
+
+# ---- Team templates ----
+
+def list_team_templates(firm_id: str, db: Session, active_only: bool = True) -> list:
+    q = db.query(models.FirmTeamTemplate).filter(models.FirmTeamTemplate.firm_id == firm_id)
+    if active_only:
+        q = q.filter(models.FirmTeamTemplate.active == True)  # noqa: E712
+    return [_serialize_team_template(t) for t in q.order_by(models.FirmTeamTemplate.template_name).all()]
+
+
+def get_team_template_for_engagement(firm_id: str, engagement_type: Optional[str], db: Session) -> Optional[dict]:
+    if not engagement_type:
+        return None
+    row = (
+        db.query(models.FirmTeamTemplate)
+        .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                models.FirmTeamTemplate.engagement_type == engagement_type,
+                models.FirmTeamTemplate.active == True)  # noqa: E712
+        .first()
+    )
+    return _serialize_team_template(row) if row else None
+
+
+def create_team_template(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmTeamTemplate(
+            firm_id=firm_id,
+            template_name=data["template_name"],
+            engagement_type=data.get("engagement_type"),
+            roles=data.get("roles", []),
+            notes=data.get("notes"),
+            active=data.get("active", True),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_team_template(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_team_template failed: {e}")
+
+
+def update_team_template(firm_id: str, template_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmTeamTemplate)
+            .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                    models.FirmTeamTemplate.template_id == template_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("template_name", "engagement_type", "roles", "notes", "active"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        if "roles" in updates:
+            flag_modified(row, "roles")
+        db.commit()
+        db.refresh(row)
+        return _serialize_team_template(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_team_template failed: {e}")
+
+
+def delete_team_template(firm_id: str, template_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmTeamTemplate)
+            .filter(models.FirmTeamTemplate.firm_id == firm_id,
+                    models.FirmTeamTemplate.template_id == template_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_team_template failed: {e}")
+
+
+# ---- Tech preferences ----
+
+def list_tech_preferences(firm_id: str, db: Session) -> list:
+    rows = (
+        db.query(models.FirmTechPreference)
+        .filter(models.FirmTechPreference.firm_id == firm_id)
+        .order_by(models.FirmTechPreference.category)
+        .all()
+    )
+    return [_serialize_tech_pref(p) for p in rows]
+
+
+def create_tech_preference(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmTechPreference(
+            firm_id=firm_id,
+            category=data["category"],
+            preferred=data.get("preferred", []),
+            anti_preferred=data.get("anti_preferred", []),
+            rationale=data.get("rationale"),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_tech_pref(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_tech_preference failed: {e}")
+
+
+def update_tech_preference(firm_id: str, pref_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmTechPreference)
+            .filter(models.FirmTechPreference.firm_id == firm_id,
+                    models.FirmTechPreference.pref_id == pref_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in ("category", "preferred", "anti_preferred", "rationale"):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        for jcol in ("preferred", "anti_preferred"):
+            if jcol in updates:
+                flag_modified(row, jcol)
+        db.commit()
+        db.refresh(row)
+        return _serialize_tech_pref(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_tech_preference failed: {e}")
+
+
+def delete_tech_preference(firm_id: str, pref_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmTechPreference)
+            .filter(models.FirmTechPreference.firm_id == firm_id,
+                    models.FirmTechPreference.pref_id == pref_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_tech_preference failed: {e}")
+
+
+# ---- Past projects ----
+
+def list_past_projects(firm_id: str, db: Session) -> list:
+    rows = (
+        db.query(models.FirmPastProject)
+        .filter(models.FirmPastProject.firm_id == firm_id)
+        .order_by(models.FirmPastProject.created_at.desc())
+        .all()
+    )
+    return [_serialize_past_project(p) for p in rows]
+
+
+def get_past_project(firm_id: str, project_id: str, db: Session) -> Optional[dict]:
+    row = (
+        db.query(models.FirmPastProject)
+        .filter(models.FirmPastProject.firm_id == firm_id,
+                models.FirmPastProject.project_id == project_id)
+        .first()
+    )
+    return _serialize_past_project(row) if row else None
+
+
+def create_past_project(firm_id: str, data: dict, db: Session) -> dict:
+    try:
+        row = models.FirmPastProject(
+            firm_id=firm_id,
+            project_name=data["project_name"],
+            client_name=data.get("client_name"),
+            engagement_type=data.get("engagement_type"),
+            start_date=data.get("start_date"),
+            end_date=data.get("end_date"),
+            summary=data.get("summary"),
+            original_brief_md=data.get("original_brief_md"),
+            final_report_md=data.get("final_report_md"),
+            retrospective_md=data.get("retrospective_md"),
+            effort_estimated_weeks=data.get("effort_estimated_weeks"),
+            effort_actual_weeks=data.get("effort_actual_weeks"),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _serialize_past_project(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"create_past_project failed: {e}")
+
+
+def update_past_project(firm_id: str, project_id: str, updates: dict, db: Session) -> Optional[dict]:
+    try:
+        row = (
+            db.query(models.FirmPastProject)
+            .filter(models.FirmPastProject.firm_id == firm_id,
+                    models.FirmPastProject.project_id == project_id)
+            .first()
+        )
+        if not row:
+            return None
+        for k in (
+            "project_name", "client_name", "engagement_type", "start_date", "end_date",
+            "summary", "original_brief_md", "final_report_md", "retrospective_md",
+            "effort_estimated_weeks", "effort_actual_weeks",
+        ):
+            if k in updates and updates[k] is not None:
+                setattr(row, k, updates[k])
+        db.commit()
+        db.refresh(row)
+        return _serialize_past_project(row)
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"update_past_project failed: {e}")
+
+
+def delete_past_project(firm_id: str, project_id: str, db: Session) -> bool:
+    try:
+        row = (
+            db.query(models.FirmPastProject)
+            .filter(models.FirmPastProject.firm_id == firm_id,
+                    models.FirmPastProject.project_id == project_id)
+            .first()
+        )
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"delete_past_project failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Jira credentials — server-side OAuth token storage (one row per user).
+# ---------------------------------------------------------------------------
+def get_jira_credentials(user_id: str, db: Session):
+    """Return the user's JiraCredential row, or None if Jira isn't connected."""
+    return db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+
+
+def save_jira_credentials(user_id: str, *, access_token: str, refresh_token: Optional[str] = None,
+                          cloud_id: Optional[str] = None, account_id: Optional[str] = None,
+                          email: Optional[str] = None, scope: Optional[str] = None,
+                          expires_at: Optional[datetime] = None, db: Session) -> dict:
+    """Upsert a user's Jira tokens. Used by the OAuth callback (full set) and the
+    refresh path (new access token + rotated refresh + expiry)."""
+    try:
+        from utils.crypto import encrypt_secret
+        row = db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+        if row is None:
+            row = models.JiraCredential(user_id=user_id)
+            db.add(row)
+        # Encrypt the secret tokens at rest (Fernet). email/account_id/scope are not secrets.
+        row.access_token = encrypt_secret(access_token)
+        if refresh_token is not None:
+            row.refresh_token = encrypt_secret(refresh_token)
+        if cloud_id is not None:
+            row.cloud_id = cloud_id
+        if account_id is not None:
+            row.account_id = account_id
+        if email is not None:
+            row.email = email
+        if scope is not None:
+            row.scope = scope
+        row.expires_at = expires_at
+        db.commit()
+        db.refresh(row)
+        return {"user_id": user_id, "connected": True}
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"save_jira_credentials failed: {e}")
+
+
+def delete_jira_credentials(user_id: str, db: Session) -> bool:
+    """Disconnect Jira for a user. Idempotent."""
+    try:
+        row = db.query(models.JiraCredential).filter(models.JiraCredential.user_id == user_id).first()
+        if not row:
+            return False
+        db.delete(row)
+        db.commit()
+        return True
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"delete_jira_credentials failed: {e}")

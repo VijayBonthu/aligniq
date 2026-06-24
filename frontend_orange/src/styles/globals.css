@@ -1015,11 +1015,19 @@ button { font-family: inherit; }
   display: block;
 }
 
+/* Wide tables scroll horizontally inside this wrapper instead of overflowing
+   the report column. The wrapper is injected by sanitizeHtml(). */
+.report-markdown .md-table-wrap,
+.chat-markdown .md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 14px 0;
+}
 .report-markdown table,
 .chat-markdown table {
   width: 100%;
   border-collapse: collapse;
-  margin: 14px 0;
+  margin: 0;
   font-size: 13px;
 }
 .report-markdown th,
@@ -1048,6 +1056,7 @@ button { font-family: inherit; }
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 2px;
+  overflow-wrap: anywhere;
 }
 
 .report-markdown blockquote,

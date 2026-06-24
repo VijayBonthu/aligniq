@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SSM_PATH="${SSM_PATH:-/aligniq/staging/}"
+SSM_PATH="${SSM_PATH:-/groundediq/staging/}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 # Local dev short-circuit: skip SSM and trust whatever env is already set.
@@ -42,7 +42,7 @@ for line in "${PARAMS[@]}"; do
   # Each line is "Name<TAB>Value". Value may itself contain tabs — split only on first tab.
   name="${line%%$'\t'*}"
   value="${line#*$'\t'}"
-  key="${name##*/}"          # basename, e.g. /aligniq/staging/POSTGRES_PASSWORD -> POSTGRES_PASSWORD
+  key="${name##*/}"          # basename, e.g. /groundediq/staging/POSTGRES_PASSWORD -> POSTGRES_PASSWORD
 
   # Validate key looks like a real env var name (defensive).
   if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then

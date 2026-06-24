@@ -174,7 +174,7 @@ class ExtractText:
         except ImportError:
             pass
         except Exception as e:
-            print(f"Error processing tables: {e}")
+            logger.error("Error processing tables: %s", e)
         finally:
             os.remove(temp_file.name)  # Clean up the temporary file
             logger.info("Extraction process is complete")
@@ -278,6 +278,6 @@ async def open_pdf(document_path: str = None, stream: bytes = None, filetype: st
         yield doc
     finally:
         doc.close()
-        print("Closed the PDF document to conserve resources")
+        logger.debug("Closed the PDF document to conserve resources")
 
 #all authentication is done, want to improve the time time for extracting pdf data and get details of images and table there are 2 pdf functions need to look into it

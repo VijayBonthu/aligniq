@@ -21,6 +21,7 @@ __pycache__
 # Frontends — backend image must NEVER contain these
 frontend
 frontend_orange
+frontend_green
 new_frontend
 node_modules
 
@@ -52,7 +53,8 @@ package.json
 package-lock.json
 bird_2.jpg
 
-# Migrations folder — not used in staging (create_all builds schema)
+# Legacy hand-written SQL migrations — historical reference only.
+# Schema is now managed by Alembic (alembic/ + alembic.ini ARE copied into the image).
 migrations
 
 # Docker meta

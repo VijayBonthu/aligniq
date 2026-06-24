@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard';
 import ProjectsPage from './pages/ProjectsPage';
 import NewProjectFlow from './pages/NewProjectFlow';
 import ChatView from './pages/ChatView';
+import CompareView from './pages/CompareView';
 import FullPipelineProgress from './pages/FullPipelineProgress';
 import DeliverableBuilder from './pages/DeliverableBuilder';
 import Messages from './pages/Messages';
@@ -18,6 +19,13 @@ import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
 import AppShell from './components/layout/AppShell';
 import UpgradeModal from './components/billing/UpgradeModal';
+import FirmAdminRoute from './components/auth/FirmAdminRoute';
+import FirmSettings from './pages/firm/FirmSettings';
+import RateCardPage from './pages/firm/RateCard';
+import TeamTemplatesPage from './pages/firm/TeamTemplates';
+import TechPreferencesPage from './pages/firm/TechPreferences';
+import PastProjectsPage from './pages/firm/PastProjects';
+import PastProjectEditor from './pages/firm/PastProjectEditor';
 
 function BgLayers() {
   const { pathname } = useLocation();
@@ -26,11 +34,13 @@ function BgLayers() {
     pathname.startsWith('/projects') ||
     pathname.startsWith('/new-project') ||
     pathname.startsWith('/chat') ||
+    pathname.startsWith('/compare') ||
     pathname.startsWith('/full-pipeline') ||
     pathname.startsWith('/deliverable') ||
     pathname.startsWith('/messages') ||
     pathname.startsWith('/reports') ||
     pathname.startsWith('/settings') ||
+    pathname.startsWith('/firm') ||
     pathname.startsWith('/pricing')
   )
     return null;
@@ -145,6 +155,16 @@ function App() {
               }
             />
             <Route
+              path="/compare/:chatHistoryId"
+              element={
+                <ProtectedRoute>
+                  <AppShell>
+                    <CompareView />
+                  </AppShell>
+                </ProtectedRoute>
+              }
+            />
+            <Route
               path="/full-pipeline/:chatHistoryId"
               element={
                 <ProtectedRoute>
@@ -208,6 +228,76 @@ function App() {
                 <ProtectedRoute>
                   <Dashboard />
                 </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/firm/settings"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <FirmSettings />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/rate-cards"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <RateCardPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/team-templates"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <TeamTemplatesPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/tech-preferences"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <TechPreferencesPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectsPage />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects/new"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectEditor />
+                  </AppShell>
+                </FirmAdminRoute>
+              }
+            />
+            <Route
+              path="/firm/past-projects/:projectId"
+              element={
+                <FirmAdminRoute>
+                  <AppShell>
+                    <PastProjectEditor />
+                  </AppShell>
+                </FirmAdminRoute>
               }
             />
             <Route path="*" element={<Navigate to="/" replace />} />

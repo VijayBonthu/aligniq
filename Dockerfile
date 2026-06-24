@@ -62,6 +62,8 @@ COPY --from=builder /install /usr/local
 
 WORKDIR /app
 COPY src ./src
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 

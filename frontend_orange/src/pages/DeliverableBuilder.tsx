@@ -18,7 +18,7 @@ import SectionRow from '../components/deliverable/SectionRow';
 import CustomSectionRow from '../components/deliverable/CustomSectionRow';
 import AddSectionButton from '../components/deliverable/AddSectionButton';
 import PreviewPane, { buildAssembledMarkdown } from '../components/deliverable/PreviewPane';
-import { exportNodeToPdf } from '../utils/exportPdf';
+import { exportMarkdownToPdf } from '../utils/exportPdf';
 import { exportMarkdownToDocx } from '../utils/exportDocx';
 
 function emptyConfig(): DeliverableConfig {
@@ -175,11 +175,24 @@ export default function DeliverableBuilder() {
   }, []);
 
   const onDownloadPdf = async () => {
-    if (!previewRef.current) return;
     setExporting('pdf');
     try {
-      await exportNodeToPdf(previewRef.current, `${downloadFilename}.pdf`, {
+      const node = previewRef.current;
+      // Let any in-flight mermaid renders in the preview finish so the PDF
+      // captures every diagram.
+      for (let i = 0; node && i < 60 && node.querySelectorAll('.diagram-block--loading').length; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const md = buildAssembledMarkdown({
+        sections,
+        excludedIds: excluded,
+        sectionEdits: edits,
+        polished,
+        customSections,
+      });
+      await exportMarkdownToPdf(md, `${downloadFilename}.pdf`, {
         title: 'Project Deliverable',
+        node,
       });
     } catch (err: any) {
       toast.error(err?.message || 'PDF export failed');

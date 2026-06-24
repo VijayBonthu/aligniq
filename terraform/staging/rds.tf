@@ -49,7 +49,7 @@ resource "aws_db_instance" "main" {
   storage_type          = "gp3"
   storage_encrypted     = true
 
-  db_name  = "aligniq"
+  db_name  = "groundediq"
   username = var.db_username
   password = var.db_password
   port     = 5432

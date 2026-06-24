@@ -1,5 +1,5 @@
 """
-Agents module for AlignIQ document analysis pipeline.
+Agents module for GroundedIQ document analysis pipeline.
 
 This module provides the LangGraph-based multi-agent pipeline for analyzing
 requirements documents and generating comprehensive technical reports.

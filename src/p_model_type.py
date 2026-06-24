@@ -24,10 +24,24 @@ class Registration_login_password(BaseModel):
     password:str
     username: Optional[str] = None
     role: Optional[str] = None
+    company: Optional[str] = None
+    # Anti-abuse signals (optional so older clients/tests still work).
+    turnstile_token: Optional[str] = None
+    device_id: Optional[str] = None
 
 class login_details(BaseModel):
     email_address:str
     password:str
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
+class EmailVerifyConfirm(BaseModel):
+    token: str
 
 class JiraTokenRequest(BaseModel):
     jira_access_token:str

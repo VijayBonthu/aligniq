@@ -15,9 +15,54 @@ client = chromadb.CloudClient(
 
 client_oa = OpenAI(api_key=settings.OPENAI_CHATGPT)
 embedding_function = OpenAIEmbeddings(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_CHATGPT)
-collection = client.get_or_create_collection(name="AlignIQ")
+collection = client.get_or_create_collection(name="GroundedIQ")
 
-async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> list[float]:
+def _embed_batched(texts: list[str], model: str, batch_size: int = 100) -> list[list[float]]:
+  """Embed `texts` in batches (the OpenAI embeddings API accepts a list input and
+  returns vectors in order). Replaces the previous one-call-per-chunk loop.
+
+  Records embedding-token usage into llm_call_log via the bound recorder so the
+  project COGS total matches the OpenAI usage dashboard (embeddings are a separate
+  line item there). No-op when no recorder is bound."""
+  from utils.llm_metrics import get_recorder
+
+  embeddings: list[list[float]] = []
+  total_tokens = 0
+  for start in range(0, len(texts), batch_size):
+    batch = texts[start:start + batch_size]
+    resp = client_oa.embeddings.create(input=batch, model=model)
+    embeddings.extend(item.embedding for item in resp.data)
+    try:
+      total_tokens += int(getattr(resp, "usage", None).total_tokens or 0)
+    except Exception:
+      pass
+
+  recorder = get_recorder()
+  if recorder is not None and total_tokens:
+    recorder.record(
+      agent_name="embedding", model=model,
+      input_tokens=total_tokens, cached_input_tokens=0, output_tokens=0, latency_ms=0,
+    )
+  return embeddings
+
+
+async def create_embeddings(
+  texts: list[str],
+  model: str,
+  chat_history_id: str,
+  metadatas: list[dict] | None = None,
+  document_id: str | None = None,
+) -> str:
+  """Embed `texts` and (re)store them under `chat_history_id`.
+
+  `metadatas` (parallel to `texts`) may carry section_id/heading_text/content_type
+  from section-aware chunking; they are merged into the base metadata so chat
+  retrieval can filter by content_type (e.g. diagrams) or section. Existing
+  embeddings for the chat are deleted first so a regeneration fully replaces them.
+  """
+  if not texts:
+    logger.info(f"create_embeddings: no chunks to embed for chat_history_id: {chat_history_id}")
+    return "no chunks to embed"
 
   #Deleting the existing embedding for the chat_hisotry_id if exists
   try:
@@ -31,45 +76,42 @@ async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> 
   except Exception as e:
     logger.error(f"Error checking/deleting existing embedding for chat_history_id: {chat_history_id}, error: {e}")
     raise RuntimeError(f"failed to check/delete exisitng embeddings: {e}")
-  
-  #Creating metadata for the vector store
-  ts = datetime.now(timezone.utc).isoformat()
-  metadata = [{
-    "chunk_id": f"{chat_history_id}_{idx+1}",
-    "chat_history_id": chat_history_id,
-    "timestamp": ts
-  }
-  for idx in range(len(texts))
-  ]
 
-  # Create embeddings via OpenAI client. The client may return either a mapping (dict)
-  # or a response object. Handle both safely.
+  #Creating metadata for the vector store. Chroma rejects None values, so only
+  # non-empty fields are included.
+  ts = datetime.now(timezone.utc).isoformat()
+  metadata = []
+  for idx in range(len(texts)):
+    meta = {
+      "chunk_id": f"{chat_history_id}_{idx+1}",
+      "chat_history_id": chat_history_id,
+      "timestamp": ts,
+    }
+    if document_id:
+      meta["document_id"] = document_id
+    if metadatas and idx < len(metadatas) and metadatas[idx]:
+      for k, v in metadatas[idx].items():
+        if v not in (None, ""):
+          meta[k] = v
+    metadata.append(meta)
+
+  # Create embeddings via OpenAI client (batched). Ensure a recorder is bound so
+  # the embedding cost is captured even when indexing runs outside a pipeline/chat
+  # context (which already bind a richer-scoped recorder).
+  from contextlib import nullcontext
+  from utils.llm_metrics import get_recorder, LLMCallRecorder, use_recorder
+  _embed_ctx = nullcontext() if get_recorder() is not None else use_recorder(
+    LLMCallRecorder(chat_history_id=chat_history_id)
+  )
   try:
-    resp = [
-      client_oa.embeddings.create(input=text,model=model).data[0].embedding for text in texts 
-    ]
-    # resp = client_oa.embeddings.create(input=text, model=model)
-    logger.info(f"created embedding for chat_history_id: {chat_history_id}")
+    with _embed_ctx:
+      resp = _embed_batched(texts, model)
+    logger.info(f"created {len(resp)} embeddings for chat_history_id: {chat_history_id}")
   except Exception as e:
      logger.error(f'Error creating embedding for chat_history_id: {chat_history_id}, error: {e}')
      raise RuntimeError(f"Failed to create embeddings: {e}")
-     
 
-  # support both dict-like and object-like responses
-  # try:
-  #   embedding = resp.data[0].embedding
-  # except Exception as e:
-  #   # raise a clearer error so caller can debug
-  #   raise RuntimeError(f"Failed to extract embedding from response: {e}")
-  
-  # Chroma expects sequences for these fields. Wrap single items in lists.
   try:
-    # collection.add(
-    #     embeddings=[embedding],
-    #     documents=[text],
-    #     ids=[f"{chat_history_id}_{chunk_id}"],
-    #     metadatas=[metadata]
-    # )
     collection.add(
       ids=[f"{chat_history_id}_{idx+1}" for idx in range(len(texts))],
       embeddings=resp,
@@ -82,19 +124,53 @@ async def create_embeddings(texts:list[str], model:str, chat_history_id:str) -> 
      logger.error(f"Error adding embeddings to collection for chat_history_id: {chat_history_id}, error: {e}")
      raise RuntimeError(f"failed to add embeddings to collection: {e}")
 
-  # Return the embedding vector so callers can inspect it if needed.
-  # logger.info(f"added Embeddings to collection for chat_histotry_id: {chat_history_id}")
-  # return f"embeddings created and added to collections successfully"
+
+async def embed_report(markdown: str, model: str, chat_history_id: str, document_id: str | None = None) -> str:
+  """Section-aware chunk + embed for a markdown report (the chat retrieval store).
+
+  Single entry point for every report ingest site: produces fence-atomic,
+  section-tagged chunks (vectordb.chunking.chunk_report) and stores them with
+  content_type/section metadata. Embeddings are now a *fallback* path — the chat
+  serves sections/diagrams deterministically from report_content — so this is
+  best-effort; callers already treat embedding failure as non-fatal.
+  """
+  from vectordb.chunking import chunk_report
+
+  chunks = chunk_report(markdown)
+  if not chunks:
+    logger.info(f"embed_report: no chunks produced for chat_history_id: {chat_history_id}")
+    return "no chunks to embed"
+  texts = [c["text"] for c in chunks]
+  metadatas = [
+    {"section_id": c["section_id"], "heading_text": c["heading_text"], "content_type": c["content_type"]}
+    for c in chunks
+  ]
+  return await create_embeddings(
+    texts=texts, model=model, chat_history_id=chat_history_id,
+    metadatas=metadatas, document_id=document_id,
+  )
 
 
-async def retrieve_similar_embeddings(query_text:str,chat_history_id:str, model:str, top_k:int=5) -> list[str]:
-
+async def retrieve_similar_embeddings(
+  query_text: str,
+  chat_history_id: str,
+  model: str,
+  top_k: int = 5,
+  content_type: str | None = None,
+) -> list[str]:
+  """Semantic search scoped to one chat. `content_type` optionally filters to a
+  chunk class (e.g. 'diagram', 'prose', 'table'). Returns the raw Chroma result
+  (documents + metadatas + distances)."""
   try:
     query_embedding = client_oa.embeddings.create(input=query_text, model=model).data[0].embedding
+    if content_type:
+      where = {"$and": [{"chat_history_id": chat_history_id}, {"content_type": content_type}]}
+    else:
+      where = {"chat_history_id": chat_history_id}
     results = collection.query(
       query_embeddings=[query_embedding],
       n_results=top_k,
-      where={"chat_history_id": chat_history_id}
+      where=where,
     )
     return  results
   except Exception as e:

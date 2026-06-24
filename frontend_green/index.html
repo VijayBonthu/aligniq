@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Set the theme before first paint so light mode never flashes dark.
+         Saved choice wins; otherwise follow the OS; otherwise dark (brand default). -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('giq-theme');
+          var theme = saved
+            || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+    <title>GroundedIQ — AI scoping & alignment reports for teams</title>
+
+    <!-- ── SEO: primary meta ── -->
+    <meta
+      name="description"
+      content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect."
+    />
+    <link rel="canonical" href="https://grounded-iq.com/" />
+    <meta id="robots-tag" name="robots" content="index, follow" />
+    <meta name="theme-color" content="#0d0d11" />
+    <meta name="author" content="GroundedIQ" />
+
+    <!-- Keep non-production hosts (e.g. staging.grounded-iq.com, www, S3 endpoints)
+         out of search indexes. Production canonical host is grounded-iq.com; any
+         other host flips robots to noindex. Belt-and-suspenders with the preferred
+         Cloudflare `X-Robots-Tag: noindex` rule on the staging zone. -->
+    <script>
+      (function () {
+        try {
+          if (location.hostname !== 'grounded-iq.com') {
+            var m = document.getElementById('robots-tag');
+            if (m) m.setAttribute('content', 'noindex, nofollow');
+          }
+        } catch (e) {}
+      })();
+    </script>
+
+    <!-- ── Open Graph (LinkedIn / Slack / Facebook) ── -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="GroundedIQ" />
+    <meta property="og:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
+    <meta
+      property="og:description"
+      content="Reads a raw brief like your sharpest architect — surfacing the buried risks, raising the questions that move the estimate, and grounding every assumption in evidence. The alignment report your client signs before kickoff."
+    />
+    <meta property="og:url" content="https://grounded-iq.com/" />
+    <meta property="og:image" content="https://grounded-iq.com/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="GroundedIQ — every estimate, grounded in the brief." />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- ── Twitter / X card ── -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
+    <meta
+      name="twitter:description"
+      content="Reads a raw brief like your sharpest architect — surfacing buried risks, raising the questions that move the estimate, grounding every assumption. The report your client signs before kickoff."
+    />
+    <meta name="twitter:image" content="https://grounded-iq.com/og-image.png" />
+
+    <!-- ── Structured data (Organization + SoftwareApplication) ── -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://grounded-iq.com/#organization",
+            "name": "GroundedIQ",
+            "url": "https://grounded-iq.com/",
+            "logo": "https://grounded-iq.com/logo.svg",
+            "email": "hello@grounded-iq.com",
+            "description": "AI-powered scoping that turns a raw brief into an evidence-grounded alignment report.",
+            "contactPoint": {
+              "@type": "ContactPoint",
+              "email": "hello@grounded-iq.com",
+              "contactType": "customer support"
+            }
+          },
+          {
+            "@type": "SoftwareApplication",
+            "@id": "https://grounded-iq.com/#software",
+            "name": "GroundedIQ",
+            "applicationCategory": "BusinessApplication",
+            "operatingSystem": "Web",
+            "url": "https://grounded-iq.com/",
+            "description": "GroundedIQ reads a project brief like a senior solution architect — surfacing risks, raising clarifying questions, and producing an evidence-grounded alignment report with architecture, timeline and resourcing before kickoff.",
+            "publisher": { "@id": "https://grounded-iq.com/#organization" },
+            "offers": [
+              { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD" },
+              { "@type": "Offer", "name": "Basic", "price": "30", "priceCurrency": "USD", "category": "/month" },
+              { "@type": "Offer", "name": "Plus", "price": "70", "priceCurrency": "USD", "category": "/month" }
+            ]
+          }
+        ]
+      }
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Inter+Tight:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

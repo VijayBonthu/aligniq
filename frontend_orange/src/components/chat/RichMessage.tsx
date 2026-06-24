@@ -1,7 +1,9 @@
 import { useRef } from 'react';
+import { toast } from 'react-hot-toast';
 import MarkdownContent from './MarkdownContent';
 import ReportContent from '../report/ReportContent';
 import ReportToolbar from '../report/ReportToolbar';
+import { exportMarkdownToPdf } from '../../utils/exportPdf';
 
 export interface ChatMessage {
   id: string | number;
@@ -11,20 +13,38 @@ export interface ChatMessage {
   selected?: boolean;
   type?: string;
   reportTitle?: string;
+  /** Set when a briefing/analysis tool produced this reply — drives the saved badge + export. */
+  savedLabel?: string;
 }
 
 interface Props {
   msg: ChatMessage;
   contextMode: boolean;
   onToggleSelect: () => void;
+  /** Queue the message content as a draft pending change (analysis/optimization replies). */
+  onQueueChange?: (text: string) => void;
+  /** This reply is still streaming — defer diagram rendering until complete. */
+  streaming?: boolean;
 }
 
-export default function RichMessage({ msg, contextMode, onToggleSelect }: Props) {
+// Saved-output labels whose content is actionable as a report change.
+const ACTIONABLE_LABELS = new Set(['Cost Analysis', 'Timeline Analysis', 'Optimization']);
+
+export default function RichMessage({ msg, contextMode, onToggleSelect, onQueueChange, streaming }: Props) {
   const isUser = msg.role === 'user';
   const selected = msg.selected !== false;
   const opacity = contextMode && !selected ? 0.4 : 1;
   const isReport = msg.type === 'full_report';
   const reportRef = useRef<HTMLDivElement | null>(null);
+
+  const exportSaved = async () => {
+    try {
+      const slug = (msg.savedLabel || 'briefing').toLowerCase().replace(/\s+/g, '-');
+      await exportMarkdownToPdf(msg.content, `${slug}.pdf`, { title: msg.savedLabel || 'Briefing' });
+    } catch {
+      toast.error('Export failed');
+    }
+  };
 
   return (
     <div
@@ -106,9 +126,43 @@ export default function RichMessage({ msg, contextMode, onToggleSelect }: Props)
               <ReportContent ref={reportRef} content={msg.content} variant="report" />
             </>
           ) : (
-            <MarkdownContent content={msg.content} />
+            <MarkdownContent content={msg.content} streaming={streaming} />
           )}
         </div>
+        {!isUser && !isReport && msg.savedLabel && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: '.06em',
+                padding: '2px 7px', borderRadius: 999, background: 'var(--surface-2)',
+                border: '1px solid var(--border)', color: 'var(--fg-muted)',
+              }}
+            >
+              ★ {msg.savedLabel}
+            </span>
+            <div style={{ flex: 1 }} />
+            {onQueueChange && ACTIONABLE_LABELS.has(msg.savedLabel) && (
+              <button
+                onClick={() => onQueueChange(msg.content)}
+                style={{
+                  background: 'var(--accent-soft)', border: '1px solid var(--accent)', color: 'var(--accent)',
+                  borderRadius: 999, fontFamily: 'var(--font-mono)', fontSize: 10, padding: '3px 9px', cursor: 'pointer',
+                }}
+              >
+                Queue as change
+              </button>
+            )}
+            <button
+              onClick={exportSaved}
+              style={{
+                background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--fg-dim)',
+                borderRadius: 999, fontFamily: 'var(--font-mono)', fontSize: 10, padding: '3px 9px', cursor: 'pointer',
+              }}
+            >
+              Export PDF
+            </button>
+          </div>
+        )}
         {msg.ts && (
           <p
             style={{

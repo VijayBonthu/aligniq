@@ -1,5 +1,5 @@
 """
-PDF Generator for AlignIQ Reports
+PDF Generator for GroundedIQ Reports
 
 Uses ReportLab for PDF generation from Markdown content.
 Includes proper handling of:
@@ -9,6 +9,7 @@ Includes proper handling of:
 - Lists (ordered and unordered)
 - Bold/italic text
 """
+from __future__ import annotations
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, A4
@@ -119,6 +120,9 @@ def _parse_markdown_to_flowables(markdown_content: str, styles) -> list:
         List of ReportLab flowables
     """
     flowables = []
+    # Strip HTML comments (e.g. internal <!-- judge: ... --> debug notes) so they
+    # can never render into a client-facing PDF. DOTALL handles multi-line comments.
+    markdown_content = re.sub(r'<!--.*?-->', '', markdown_content, flags=re.DOTALL)
     lines = markdown_content.split('\n')
 
     i = 0
@@ -217,7 +221,19 @@ def _parse_markdown_to_flowables(markdown_content: str, styles) -> list:
 
 
 def _convert_inline_markdown(text: str) -> str:
-    """Convert inline markdown (bold, italic, code) to ReportLab tags."""
+    """Convert inline markdown (bold, italic, code, links) to ReportLab tags."""
+    # Stash links FIRST so URL contents (underscores, asterisks, ampersands) survive
+    # the bold/italic/code passes and the XML escaping below. Links render as
+    # clickable anchors; previously the URL was discarded, leaving dead "(source)"
+    # text in the PDF and breaking the clickable-citation contract.
+    stashed: list = []
+
+    def _stash(m):
+        stashed.append((m.group(1), m.group(2)))
+        return f"\x00L{len(stashed) - 1}\x00"
+
+    text = re.sub(r'\[(.+?)\]\((.+?)\)', _stash, text)
+
     # Bold
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
@@ -229,8 +245,16 @@ def _convert_inline_markdown(text: str) -> str:
     # Inline code
     text = re.sub(r'`(.+?)`', r'<font name="Courier" size="9">\1</font>', text)
 
-    # Links (just show the text, not the URL)
-    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    # Restore stashed links as clickable anchors (href + label XML-escaped so
+    # reportlab's mini-XML parser doesn't choke on & / < / > in URLs).
+    def _restore(m):
+        label, url = stashed[int(m.group(1))]
+        url_esc = (url.replace('&', '&amp;').replace('"', '&quot;')
+                      .replace('<', '&lt;').replace('>', '&gt;'))
+        label_esc = label.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        return f'<a href="{url_esc}" color="#1a73e8">{label_esc}</a>'
+
+    text = re.sub(r'\x00L(\d+)\x00', _restore, text)
 
     return text
 
@@ -280,11 +304,33 @@ def _create_table(rows: list, styles) -> Table:
     return table
 
 
+def _make_watermark(text: str, page_size):
+    """Return an onPage callback that stamps a faint diagonal watermark on every
+    page. Used for the free tier so its exports aren't client-ready deliverables
+    (the conversion nudge). No-op caller-side when text is falsy."""
+    page_w, page_h = page_size
+
+    def _draw(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica-Bold", 64)
+        canvas.setFillColor(colors.Color(0.6, 0.6, 0.6, alpha=0.18))
+        canvas.translate(page_w / 2.0, page_h / 2.0)
+        canvas.rotate(45)
+        canvas.drawCentredString(0, 0, text)
+        canvas.restoreState()
+
+    return _draw
+
+
 async def generate_pdf_from_markdown(
     markdown_content: str,
     title: str = "Technical Report",
     version: int = 1,
-    page_size=letter
+    page_size=letter,
+    *,
+    brand_name: str = "GroundedIQ",
+    accent_hex: str | None = None,
+    watermark_text: str | None = None,
 ) -> bytes:
     """
     Generate a PDF from markdown content.
@@ -294,6 +340,11 @@ async def generate_pdf_from_markdown(
         title: The report title
         version: The version number
         page_size: Page size (default: letter)
+        brand_name: footer/brand line on the title page. pro (white-label) passes
+            the firm's name so the deliverable carries the client's brand.
+        accent_hex: optional '#RRGGBB' to recolour the title (firm primary colour).
+        watermark_text: when set (free tier), stamps a diagonal watermark on
+            every page so the export isn't a clean client deliverable.
 
     Returns:
         PDF content as bytes
@@ -311,6 +362,12 @@ async def generate_pdf_from_markdown(
         )
 
         styles = _create_styles()
+        # White-label: recolour the title to the firm's primary colour if valid.
+        if accent_hex:
+            try:
+                styles['ReportTitle'].textColor = colors.HexColor(accent_hex)
+            except Exception:
+                pass
         story = []
 
         # Title page
@@ -322,15 +379,19 @@ async def generate_pdf_from_markdown(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             styles['CustomBody']
         ))
-        story.append(Paragraph("Generated by AlignIQ", styles['CustomBody']))
+        story.append(Paragraph(f"Generated by {brand_name or 'GroundedIQ'}", styles['CustomBody']))
         story.append(PageBreak())
 
         # Convert markdown to flowables
         content_flowables = _parse_markdown_to_flowables(markdown_content, styles)
         story.extend(content_flowables)
 
-        # Build PDF
-        doc.build(story)
+        # Build PDF (watermark stamped on every page for the free tier)
+        if watermark_text:
+            stamp = _make_watermark(watermark_text, page_size)
+            doc.build(story, onFirstPage=stamp, onLaterPages=stamp)
+        else:
+            doc.build(story)
 
         pdf_data = buffer.getvalue()
         buffer.close()

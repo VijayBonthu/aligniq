@@ -3,6 +3,8 @@ import api from '../services/api';
 import { getSubscription, SubscriptionData } from '../services/billingService';
 import type { LimitHitDetail } from '../components/billing/UpgradeModal';
 
+export type FirmRole = 'firm_admin' | 'member';
+
 interface UserData {
   id: string;
   email: string;
@@ -10,6 +12,8 @@ interface UserData {
   provider: string;
   username?: string;
   role?: string;
+  firm_id?: string;
+  firm_role?: FirmRole;
   iat: number;
   exp: number;
 }

@@ -3,7 +3,7 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project     = "aligniq"
+      Project     = "groundediq"
       Environment = "staging"
       ManagedBy   = "terraform"
     }

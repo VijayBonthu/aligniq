@@ -143,7 +143,7 @@ def validate_response(response, agent_name: str, required_fields: list = None):
 
     return response
 
-async def requirements_analyzer(docs: list) -> dict:
+async def requirements_analyzer(docs: list, firm_context: str = "") -> dict:
     """
     Analyze raw requirements document and extract structured information.
 
@@ -156,7 +156,7 @@ async def requirements_analyzer(docs: list) -> dict:
     logger.info("Starting requirements_analyzer")
     req_analyzer_prompt = ChatPromptTemplate.from_template(Requirements_analyzer_prompt)
     chain = req_analyzer_prompt | llm | fixed_parser
-    input_dict = {"requirements_text": docs}
+    input_dict = {"requirements_text": docs, "firm_context": firm_context}
 
     response = await invoke_with_timeout(
         chain, input_dict,
@@ -259,7 +259,7 @@ async def midway_report(req_analyzer_json: dict, amb_resolver_json: dict, valida
     return validate_response(response, "midway_report")
 
 
-async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, validator_json: dict, critic_feedback: dict) -> dict:
+async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, validator_json: dict, critic_feedback: dict, firm_context: str = "") -> dict:
     """
     Design solution architecture based on validated requirements.
 
@@ -279,7 +279,8 @@ async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, v
         "requirements_json": json.dumps(req_analyzer_json),
         "clarified_assumptions": json.dumps(amb_resolver_json),
         "validated_requirements": json.dumps(validator_json),
-        "critic_feedback": json.dumps(critic_feedback)
+        "critic_feedback": json.dumps(critic_feedback),
+        "firm_context": firm_context,
     }
 
     response = await invoke_with_timeout(
@@ -291,37 +292,140 @@ async def solution_architect(req_analyzer_json: dict, amb_resolver_json: dict, v
     return validate_response(response, "solution_architect")
 
 
-async def evidence_gather_agent(recommendations_json: dict, validated_requirements_json: dict, solution_architectures: dict) -> dict:
+async def evidence_gather_agent(recommendations_json: dict, validated_requirements_json: dict, solution_architectures: dict, firm_context: str = "") -> dict:
     """
     Gather evidence and best practices for proposed solution.
+
+    When firm_context is non-empty, the agent gains access to the
+    `firm_project_search` tool and may invoke it up to 3 times to retrieve
+    past-project evidence from this firm's own Chroma collection. Without
+    firm_context, the agent runs as a plain chain (no tools bound, no
+    extra latency).
 
     Args:
         recommendations_json: Requirements recommendations
         validated_requirements_json: Validated requirements
         solution_architectures: Proposed solution architecture
+        firm_context: Markdown <firm_context> block; gates tool binding.
 
     Returns:
         dict: Evidence and best practices
     """
     logger.info("Starting evidence_gather_agent")
-    evi_gather_prompt = ChatPromptTemplate.from_template(Evidence_Gatherer_Agent_prompt)
-    chain = evi_gather_prompt | llm | fixed_parser
     input_dict = {
         "requirements_json": json.dumps(recommendations_json),
         "validated_requirements": json.dumps(validated_requirements_json),
-        "solution_architectures": json.dumps(solution_architectures)
+        "solution_architectures": json.dumps(solution_architectures),
+        "firm_context": firm_context,
     }
 
-    response = await invoke_with_timeout(
-        chain, input_dict,
+    # Fast path: no firm context → no past-project portfolio to search →
+    # don't pay for tool-binding overhead. Keep the original chain shape.
+    if not firm_context:
+        evi_gather_prompt = ChatPromptTemplate.from_template(Evidence_Gatherer_Agent_prompt)
+        chain = evi_gather_prompt | llm | fixed_parser
+        response = await invoke_with_timeout(
+            chain, input_dict,
+            agent_name="evidence_gather_agent",
+            prompt_hash=_HASHES["evidence_gather_agent"],
+        )
+        logger.info("Completed evidence_gather_agent (no-tools path)")
+        return validate_response(response, "evidence_gather_agent")
+
+    # Firm-context path: bind firm_project_search and let the LLM decide
+    # which queries to run. Cap at 3 tool calls so a runaway loop can't
+    # blow the LLM_CALL_TIMEOUT budget.
+    response_dict = await _evidence_gather_with_firm_tool(input_dict)
+    logger.info("Completed evidence_gather_agent (firm-tool path)")
+    return validate_response(response_dict, "evidence_gather_agent")
+
+
+async def _evidence_gather_with_firm_tool(input_dict: dict) -> dict:
+    """
+    Run the evidence-gather agent in a tool-using loop bound to
+    `firm_project_search`. Caps tool calls at 3 to stay within timeout.
+    """
+    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+    from utils.chat_tools import firm_project_search
+
+    tools = [firm_project_search]
+    tool_map = {t.name: t for t in tools}
+    llm_with_tools = llm.bind_tools(tools)
+
+    # Render the system prompt with the inputs interpolated.
+    rendered_prompt = Evidence_Gatherer_Agent_prompt.format(**input_dict)
+    messages: list = [
+        SystemMessage(content=rendered_prompt),
+        HumanMessage(content="Gather the evidence now. Use `firm_project_search` up to 3 times for past-project grounding, then return the final JSON exactly matching the schema in the system prompt."),
+    ]
+
+    config = callback_for(
         agent_name="evidence_gather_agent",
+        model=settings.GENERATING_REPORT_MODEL,
         prompt_hash=_HASHES["evidence_gather_agent"],
     )
-    logger.info("Completed evidence_gather_agent")
-    return validate_response(response, "evidence_gather_agent")
+
+    tool_calls_used = 0
+    MAX_TOOL_CALLS = 3
+    final_text: str | None = None
+
+    for step in range(MAX_TOOL_CALLS + 1):
+        ai_msg = await asyncio.wait_for(
+            llm_with_tools.ainvoke(messages, config=config) if config else llm_with_tools.ainvoke(messages),
+            timeout=settings.LLM_CALL_TIMEOUT,
+        )
+        messages.append(ai_msg)
+
+        tool_calls = getattr(ai_msg, "tool_calls", None) or []
+        if not tool_calls:
+            final_text = ai_msg.content if isinstance(ai_msg.content, str) else str(ai_msg.content)
+            break
+
+        if tool_calls_used >= MAX_TOOL_CALLS:
+            # Force the model to finalize on next step by stripping further tool use.
+            messages.append(HumanMessage(content="You have used the maximum tool budget. Return the final JSON now."))
+            ai_msg = await asyncio.wait_for(
+                llm.ainvoke(messages, config=config) if config else llm.ainvoke(messages),
+                timeout=settings.LLM_CALL_TIMEOUT,
+            )
+            final_text = ai_msg.content if isinstance(ai_msg.content, str) else str(ai_msg.content)
+            break
+
+        for tc in tool_calls:
+            if tool_calls_used >= MAX_TOOL_CALLS:
+                messages.append(ToolMessage(
+                    content=json.dumps({"hits": [], "note": "tool budget exhausted"}),
+                    tool_call_id=tc.get("id") or tc.get("tool_call_id") or "",
+                ))
+                continue
+            name = tc.get("name")
+            args = tc.get("args") or {}
+            tool_obj = tool_map.get(name)
+            if not tool_obj:
+                messages.append(ToolMessage(
+                    content=json.dumps({"error": f"unknown tool {name}"}),
+                    tool_call_id=tc.get("id") or "",
+                ))
+                continue
+            try:
+                tool_result = await tool_obj.ainvoke(args)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"evidence_gather: tool {name} failed: {e}")
+                tool_result = json.dumps({"hits": [], "error": str(e)})
+            messages.append(ToolMessage(
+                content=tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
+                tool_call_id=tc.get("id") or "",
+            ))
+            tool_calls_used += 1
+
+    if final_text is None:
+        raise AgentOutputError("evidence_gather_agent did not produce final content")
+
+    # Parse the JSON the model returned. OutputFixingParser handles malformed JSON.
+    return await fixed_parser.aparse(final_text) if hasattr(fixed_parser, "aparse") else fixed_parser.parse(final_text)
 
 
-async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_architectures_json: dict, previous_critic_feedback: dict) -> dict:
+async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_architectures_json: dict, previous_critic_feedback: dict, firm_context: str = "") -> dict:
     """
     Critique the solution architecture and identify issues.
 
@@ -341,7 +445,8 @@ async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_a
         "requirements_json": json.dumps(req_analyzer_json),
         "validated_requirements": json.dumps(validator_json),
         "solution_architectures": json.dumps(solution_architectures_json),
-        "previous_critic_feedback": json.dumps(previous_critic_feedback)
+        "previous_critic_feedback": json.dumps(previous_critic_feedback),
+        "firm_context": firm_context,
     }
 
     response = await invoke_with_timeout(
@@ -353,7 +458,7 @@ async def critic_agent(req_analyzer_json: dict, validator_json: dict, solution_a
     return validate_response(response, "critic_agent")
 
 
-async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, solution_architectures_json: dict, evidence_gather_json: dict) -> dict:
+async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, solution_architectures_json: dict, evidence_gather_json: dict, firm_context: str = "") -> dict:
     """
     Estimate feasibility, timeline, and resource requirements.
 
@@ -373,7 +478,8 @@ async def feasibility_estimator(req_analyzer_json: dict, validator_json: dict, s
         "requirements_json": json.dumps(req_analyzer_json),
         "validated_requirements": json.dumps(validator_json),
         "solution_architectures": json.dumps(solution_architectures_json),
-        "evidence_json": json.dumps(evidence_gather_json)
+        "evidence_json": json.dumps(evidence_gather_json),
+        "firm_context": firm_context,
     }
 
     response = await invoke_with_timeout(
@@ -392,7 +498,8 @@ async def ba_final_report_generation(
     solution_architectures: dict,
     critic_feedback: dict,
     evidence: dict,
-    feasibility: dict
+    feasibility: dict,
+    firm_context: str = "",
 ) -> str:
     """
     Generate the final comprehensive BA report.
@@ -420,7 +527,8 @@ async def ba_final_report_generation(
         "solution_architect_json": json.dumps(solution_architectures),
         "critic_feedback_json": json.dumps(critic_feedback),
         "evidence_gathering_json": json.dumps(evidence),
-        "feasibility_estimator_json": json.dumps(feasibility)
+        "feasibility_estimator_json": json.dumps(feasibility),
+        "firm_context": firm_context,
     }
 
     # Final report generation might take longer, use extended timeout

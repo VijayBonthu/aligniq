@@ -1,7 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'react-hot-toast';
+import { isAxiosError } from 'axios';
 import { uploadFiles, type UploadPresalesResponse } from '../../services/uploadService';
 import ProcessingSteps from './ProcessingSteps';
+
+interface RejectionDetail {
+  rejection_reason?: string;
+  next_step?: string;
+  classification?: {
+    document_type?: string;
+    confidence?: number;
+  };
+}
 
 interface UploadStepProps {
   onComplete: (response: UploadPresalesResponse) => void;
@@ -15,7 +25,15 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
   const [dragOver, setDragOver] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [procStep, setProcStep] = useState(0);
+  const [rejection, setRejection] = useState<RejectionDetail | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const resetForNewFile = () => {
+    setRejection(null);
+    setFile(null);
+    if (inputRef.current) inputRef.current.value = '';
+    inputRef.current?.click();
+  };
 
   // Animate the 5-stage indicator while the API call is in flight.
   // The API resolution is the source of truth; this is purely visual.
@@ -34,6 +52,7 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
   const handleAnalyse = async () => {
     if (!file) return;
     if (onBeforeUpload && !onBeforeUpload()) return;
+    setRejection(null);
     setProcessing(true);
     setProcStep(0);
     try {
@@ -45,6 +64,17 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
       }
       onComplete(res);
     } catch (err: unknown) {
+      // Pre-flight classifier rejection (HTTP 422) — show a dedicated card instead of a toast,
+      // since the user needs to understand *why* and pick a different file.
+      if (isAxiosError(err) && err.response?.status === 422) {
+        const detail = (err.response.data as { detail?: RejectionDetail | string })?.detail;
+        if (detail && typeof detail === 'object' && (detail.rejection_reason || detail.next_step)) {
+          setRejection(detail);
+          setProcessing(false);
+          setProcStep(0);
+          return;
+        }
+      }
       const msg = err instanceof Error ? err.message : 'Upload failed';
       toast.error(msg);
       setProcessing(false);
@@ -83,6 +113,73 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
           AlignIQ will scan it for ambiguities, risks, and critical unknowns in under 2 minutes.
         </p>
       </div>
+
+      {rejection && (
+        <div
+          style={{
+            marginBottom: 20,
+            padding: 18,
+            borderRadius: 12,
+            background: 'rgba(234, 179, 8, 0.06)',
+            border: '1px solid rgba(234, 179, 8, 0.35)',
+          }}
+        >
+          <p
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 10,
+              letterSpacing: '.14em',
+              textTransform: 'uppercase',
+              color: 'var(--warn)',
+              marginBottom: 8,
+            }}
+          >
+            Doesn&rsquo;t look like an RFP
+          </p>
+          {rejection.rejection_reason && (
+            <p style={{ fontSize: 14, color: 'var(--fg)', lineHeight: 1.55, marginBottom: 8 }}>
+              {rejection.rejection_reason}
+            </p>
+          )}
+          {rejection.next_step && (
+            <p style={{ fontSize: 13, color: 'var(--fg-dim)', lineHeight: 1.55, marginBottom: 14 }}>
+              {rejection.next_step}
+            </p>
+          )}
+          {rejection.classification?.document_type && (
+            <p
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 11,
+                color: 'var(--fg-muted)',
+                marginBottom: 14,
+              }}
+            >
+              Detected: {rejection.classification.document_type}
+              {typeof rejection.classification.confidence === 'number'
+                ? ` (${Math.round(rejection.classification.confidence * 100)}% confidence)`
+                : ''}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={resetForNewFile}
+            style={{
+              padding: '8px 14px',
+              background: 'var(--accent)',
+              color: '#1a0a04',
+              border: 'none',
+              borderRadius: 8,
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: 'pointer',
+              fontFamily: 'var(--font-sans)',
+            }}
+          >
+            Choose a different file
+          </button>
+        </div>
+      )}
 
       {!processing ? (
         <>

@@ -6,6 +6,7 @@ import models
 import json
 from sqlalchemy import text, and_
 import uuid
+from utils.ids import new_id
 from fastapi import HTTPException
 from utils.logger import logger
 from database_scripts import get_analysis_mode
@@ -214,7 +215,7 @@ async def save_chat_history(chat:Dict, db:Session) -> Dict:
             else:
                 # Create new chat only if none exists
                 logger.info(f"no existing chat found, creating new chat for user: {chat['user_id']}")
-                chat_history_id = str(uuid.uuid4())
+                chat_history_id = new_id()
                 new_chat = models.ChatHistory(
                     chat_history_id = chat_history_id,
                     user_id = chat["user_id"],
@@ -362,34 +363,50 @@ async def save_report_version(summary_report_details:Dict, db:Session):
 
     """
     try:
-        report_details_exists = db.query(models.ReportVersions).filter(models.ReportVersions.chat_history_id == summary_report_details["chat_history_id"]).order_by(models.ReportVersions.created_at.desc()).first()
-        if report_details_exists:
-            version_details = report_details_exists.version_number + 1
+        # Optional structured contract (contract pipeline only); legacy runs omit it.
+        report_contract = summary_report_details.get("report_contract")
+        # Changelog tracking — set on regeneration so each version is identifiable.
+        changes_applied = summary_report_details.get("changes_applied") or []
+        changelog_summary = summary_report_details.get("changelog_summary")
+        chat_id = summary_report_details["chat_history_id"]
 
-            new_report_insert = models.ReportVersions(
-                report_version_id = str(uuid.uuid4()),
-                chat_history_id = summary_report_details["chat_history_id"],
-                user_id = summary_report_details["user_id"],
-                version_number = version_details,
-                report_content = summary_report_details["report_content"],
-                summary_report = summary_report_details["summary_report"]
-            )
-            db.add(new_report_insert)
-            db.commit()
-            db.refresh(new_report_insert)
-            logger.info(f"new report version saved successfully for chat_history_id: {str(summary_report_details['chat_history_id'])} and version: {str(version_details)} for user: {str(summary_report_details['user_id'])}")
-        else:
-            new_report_insert = models.ReportVersions(
-                report_version_id = str(uuid.uuid4()),
-                chat_history_id = summary_report_details["chat_history_id"],
-                user_id = summary_report_details["user_id"],
-                report_content = summary_report_details["report_content"],
-                summary_report = summary_report_details["summary_report"]
-            )
-            db.add(new_report_insert)
-            db.commit()
-            db.refresh(new_report_insert)
-            logger.info(f"brand new report version saved successfully for chat_history_id: {str(summary_report_details['chat_history_id'])} for user: {str(summary_report_details['user_id'])}")
+        latest = db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_id
+        ).order_by(models.ReportVersions.version_number.desc()).first()
+
+        version_details = (latest.version_number + 1) if latest else 1
+        parent_version_id = latest.report_version_id if latest else None
+
+        # Every version row should carry an identifiable label so the version list
+        # and the compare "why" read cleanly. The first version has no applied
+        # changes, so give it a deterministic changelog instead of leaving it NULL.
+        if version_details == 1 and not changelog_summary:
+            changelog_summary = "Initial analysis"
+
+        # The newest version becomes the active/default; clear any prior default so
+        # get_summary_report (default-preferred) resolves to it until the user
+        # explicitly picks an older version.
+        db.query(models.ReportVersions).filter(
+            models.ReportVersions.chat_history_id == chat_id
+        ).update({"is_default": False})
+
+        new_report_insert = models.ReportVersions(
+            report_version_id = new_id(),
+            chat_history_id = chat_id,
+            user_id = summary_report_details["user_id"],
+            version_number = version_details,
+            report_content = summary_report_details["report_content"],
+            summary_report = summary_report_details["summary_report"],
+            report_contract = report_contract,
+            changes_applied = changes_applied,
+            changelog_summary = changelog_summary,
+            parent_version_id = parent_version_id,
+            is_default = True,
+        )
+        db.add(new_report_insert)
+        db.commit()
+        db.refresh(new_report_insert)
+        logger.info(f"report version {version_details} saved (default) for chat_history_id: {chat_id}, user: {summary_report_details['user_id']}")
     except Exception as e:
         db.rollback()
         logger.error(f"Error in saving the report version: {str(e)}")

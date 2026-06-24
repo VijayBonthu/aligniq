@@ -17,6 +17,33 @@ import { useAuth } from '../context/AuthContext';
 
 const ASSUMPTION_TAG = '[SYSTEM ASSUMPTION]';
 
+function extractLatestPresalesBrief(message: unknown): string | null {
+  if (!message) return null;
+  let arr: unknown;
+  try {
+    arr = typeof message === 'string' ? JSON.parse(message) : message;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr)) return null;
+  for (let i = arr.length - 1; i >= 0; i -= 1) {
+    const m = arr[i] as { type?: string; content?: unknown; selected?: unknown } | null;
+    // Only the user-confirmed final brief (generated after Questions + Analysis)
+    // carries `selected: true`. The auto-scan brief saved at upload time does
+    // not — matching it here would skip the wizard straight to Report.
+    if (
+      m &&
+      m.type === 'presales_brief' &&
+      m.selected === true &&
+      typeof m.content === 'string' &&
+      m.content.trim()
+    ) {
+      return m.content;
+    }
+  }
+  return null;
+}
+
 interface ChatRecordResponse {
   user_details?: {
     chat_history_id: string;
@@ -56,6 +83,7 @@ export default function NewProjectFlow() {
   const [reportContent, setReportContent] = useState<string | null>(null);
   const [chatHistoryIdState, setChatHistoryIdState] = useState<string | null>(null);
   const [projectTitle, setProjectTitle] = useState<string>('New project');
+  const [readinessStatus, setReadinessStatus] = useState<string | null>(null);
   const [hydrating, setHydrating] = useState<boolean>(Boolean(urlChatHistoryId));
 
   const initialQuestions: PresalesQuestion[] = useMemo(() => {
@@ -90,6 +118,14 @@ export default function NewProjectFlow() {
         }
 
         if (details.pipeline_status === 'running' || details.pipeline_status === 'queued') {
+          navigate(`/full-pipeline/${urlChatHistoryId}`, { replace: true });
+          return;
+        }
+
+        // Failed / cancelled: /full-pipeline owns the Retry/Resume surface
+        // and the stage-history view. The wizard would otherwise re-prompt
+        // the user to "Generate full report" they already generated.
+        if (details.pipeline_status === 'failed' || details.pipeline_status === 'cancelled') {
           navigate(`/full-pipeline/${urlChatHistoryId}`, { replace: true });
           return;
         }
@@ -156,9 +192,19 @@ export default function NewProjectFlow() {
           console.warn('Failed to fetch presales brief during hydrate', briefRes.reason);
         }
 
-        // Decide initial phase: if anything unanswered, send them back to questions.
-        const anyUnanswered = hydratedQuestions.some((q) => !q.answer || !String(q.answer).trim());
-        setPhase(anyUnanswered || hydratedQuestions.length === 0 ? 'questions' : 'analysis');
+        // If a presales brief was generated for this project (saved into
+        // chat_history.message as type='presales_brief'), the user is past
+        // Step 3. Hydrate that brief and land on Step 4 (Report) so they
+        // pick up where they left off — never re-prompted to "Generate full
+        // report" they already generated. Otherwise pick step by answers.
+        const briefContent = extractLatestPresalesBrief(details.message);
+        if (briefContent) {
+          setReportContent(briefContent);
+          setPhase('report');
+        } else {
+          const anyUnanswered = hydratedQuestions.some((q) => !q.answer || !String(q.answer).trim());
+          setPhase(anyUnanswered || hydratedQuestions.length === 0 ? 'questions' : 'analysis');
+        }
       } catch (err) {
         if (cancelled) return;
         console.error('Failed to hydrate project', err);
@@ -219,9 +265,10 @@ export default function NewProjectFlow() {
     return true;
   };
 
-  const handleGenerateReport = async (assumptions: AnalysisAssumption[]) => {
+  const handleGenerateReport = async (assumptions: AnalysisAssumption[], statusKey?: string) => {
     if (!uploadData?.presales_id) return;
     if (!checkRegenLimit()) return;
+    if (statusKey) setReadinessStatus(statusKey);
     setGenerating(true);
     try {
       const res = await presalesService.generatePresalesReport(
@@ -388,6 +435,7 @@ export default function NewProjectFlow() {
             onOpenChat={handleOpenChat}
             onBack={() => setPhase('analysis')}
             onContentChange={setReportContent}
+            requireAssumptionAck={readinessStatus === 'ready_with_assumptions'}
           />
         )}
       </div>

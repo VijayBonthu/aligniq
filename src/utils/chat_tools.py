@@ -6,10 +6,28 @@ These tools enable the LLM to directly interact with pending changes,
 document search, and report operations.
 """
 
+from contextvars import ContextVar
 from langchain_core.tools import tool
 from typing import List, Optional, Any
 import json
 from utils.logger import logger
+
+
+# Bet 3 — firm_id context for `firm_project_search`. Set by pipeline_runner.py
+# (or any caller that binds the tool) BEFORE the agent runs; the tool reads from
+# this contextvar so the LLM cannot influence tenant scope by passing
+# untrusted args. Empty/None means no firm scope → tool returns empty.
+_firm_id_ctx: ContextVar[Optional[str]] = ContextVar("groundediq_firm_id", default=None)
+
+
+def set_firm_id_context(firm_id: Optional[str]):
+    """Set the firm_id contextvar for the current async task. Returns the token
+    so the caller can `_firm_id_ctx.reset(token)` after the agent run."""
+    return _firm_id_ctx.set(firm_id)
+
+
+def get_firm_id_context() -> Optional[str]:
+    return _firm_id_ctx.get()
 
 
 # ============= CONTEXT HOLDER =============
@@ -19,8 +37,90 @@ class ToolContext:
     chat_history_id: str = None
     db: Any = None
     user_id: str = None  # REQUIRED for get_regeneration_context and create_new_report_version
+    jira_token: str = None  # Jira OAuth access token for push_to_jira (set on the stream path)
+    # Per-turn cache of the latest report row, keyed by chat_history_id so a stale
+    # row from another chat is never served. Invalidated by report writes
+    # (regenerate/rollback/set_default) so the agent always sees fresh content.
+    _report_cache_key: str = None
+    _report: Any = None
 
 tool_context = ToolContext()
+
+
+async def _load_report(force: bool = False):
+    """Fetch the latest report once per turn and cache it on tool_context.
+
+    Multiple tools (get_report_section, get_diagrams, risks, analysis, ...) need
+    the same report; this collapses what used to be one get_summary_report DB
+    hit per tool into one per turn.
+
+    IMPORTANT: we cache a *detached* plain object, never the live ReportVersions
+    ORM instance. tool_context is a process-global, so a cached ORM row outlives
+    its request's DB session; the next attribute access then raises
+    DetachedInstanceError. We read the fields we need while the session is alive
+    and hand back a SimpleNamespace that needs no session."""
+    from types import SimpleNamespace
+    from database_scripts import get_summary_report
+
+    cid = tool_context.chat_history_id
+    if (not force) and tool_context._report_cache_key == cid and tool_context._report is not None:
+        return tool_context._report
+
+    row = await get_summary_report(cid, tool_context.db)
+    if row is None:
+        report = None
+    else:
+        report = SimpleNamespace(
+            report_content=getattr(row, "report_content", None),
+            summary_report=getattr(row, "summary_report", None),
+            # Typed decision artifact (plain JSON dict, NOT a ReportContract;
+            # legacy rows are None — read defensively). Powers the reality-gap
+            # and what-if tools.
+            report_contract=getattr(row, "report_contract", None),
+            # The column is version_number (there is no `version` attribute); read
+            # the right one so the active version can be surfaced. Keep a `version`
+            # alias for any back-compat readers.
+            version_number=getattr(row, "version_number", None),
+            version=getattr(row, "version_number", None),
+        )
+    tool_context._report_cache_key = cid
+    tool_context._report = report
+    return report
+
+
+def _invalidate_report_cache():
+    """Drop the cached report after a write so later tools re-read fresh."""
+    tool_context._report_cache_key = None
+    tool_context._report = None
+
+
+def _report_markdown(report) -> str:
+    """Best-effort markdown for the report. report_content is a markdown string
+    on the contract pipeline; legacy rows may store a dict, which we json-encode
+    only as a last resort (diagram/section extraction needs the markdown)."""
+    content = getattr(report, "report_content", None) if report else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        # Legacy dict: stitch string values so heading/diagram parsing still works.
+        parts = [v for v in content.values() if isinstance(v, str)]
+        return "\n\n".join(parts)
+    return ""
+
+
+def _clip(text, limit: int) -> str:
+    """Clip text to `limit` chars, appending an explicit notice when truncated so
+    the LLM never silently reasons over a partial report."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[...truncated: showing {limit} of {len(text)} characters. "
+        + "Call get_report_section for the full text of a specific section...]"
+    )
 
 
 # ============= READ-ONLY TOOLS =============
@@ -123,43 +223,141 @@ async def search_document(query: str, max_results: int = 5) -> str:
 @tool
 async def get_report_section(section_name: str) -> str:
     """
-    Get a specific section from the generated report.
+    Get the exact text of a section from the generated report, verbatim (no
+    paraphrasing). Use this for any "what does the report say about X" / "show me
+    the X section" question — it returns the real markdown (including tables and
+    diagrams) so you can quote it and cite the section heading.
 
     Args:
-        section_name: One of: executive_summary, tech_stack, team_structure,
-                      timeline, risks, recommendations, or full_report for everything
+        section_name: A friendly name (executive_summary, tech_stack,
+                      team_structure, timeline, risks, recommendations), a section
+                      id from list_report_sections, an exact heading, or
+                      "full_report" for the entire report.
     """
-    from database_scripts import get_summary_report
+    from utils.report_sections import parse_sections, find_section
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
-
-        if not report or not report.report_content:
+        report = await _load_report()
+        if not report or not getattr(report, "report_content", None):
             return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
 
+        markdown = _report_markdown(report)
         content = report.report_content
 
         if section_name == "full_report":
             return json.dumps({
                 "status": "success",
                 "section": "full_report",
-                "content": content
+                "content": markdown or content,
             })
-        elif isinstance(content, dict) and section_name in content:
+
+        # Legacy dict report: honor exact key access first.
+        if isinstance(content, dict) and section_name in content:
             return json.dumps({
                 "status": "success",
                 "section": section_name,
-                "content": content[section_name]
+                "content": content[section_name],
             })
-        else:
-            available = list(content.keys()) if isinstance(content, dict) else []
+
+        # Markdown report (contract pipeline): resolve the section deterministically.
+        sections = parse_sections(markdown)
+        match = find_section(sections, section_name)
+        if match:
             return json.dumps({
-                "status": "error",
-                "message": f"Section '{section_name}' not found",
-                "available_sections": available
+                "status": "success",
+                "section": match.heading_text,
+                "section_id": match.id,
+                "content": match.raw_markdown,
             })
+
+        # Fall back to the typed summary_report dict (tech/cost/timeline/...).
+        summary = getattr(report, "summary_report", None)
+        if isinstance(summary, dict):
+            if section_name in summary:
+                return json.dumps({"status": "success", "section": section_name, "content": summary[section_name]})
+            for key in summary:
+                if section_name.lower() in key.lower():
+                    return json.dumps({"status": "success", "section": key, "content": summary[key]})
+
+        available = [s.heading_text for s in sections] or (
+            list(content.keys()) if isinstance(content, dict) else []
+        )
+        return json.dumps({
+            "status": "not_found",
+            "message": f"Section '{section_name}' not found. Try one of the available sections, or call list_report_sections.",
+            "available_sections": available,
+        })
     except Exception as e:
         logger.error(f"Error in get_report_section tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@tool
+async def get_diagrams(kind: str = None) -> str:
+    """
+    Return the ACTUAL diagrams from the report, verbatim, as renderable code
+    fences (the chat renders mermaid/ascii diagrams). ALWAYS use this when the
+    user asks to see, show, or explain a diagram, the architecture diagram, a
+    flowchart, sequence/ER diagram, etc. — never describe a diagram in prose when
+    one exists. Return each diagram's `code` field exactly as given (keep the
+    ```mermaid fences) so it renders.
+
+    Args:
+        kind: Optional filter — "mermaid", "ascii", "plantuml". Omit for all.
+    """
+    from utils.report_sections import extract_diagrams
+    from agents.tools import repair_mermaid_blocks
+
+    try:
+        report = await _load_report()
+        markdown = _report_markdown(report)
+        if not markdown:
+            return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
+
+        diagrams = extract_diagrams(markdown, kind=kind)
+        if not diagrams:
+            return json.dumps({
+                "status": "empty",
+                "message": "The report does not contain any diagrams"
+                           + (f" of type '{kind}'." if kind else "."),
+                "diagrams": [],
+            })
+
+        # Repair mermaid the writer may have left invalid before returning it.
+        for d in diagrams:
+            d["code"] = repair_mermaid_blocks(d["code"])
+
+        return json.dumps({
+            "status": "success",
+            "count": len(diagrams),
+            "diagrams": diagrams,
+            "note": "Return each `code` block verbatim (keep the ``` fences) so it renders in chat. Label it with its `heading`.",
+        })
+    except Exception as e:
+        logger.error(f"Error in get_diagrams tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@tool
+async def list_report_sections() -> str:
+    """
+    List the report's sections (a table of contents): id, heading, level, and
+    whether each section contains a diagram. Use this to orient yourself before
+    answering, to find the right section_name for get_report_section, or when the
+    user asks "what's in the report?".
+    """
+    from utils.report_sections import list_sections
+
+    try:
+        report = await _load_report()
+        markdown = _report_markdown(report)
+        if not markdown:
+            return json.dumps({"status": "error", "message": "No report found. The analysis may not be complete yet."})
+
+        toc = list_sections(markdown)
+        return json.dumps({"status": "success", "count": len(toc), "sections": toc})
+    except Exception as e:
+        logger.error(f"Error in list_report_sections tool: {str(e)}")
         return json.dumps({"status": "error", "message": str(e)})
 
 
@@ -187,7 +385,7 @@ async def search_report_section(query: str, section: str = None) -> str:
 
         # Get report section directly if specified
         if section:
-            report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+            report = await _load_report()
             if report and report.summary_report:
                 summary = report.summary_report
                 if isinstance(summary, dict) and section in summary:
@@ -232,7 +430,7 @@ async def get_risks_and_mitigations() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         results = {
             "status": "success"
@@ -288,7 +486,7 @@ async def suggest_optimization(constraint_type: str, constraint_details: str) ->
 
     try:
         # Get relevant report sections
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -312,7 +510,7 @@ async def suggest_optimization(constraint_type: str, constraint_details: str) ->
                 elif constraint_type == "scope" and any(k in key.lower() for k in ["requirement", "feature", "scope", "mvp"]):
                     relevant_sections.append(f"**{key}**:\n{value}")
 
-        context = "\n\n".join(relevant_sections) if relevant_sections else str(summary)[:3000]
+        context = "\n\n".join(relevant_sections) if relevant_sections else _clip(summary, 3000)
 
         # Generate optimization suggestion using LLM
         llm = ChatOpenAI(
@@ -377,7 +575,7 @@ async def analyze_cost_reduction() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -398,7 +596,7 @@ async def analyze_cost_reduction() -> str:
         analysis_prompt = f"""Analyze this project report and identify cost reduction opportunities.
 
 REPORT CONTENT:
-{str(report_content)[:6000]}
+{_clip(report_content, 6000)}
 
 Identify 3-5 specific cost reduction opportunities. For each, provide:
 1. The current recommendation and estimated cost impact
@@ -435,7 +633,7 @@ async def analyze_timeline_acceleration() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -456,7 +654,7 @@ async def analyze_timeline_acceleration() -> str:
         analysis_prompt = f"""Analyze this project report and identify timeline acceleration opportunities.
 
 REPORT CONTENT:
-{str(report_content)[:6000]}
+{_clip(report_content, 6000)}
 
 Identify 3-5 specific ways to accelerate the project timeline. For each, provide:
 1. The current timeline element or phase
@@ -504,7 +702,7 @@ async def prepare_client_meeting_brief(focus_areas: str = None) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -602,7 +800,7 @@ async def prepare_executive_summary(include_recommendation: bool = True) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -628,7 +826,7 @@ async def prepare_executive_summary(include_recommendation: bool = True) -> str:
         exec_prompt = f"""Create an executive decision brief based on this project analysis.
 
 REPORT CONTENT (for estimates and details):
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 STRUCTURED DATA:
 - Critical Assumptions: {json.dumps(critical_assumptions)}
@@ -683,7 +881,7 @@ async def get_technical_deep_dive(component: str = None) -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -710,7 +908,7 @@ async def get_technical_deep_dive(component: str = None) -> str:
         tech_prompt = f"""Create a technical deep-dive analysis for a Solution Architect.
 
 REPORT CONTENT:
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 ARCHITECTURE DATA:
 - Recommended: {json.dumps(recommended_arch)}
@@ -769,7 +967,7 @@ async def get_implementation_gotchas() -> str:
     from config import settings
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -805,7 +1003,7 @@ async def get_implementation_gotchas() -> str:
         gotcha_prompt = f"""Create a developer onboarding brief with implementation gotchas.
 
 REPORT CONTENT:
-{str(report_content)[:8000]}
+{_clip(report_content, 8000)}
 
 STRUCTURED DATA:
 - Assumptions (may affect implementation): {json.dumps(critical_assumptions)}
@@ -884,7 +1082,7 @@ async def get_project_blind_spots() -> str:
             pass
 
         # Also get from main report
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report and not presales_data:
             return json.dumps({
@@ -940,7 +1138,7 @@ async def get_project_insights(insight_type: str) -> str:
         })
 
     try:
-        report = await get_summary_report(tool_context.chat_history_id, tool_context.db)
+        report = await _load_report()
 
         if not report or not report.summary_report:
             return json.dumps({
@@ -1069,6 +1267,7 @@ async def detect_conflicts() -> str:
     """
     from database_scripts import get_pending_changes as db_get_pending
     from database_scripts import detect_conflicts as db_detect_conflicts
+    from starlette.concurrency import run_in_threadpool
 
     try:
         # Get pending changes first
@@ -1081,8 +1280,9 @@ async def detect_conflicts() -> str:
                 "conflicts": []
             })
 
-        # detect_conflicts is sync and takes the list
-        conflicts = db_detect_conflicts(changes)
+        # detect_conflicts is sync and takes the list — run off the event loop so
+        # it can't block other concurrent streams.
+        conflicts = await run_in_threadpool(db_detect_conflicts, changes)
 
         if not conflicts:
             return json.dumps({
@@ -1122,6 +1322,13 @@ async def get_report_versions(limit: int = 10) -> str:
                 "versions": []
             })
 
+        # The active/current version is the one flagged default (get_summary_report's
+        # source of truth), NOT the newest — surface it explicitly so the model never
+        # infers "current" from list order (versions come back newest-first).
+        active_version = next((v.get("version") for v in versions if v.get("is_default")), None)
+        if active_version is None and versions:
+            active_version = versions[0].get("version")  # legacy: no default flagged → newest
+
         # Limit and simplify version info with changelog data
         limited_versions = versions[:limit]
         simplified = []
@@ -1130,6 +1337,8 @@ async def get_report_versions(limit: int = 10) -> str:
                 "version_id": v.get("version_id") or v.get("id"),
                 "version_number": v.get("version"),
                 "created_at": str(v.get("created_at", "")),
+                "is_default": bool(v.get("is_default")),
+                "is_latest": bool(v.get("is_latest")),
                 "has_pending_changes": bool(v.get("pending_changes")),
                 # Changelog tracking fields
                 "changelog_summary": v.get("changelog_summary") or ("Initial report generation" if v.get("version") == 1 else "No changelog available"),
@@ -1139,6 +1348,8 @@ async def get_report_versions(limit: int = 10) -> str:
 
         return json.dumps({
             "status": "success",
+            "active_version": active_version,
+            "active_version_note": "active_version is the current/default version (is_default=true), NOT necessarily the newest.",
             "versions": simplified,
             "total_count": len(versions)
         })
@@ -1147,23 +1358,68 @@ async def get_report_versions(limit: int = 10) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _compare_section(section: str, va: int, rec_a: dict, vb: int, rec_b: dict) -> dict:
+    """Pull `section` (or its diagrams) from each version's markdown as labeled,
+    clipped blocks so the agent can render them side by side. Diagrams come back as
+    verbatim fences (the chat renders mermaid); prose comes back as raw markdown."""
+    from utils.report_sections import parse_sections, find_section, extract_diagrams
+
+    s_low = (section or "").lower()
+    want_diagram = any(k in s_low for k in ("diagram", "mermaid", "flow", "sequence", "deployment", "component"))
+
+    def _grab(rec: dict) -> str:
+        md = rec.get("report_content") or ""
+        if not isinstance(md, str) or not md:
+            return ""
+        if want_diagram:
+            diags = extract_diagrams(md)
+            if "architect" in s_low:
+                arch = [d for d in diags if "architect" in (d.get("heading") or "").lower()]
+                diags = arch or diags
+            if diags:
+                return "\n\n".join(d["code"] for d in diags)
+        sec = find_section(parse_sections(md), section)
+        if sec:
+            return sec.raw_markdown
+        diags = extract_diagrams(md)  # fall back to a diagram if the named section is absent
+        return diags[0]["code"] if diags else ""
+
+    return {
+        "section": section,
+        "version_a": {"version": va, "markdown": _clip(_grab(rec_a), 4000)},
+        "version_b": {"version": vb, "markdown": _clip(_grab(rec_b), 4000)},
+        "render_hint": (
+            f"Include both markdown blocks verbatim, labeled 'v{va}' and 'v{vb}', so any "
+            "diagrams render. Then explain what changed between them."
+        ),
+    }
+
+
 @tool
 async def compare_report_versions(
     version_a: int,
     version_b: int = None,
-    include_content: bool = False
+    include_content: bool = False,
+    section: str = None,
 ) -> str:
     """
     Compare two report versions to understand what changed between them.
-    Use when user asks about differences between versions, how architecture evolved,
-    or wants to understand why certain decisions changed.
+    Use when the user asks about differences between versions, how the architecture
+    evolved, or why decisions changed. The result carries a `decision_delta` (cost,
+    timeline, tech swaps, verdict) computed deterministically — present those numbers,
+    do not invent your own.
 
     Args:
         version_a: First version number to compare
         version_b: Second version number (defaults to latest if not provided)
         include_content: If True, includes full executive summaries. If False, just changelog info.
+        section: Optional section or diagram to drill into (e.g. "architecture diagram",
+            "tech_stack", "timeline", "cost", "risks"). When set, the SAME section is pulled
+            from BOTH versions as labeled markdown so the chat renders them side by side
+            (diagrams render). Use this for "diff the architecture diagram from v1 to v3".
     """
     from database_scripts import get_report_version_by_number, get_report_diff, get_all_report_versions
+    from utils.version_compare import compute_contract_delta
 
     try:
         chat_history_id = tool_context.chat_history_id
@@ -1231,6 +1487,19 @@ async def compare_report_versions(
             "diff_stats": diff_stats
         }
 
+        # Typed decision delta — cost / timeline / tech swaps / verdict, computed not
+        # narrated. None when neither version carries a contract (legacy rows).
+        comparison["decision_delta"] = compute_contract_delta(
+            ver_a_record.get("report_contract"),
+            ver_b_record.get("report_contract"),
+        )
+
+        # Section / diagram drill-in: same section from both versions, side by side.
+        if section:
+            comparison["section_comparison"] = _compare_section(
+                section, version_a, ver_a_record, version_b, ver_b_record
+            )
+
         # Include executive summaries if requested
         if include_content:
             summary_a = ver_a_record.get("summary_report", {})
@@ -1250,7 +1519,118 @@ async def compare_report_versions(
         return json.dumps({"status": "error", "message": str(e)})
 
 
+@tool
+async def rank_versions(metric: str = None, versions: str = None) -> str:
+    """
+    Compare report versions across cost, timeline, and verdict — over ALL versions or a
+    chosen subset. Use for "which version is cheapest / fastest?", "compare cost across
+    v1 and v3", "which has the best go/no-go verdict?".
+
+    Numbers are computed deterministically from each version's stored decisions; cite each
+    figure with its version (e.g. "v2: $241K"). Do not compute totals yourself.
+
+    Args:
+        metric: One of "cost", "timeline", or "verdict" to rank by (cheapest / fastest /
+            most favorable first). Omit to just return the metric matrix for the versions.
+        versions: Optional comma-separated subset, e.g. "1,3,4". Omit for all versions.
+    """
+    from utils.version_compare import version_metrics, rank_metrics
+
+    try:
+        subset = None
+        if versions:
+            try:
+                subset = [int(x) for x in str(versions).replace(" ", "").split(",") if x]
+            except Exception:
+                subset = None
+
+        metrics = await version_metrics(tool_context.chat_history_id, tool_context.db, subset)
+        if not metrics:
+            return json.dumps({"status": "error", "message": "No report versions found."})
+
+        priced = [m for m in metrics if m.get("has_contract")]
+        payload = {
+            "status": "success",
+            "metrics": metrics,
+            "versions_with_metrics": [m["version"] for m in priced],
+            "note": "All figures are computed from stored decisions. Cite each with its version (e.g. 'v2: $241K').",
+        }
+
+        if metric:
+            ranked = rank_metrics(metrics, metric)
+            if not ranked:
+                payload["ranking_error"] = (
+                    f"Could not rank by '{metric}'. Use cost, timeline, or verdict; note that "
+                    "versions without computed decisions (legacy) are excluded from ranking."
+                )
+            else:
+                payload["ranked_by"] = metric.lower()
+                payload["ranking"] = [m["version"] for m in ranked]
+                payload["best"] = ranked[0]["version"]
+        return json.dumps(payload)
+    except Exception as e:
+        logger.error(f"Error in rank_versions tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
 # ============= WRITE TOOLS =============
+
+
+@tool
+async def synthesize_version(instructions: str, source_versions: str = None) -> str:
+    """
+    Build a NEW unified version by merging the best of existing versions — e.g. "take v2's
+    datastore and v3's timeline". This does NOT rewrite the report directly: it QUEUES the
+    merge as a reviewable pending change (citing its source versions), then the user reviews
+    it in the Changes panel and clicks Regenerate to produce the new version.
+
+    Use when the user wants a single report combining strengths of multiple versions to show
+    a client. After queueing, tell the user it's queued and to review + Regenerate.
+
+    Args:
+        instructions: What to merge, in the user's words (e.g. "use v2's PostgreSQL datastore
+            but keep v3's 19-week phased timeline").
+        source_versions: Optional comma-separated versions the merge draws from, e.g. "2,3".
+    """
+    from database_scripts import add_pending_change as db_add_change, record_transaction
+
+    try:
+        srcs = ""
+        if source_versions:
+            nums = [x for x in str(source_versions).replace(" ", "").split(",") if x]
+            if nums:
+                srcs = " (source versions: " + ", ".join(f"v{n}" for n in nums) + ")"
+
+        request = f"Unify versions{srcs}: {instructions}"
+        change_data = {
+            "user_request": request,
+            "target_section": "general",
+            "type": "synthesize_versions",
+            "change_type": "modify",
+            "source_versions": source_versions or "",
+        }
+        result = await db_add_change(tool_context.chat_history_id, change_data, tool_context.db)
+
+        if result.get("status") == "success":
+            await record_transaction(
+                chat_history_id=tool_context.chat_history_id,
+                action_type="synthesize_version",
+                action_data={
+                    "change_id": result.get("change_id"),
+                    "instructions": instructions,
+                    "source_versions": source_versions,
+                },
+                description=f"Queued merge {result.get('change_id')}: {instructions[:50]}...",
+                db=tool_context.db,
+            )
+            result["next_step"] = (
+                "Queued as a pending change. Open the Changes panel to review, then Regenerate "
+                "to produce the unified version. Nothing is overwritten until you Regenerate."
+            )
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error in synthesize_version tool: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
 
 @tool
 async def add_pending_change(
@@ -1568,8 +1948,7 @@ async def regenerate_report(include_changes: bool = True) -> str:
     )
     from agents.agentic_workflow import run_pipeline_with_constraints, main_report_summary, generate_changelog_summary
     from utils.router_llm import generate_conflict_resolution
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
     import time
 
@@ -1625,169 +2004,32 @@ async def regenerate_report(include_changes: bool = True) -> str:
                     "action": "resolve_conflicts"
                 })
 
-        # Step 3: GET FULL REGENERATION CONTEXT (document, presales data, Q&A, etc.)
+        # Step 3+: kick off the SAME async pipeline the changes-queue button and the
+        # REST /report/regenerate endpoint use (the contract pipeline when
+        # USE_CONTRACT_PIPELINE=true). The old path ran the legacy 9-agent
+        # run_pipeline_with_constraints inline here — that's the bug being fixed.
+        # Async, so we return "started"; the new version persists when the run finishes.
         try:
-            regen_context = await get_regeneration_context(chat_history_id, user_id, db)
-        except Exception as e:
-            logger.error(f"Failed to get regeneration context: {str(e)}")
+            from fastapi import HTTPException
+            from agents.pipeline_runner import kickoff_regeneration
+            run = await kickoff_regeneration(chat_history_id, user_id, db)
+            n = len(pending_changes)
             return json.dumps({
-                "status": "error",
-                "message": "Could not retrieve the necessary context for regeneration. Please try again.",
-                "action": "context_error"
+                "status": "started",
+                "action": "regeneration_started",
+                "run_id": run.get("run_id"),
+                "changes_applied": n,
+                "message": (
+                    f"**Regeneration started** — applying {n} change(s) through the full pipeline. "
+                    "This takes a couple of minutes; track progress in the pipeline view and the new "
+                    "version will appear when it's ready."
+                ),
             })
-
-        # Step 4: RUN FULL 9-AGENT PIPELINE WITH CONSTRAINTS
-        try:
-            # Document needs to be in list format for pipeline
-            document_chunks = [regen_context.get("document_text", "")]
-
-            # Build presales context dict with all available data
-            presales_context = {
-                "scanned_requirements": regen_context.get("scanned_requirements"),
-                "blind_spots": regen_context.get("blind_spots"),
-                "assumptions_list": regen_context.get("assumptions_list", []),
-                "questions_and_answers": regen_context.get("questions_and_answers", []),
-                "additional_context": regen_context.get("additional_context", ""),
-                "user_answers": regen_context.get("user_answers", {})
-            }
-
-            logger.info(
-                f"Starting regeneration for chat_history_id: {chat_history_id} with "
-                f"{len(pending_changes)} changes, {len(presales_context.get('questions_and_answers', []))} Q&A pairs"
-            )
-
-            result = await run_pipeline_with_constraints(
-                document=document_chunks,
-                pending_changes=pending_changes,
-                presales_context=presales_context,
-                timeout=settings.PIPELINE_TIMEOUT or 600  # 10 min for full pipeline
-            )
-
-            if result.get("error"):
-                raise Exception(result["error"])
-
-            regenerated_report = result["report"]
-            processing_time = result.get("processing_time", time.time() - start_time)
-            logger.info(f"Full pipeline completed in {processing_time:.2f}s with {len(pending_changes)} constraints")
-
+        except HTTPException as he:
+            return json.dumps({"status": "error", "action": "regen_error", "message": f"Couldn't start regeneration: {he.detail}"})
         except Exception as e:
-            logger.error(f"Report generation failed: {str(e)}")
-            return json.dumps({
-                "status": "error",
-                "message": f"Report generation encountered an error: {str(e)}\n\nPlease try again. If the problem persists, try removing some pending changes and regenerating.",
-                "action": "pipeline_error"
-            })
-
-        # Step 5: GENERATE REPORT SUMMARY
-        try:
-            new_version_number = regen_context.get("current_version", 0) + 1
-            summary_report = await main_report_summary(regenerated_report, new_version_number)
-        except Exception as e:
-            logger.error(f"Failed to generate report summary: {str(e)}")
-            summary_report = {"version": f"v{new_version_number}", "error": "Summary generation failed"}
-
-        # Step 5.5: GENERATE CHANGELOG SUMMARY
-        changelog_summary = None
-        parent_version_id = None
-        try:
-            # Get previous version's summary for comparison
-            previous_summary = regen_context.get("previous_summary", {})
-            parent_version_id = regen_context.get("previous_version_id")
-            previous_version_number = regen_context.get("current_version", 0)
-
-            if previous_summary:
-                previous_exec_summary = previous_summary.get("executive_summary", "") if isinstance(previous_summary, dict) else str(previous_summary)
-                new_exec_summary = summary_report.get("executive_summary", "") if isinstance(summary_report, dict) else str(summary_report)
-
-                changelog_summary = await generate_changelog_summary(
-                    previous_summary=previous_exec_summary,
-                    new_summary=new_exec_summary,
-                    changes_applied=pending_changes,
-                    previous_version=previous_version_number,
-                    new_version=new_version_number
-                )
-                logger.info(f"Generated changelog summary for v{previous_version_number} -> v{new_version_number}")
-            else:
-                changelog_summary = f"Version {new_version_number} created with {len(pending_changes)} change(s) applied."
-        except Exception as e:
-            logger.warning(f"Failed to generate changelog summary (non-fatal): {str(e)}")
-            changelog_summary = f"Version {new_version_number} created with {len(pending_changes)} change(s) applied."
-
-        # Step 6: CREATE NEW REPORT VERSION IN DB
-        try:
-            version_result = await create_new_report_version(
-                chat_history_id=chat_history_id,
-                user_id=user_id,
-                report_content=regenerated_report,
-                summary_report=summary_report,
-                changes_applied=pending_changes,
-                db=db,
-                changelog_summary=changelog_summary,
-                parent_version_id=parent_version_id
-            )
-            new_version = version_result.get("version_number", new_version_number)
-        except Exception as e:
-            logger.error(f"Failed to create new report version: {str(e)}")
-            return json.dumps({
-                "status": "partial_success",
-                "message": f"Report was generated but couldn't be saved: {str(e)}\n\nPlease try again.",
-                "action": "save_error",
-                "report_content": regenerated_report  # Include report even if save failed
-            })
-
-        # Step 7: UPDATE VECTOR DB (non-fatal if fails)
-        try:
-            report_chunks = await chunk_text(regenerated_report, chunk_size=1000, chunk_overlap=200)
-            await create_embeddings(
-                texts=report_chunks,
-                model=settings.EMBEDDING_MODEL,
-                chat_history_id=chat_history_id
-            )
-            logger.info(f"Updated vector DB with {len(report_chunks)} chunks")
-        except Exception as e:
-            logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
-
-        # Step 8: CLEAR PENDING CHANGES (non-fatal if fails)
-        try:
-            await clear_pending_changes(chat_history_id, db)
-            logger.info(f"Cleared {len(pending_changes)} pending changes after regeneration")
-        except Exception as e:
-            logger.warning(f"Failed to clear pending changes (non-fatal): {str(e)}")
-
-        # Step 9: RECORD TRANSACTION
-        try:
-            await record_transaction(
-                chat_history_id=chat_history_id,
-                action_type="regenerate_report",
-                action_data={
-                    "changes_applied": len(pending_changes),
-                    "new_version": new_version,
-                    "processing_time": processing_time
-                },
-                description=f"Regenerated report v{new_version} with {len(pending_changes)} changes",
-                db=db
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record transaction (non-fatal): {str(e)}")
-
-        # Step 10: BUILD SUCCESS RESPONSE
-        changes_summary = "\n".join([
-            f"- {c.get('id', 'CHG-?')}: {c.get('user_request', '')[:60]}..."
-            for c in pending_changes[:5]
-        ])
-        if len(pending_changes) > 5:
-            changes_summary += f"\n- ... and {len(pending_changes) - 5} more"
-
-        return json.dumps({
-            "status": "success",
-            "message": f"**Report Regenerated Successfully** (Version {new_version})\n\nApplied {len(pending_changes)} change(s):\n{changes_summary}\n\nThe report has been updated with all your requested modifications.",
-            "action": "report_regenerated",
-            "version_number": new_version,
-            "changes_applied": len(pending_changes),
-            "processing_time": f"{processing_time:.1f} seconds",
-            "report_content": regenerated_report,
-            "summary": summary_report.get("executive_summary", "")[:500] if isinstance(summary_report, dict) else ""
-        })
+            logger.error(f"Failed to start regeneration: {str(e)}")
+            return json.dumps({"status": "error", "action": "regen_error", "message": f"Could not start regeneration: {str(e)}"})
 
     except Exception as e:
         logger.error(f"Unexpected error in regenerate_report: {str(e)}")
@@ -1815,8 +2057,7 @@ async def rollback_report(version_number: int) -> str:
         set_default_version,
         record_transaction
     )
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
 
     try:
@@ -1856,20 +2097,14 @@ async def rollback_report(version_number: int) -> str:
         # This deletes existing embeddings and creates new ones
         try:
             if report_content:
-                # Chunk the report content
-                report_chunks = await chunk_text(
-                    text=report_content,
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-
-                # Create embeddings (this deletes old embeddings first)
-                await create_embeddings(
-                    texts=report_chunks,
+                _invalidate_report_cache()  # rolled-back version is now default
+                # Section-aware embed (deletes old embeddings first)
+                await embed_report(
+                    markdown=report_content,
                     model=settings.EMBEDDING_MODEL,
-                    chat_history_id=tool_context.chat_history_id
+                    chat_history_id=tool_context.chat_history_id,
                 )
-                logger.info(f"Updated vector DB with {len(report_chunks)} chunks for rollback")
+                logger.info("Updated vector DB (section-aware) for rollback")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1918,8 +2153,7 @@ async def set_default_report(version_number: int) -> str:
         version_number: The version number to set as default
     """
     from database_scripts import set_default_version, get_report_version_by_number
-    from vectordb.chunking import chunk_text
-    from vectordb.vector_db import create_embeddings
+    from vectordb.vector_db import embed_report
     from config import settings
 
     try:
@@ -1951,17 +2185,13 @@ async def set_default_report(version_number: int) -> str:
 
             # Step 3: Update vector DB with new default's content
             if report_content:
-                report_chunks = await chunk_text(
-                    text=report_content,
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-                await create_embeddings(
-                    texts=report_chunks,
+                _invalidate_report_cache()  # default switched — serve fresh
+                await embed_report(
+                    markdown=report_content,
                     model=settings.EMBEDDING_MODEL,
-                    chat_history_id=tool_context.chat_history_id
+                    chat_history_id=tool_context.chat_history_id,
                 )
-                logger.info(f"Updated vector DB for new default version {version_number}")
+                logger.info(f"Updated vector DB (section-aware) for new default version {version_number}")
         except Exception as e:
             logger.warning(f"Failed to update vector DB (non-fatal): {str(e)}")
 
@@ -1989,12 +2219,25 @@ def get_all_tools() -> list:
         get_pending_changes,
         search_document,
         get_report_section,
+        get_diagrams,            # deterministic diagram retrieval (renders in chat)
+        list_report_sections,    # report table-of-contents / navigation
         search_report_section,
         get_risks_and_mitigations,
         find_duplicate_changes,
         detect_conflicts,
         get_report_versions,
         compare_report_versions,
+        rank_versions,           # cross-version cost/timeline/verdict ranking (all or a subset)
+        # Firm delivery history (grounds estimates/architecture in past projects)
+        firm_project_search,
+        # Delivery handoff — turn the report into Jira tickets
+        push_to_jira,
+        # Live advisor tools — on-demand web research, the typed gap picture,
+        # and instant deterministic what-if estimates
+        research_live,
+        deep_research,
+        get_reality_gap,
+        whatif_estimate,
         # Optimization & Analysis tools
         suggest_optimization,
         analyze_cost_reduction,
@@ -2013,6 +2256,7 @@ def get_all_tools() -> list:
         clear_all_pending_changes,
         merge_pending_changes,
         update_pending_change,
+        synthesize_version,      # merge best-of versions into a queued change -> regenerate
         # Report tools
         regenerate_report,
         rollback_report,
@@ -2021,7 +2265,7 @@ def get_all_tools() -> list:
 
 
 # System prompt for tool-enabled chat
-TOOL_SYSTEM_PROMPT = """You are ALIGN IQ, an expert AI assistant for project analysis and technical consulting. You help users understand, refine, and improve their project analysis reports.
+TOOL_SYSTEM_PROMPT = """You are ALIGN IQ, a LIVE solution architect for this engagement — not a report-lookup bot. The report is your starting brief; you can research the current real world, read the engagement's typed decision model, recompute estimates deterministically, and evolve the report through the change queue. Every conversation should leave the engagement sharper than it found it.
 
 ## Your Role
 
@@ -2069,13 +2313,27 @@ When answering ANY question, automatically include relevant:
 
 ## Your Capabilities
 
+### Live Advisor Tools (what makes you an architect, not a search box)
+- **research_live(query, focus)**: QUICK web research (one search). Use for a fast fact-check — a tool capability, current pricing, a single known issue. Cite ONLY the returned urls as [title](url) links — NEVER invent a link. If results are thin, say so.
+- **deep_research(topic, angle)**: THOROUGH multi-round research (1-2 min): searches, reads the key pages in full, follows up, returns a typed dossier — sourced findings with verbatim quotes, prior art (who tried this, what happened), existing libraries/tools, honest gaps. Use when the user says "research X (deeply)", "has anyone done X", "what libraries/options exist for X", or when one search clearly won't cut it. angle weights the pass: prior_art | libraries | limits | benchmarks. Tell the user it takes a minute or two before calling it.
+- **get_reality_gap()**: The engagement's typed gap picture — problem profile, core challenge, what the client's brief understates (quote-anchored underplay flags), every assumption, open questions, staffing gaps, verdict conditions, and the pipeline's own confidence notes. Read it before any advisory answer about risk, scope, confidence, or "what could go wrong".
+- **whatif_estimate(apply_conditions, hours_delta_pct, contingency_pct_override)**: Instant, deterministic estimate scenarios computed in Python from the typed cost model — "what if Salesforce is in scope?" / "worst case?" / "+20% effort?" — WITHOUT a regeneration. NEVER do estimate arithmetic yourself; call this and quote its numbers.
+
+**THE ADVISOR LOOP (your defining behavior):** when research or conversation surfaces something material — a risk, a disproven assumption, a better option, a resolved open question — do not let it die in chat. Say what it changes, then OFFER to queue it with add_pending_change so the next regeneration bakes it into the plan of record. An insight that never reaches the report is a dropped requirement.
+
 ### Document & Report Tools
 - **search_document(query)**: Search the uploaded document and report for specific content using semantic search
 - **search_report_section(query, section)**: Search within a specific report section for detailed information
 - **get_report_section(section)**: Retrieve report sections (executive_summary, tech_stack, team_structure, timeline, risks, recommendations, full_report)
 - **get_risks_and_mitigations()**: Get all identified risks with their mitigation strategies
-- **get_report_versions()**: View report version history with changelog summaries showing what changed
-- **compare_report_versions(version_a, version_b)**: Compare two versions to see detailed differences, changes applied, and implications
+- **get_report_versions()**: View report version history with changelog summaries showing what changed. Its response includes `active_version` — the current/default version (the one with `is_default=true`) that the chat answers from; use this to answer "which version is active/current/default" (do NOT assume the highest-numbered/newest version is active)
+- **compare_report_versions(version_a, version_b, section=None)**: Compare two versions. Returns a computed `decision_delta` (cost / timeline / tech swaps / verdict). Pass `section` (e.g. "architecture diagram", "cost", "timeline") to pull that section from BOTH versions side by side — include the returned markdown blocks verbatim so diagrams render.
+- **rank_versions(metric, versions=None)**: Rank versions by "cost", "timeline", or "verdict" across ALL versions or a subset like "1,3". Use for "which version is cheapest / fastest?".
+- **synthesize_version(instructions, source_versions)**: Merge the best of multiple versions into a NEW unified version — queues a reviewable pending change, then the user Regenerates.
+
+**CROSS-VERSION RULE:** never compute cost/timeline numbers yourself. Call `rank_versions` / `compare_report_versions` and cite every figure with its source version (e.g. "v2: $241K").
+
+**ACTIVE-VERSION RULE:** the current / active / default version is the one flagged `is_default` — surfaced as `active_version` by `get_report_versions` and named in CURRENT REPORT above — NOT necessarily the newest. When the user asks which version is current/active/default, answer with that one; never assume the highest-numbered version is active.
 
 ### Optimization & Analysis Tools
 - **suggest_optimization(constraint_type, details)**: Generate optimization suggestions based on user constraints (budget, timeline, resource, scope)
@@ -2124,12 +2382,13 @@ Examples:
 - User: "What about Redis?" → Search document for Redis mentions, then answer based on context
 
 ### 3. Handle Visual/Diagram Requests
-When users ask for diagrams or visual representations:
-- Acknowledge that visual diagram generation isn't available in chat
-- Offer text-based alternatives (ASCII diagrams, structured descriptions, component lists)
-- Suggest they can find diagrams in the full report if applicable
-
-Example response: "I can't generate visual diagrams directly, but I can describe the architecture in detail. The system follows a 3-tier architecture: [detailed description]. Would you like me to format this as a component breakdown you can use to create a diagram?"
+The report contains real, renderable diagrams (mermaid/ASCII), and THIS CHAT
+RENDERS THEM. When users ask to see/show/explain a diagram, the architecture
+diagram, a flowchart, sequence/ER diagram, etc.:
+- ALWAYS call `get_diagrams` (optionally filtered by kind) to fetch the actual diagram(s).
+- Return each diagram's `code` field VERBATIM, keeping the ```mermaid (or ```ascii) fences intact, so it renders. Do NOT paraphrase a diagram into prose when one exists.
+- Label each diagram with its `heading`, then add any explanation the user asked for below it.
+- Only if `get_diagrams` returns empty should you describe the architecture in text (and say no diagram exists in the report).
 
 ### 4. Change Management Best Practices
 - Always reference changes by ID (CHG-001, CHG-002)
@@ -2274,12 +2533,26 @@ Response: [Uses get_implementation_gotchas()]
 
 Want me to generate acceptance criteria for any specific requirement?"
 
+## Tool Selection Policy (how to retrieve — in priority order)
+
+The report is a structured document and is the source of truth. Retrieve from it
+STRUCTURALLY before falling back to fuzzy search:
+1. **Diagrams** → `get_diagrams` (returns the actual renderable fences — never describe instead).
+2. **A named section** ("show me the tech stack / timeline / risks") → `get_report_section` (returns the verbatim section). Use `list_report_sections` first if unsure what exists.
+3. **Cross-cutting synthesis** ("is this feasible given the timeline and team?") → pull the relevant sections with `get_report_section` (or `full_report`) and reason over them.
+4. **Needle / fuzzy lookup** ("where does it mention HIPAA?") → `search_document` / `search_report_section` (semantic fallback).
+5. **Firm delivery history** (past-project evidence for estimates/architecture) → `firm_project_search`.
+
+Always cite the section heading you answered from. Prefer verbatim report text
+over paraphrase for factual asks.
+
 ## CRITICAL: Report-Only Answers
 
 You MUST answer questions ONLY using information from:
-1. The generated report (via get_report_section or search_document)
+1. The generated report (via get_report_section, get_diagrams, list_report_sections, or search_document)
 2. The uploaded document (via search_document)
 3. Pending changes and version history
+4. The firm's past projects (via firm_project_search), clearly attributed as past-project evidence
 
 You MUST NOT:
 - Use general knowledge to answer questions about the project
@@ -2349,3 +2622,423 @@ After providing any optimization suggestion, ask:
 4. **Be Honest**: If you don't know or can't do something, say so clearly
 5. **Report-Grounded**: Always retrieve from report/document before answering project questions
 """
+
+
+# ============= FIRM CONTEXT TOOLS (Bet 3) =============
+
+@tool
+async def firm_project_search(query: str, max_results: int = 3) -> str:
+    """
+    Search this firm's past delivered projects for evidence relevant to the
+    current engagement. Use this to ground architecture choices and effort
+    estimates in the firm's actual delivery history (effort variance,
+    technology trade-offs, retrospective lessons). Prefer focused queries
+    such as "real-time chat scaling lessons" or "Azure HIPAA compliance gaps"
+    over generic vendor names.
+
+    Args:
+        query: Natural-language search query against past-project briefs,
+               final reports, and retrospectives.
+        max_results: Maximum number of matching project chunks to return
+                     (default 3, capped at 5).
+
+    Returns: JSON string with {"hits": [...]} where each hit has project_id,
+    project_name, engagement_type, snippet, score. Empty list means no
+    relevant past projects in the firm's portfolio.
+    """
+    firm_id = get_firm_id_context()
+    if not firm_id:
+        return json.dumps({"hits": [], "note": "no firm context bound"})
+    try:
+        from vectordb.firm_projects import search_firm_projects
+        hits = await search_firm_projects(firm_id, query, k=min(max_results, 5))
+        return json.dumps({"hits": hits})
+    except Exception as e:
+        logger.warning(f"firm_project_search failed: {e}")
+        return json.dumps({"hits": [], "error": str(e)})
+
+
+@tool
+async def push_to_jira(scope: str = "risks", project_key: str = None) -> str:
+    """
+    Push the report's risks or sections to Jira as an epic + child stories — the
+    report -> delivery handoff. Use when the user wants to turn the analysis into
+    actionable Jira tickets. If project_key is omitted, this returns the available
+    Jira projects so you can ask the user which one to use, then call again with
+    the chosen key.
+
+    Args:
+        scope: 'risks' (export the risk register) or 'sections' (export report sections as stories).
+        project_key: Target Jira project key (e.g. 'PROJ'). Omit to list projects first.
+    """
+    token = getattr(tool_context, "jira_token", None)
+    if not token:
+        return json.dumps({
+            "status": "not_connected",
+            "message": "Jira isn't connected. Tell the user to connect Jira in Settings, then retry.",
+        })
+    try:
+        from utils.integrations import Integrations
+        from utils.report_sections import report_delivery_items
+
+        integ = Integrations(token)
+        if not project_key:
+            projects = integ.get_projects()
+            return json.dumps({
+                "status": "need_project",
+                "message": "Ask the user which Jira project to push to (give the project key).",
+                "projects": projects,
+            })
+
+        report = await _load_report()
+        if not report or not getattr(report, "report_content", None):
+            return json.dumps({"status": "error", "message": "No report found yet."})
+        summary = report.summary_report if isinstance(getattr(report, "summary_report", None), dict) else {}
+        project_title = summary.get("project_summary") or summary.get("title") or "GroundedIQ Project"
+        markdown = _report_markdown(report)
+
+        exec_summary, items = report_delivery_items(markdown, summary, scope=scope)
+        if not items:
+            return json.dumps({"status": "empty", "message": f"Nothing to push for scope '{scope}'."})
+
+        labels = ["groundediq"]
+        epic = integ.create_epic(project_key, f"{project_title} — GroundedIQ"[:250], exec_summary, labels=labels)
+        epic_key = epic.get("key")
+        issue_keys = []
+        for it in items[:50]:
+            created = integ.create_issue(
+                project_key, it["summary"], it["description"],
+                issue_type="Task", parent_key=epic_key, labels=labels,
+            )
+            if created.get("key"):
+                issue_keys.append(created["key"])
+
+        return json.dumps({
+            "status": "success", "epic_key": epic_key, "issue_keys": issue_keys,
+            "count": len(issue_keys), "scope": scope,
+        })
+    except Exception as e:
+        logger.warning(f"push_to_jira failed: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# ============= LIVE ADVISOR TOOLS =============
+# The pipeline researches once at generation time; these make the CHAT a live
+# solution architect: on-demand web research with real sources, the typed
+# reality-gap/assumption picture, and instant deterministic what-if estimates
+# (no 3-minute regen for "what if Salesforce is in scope?").
+
+
+def _contract_dict() -> Optional[dict]:
+    """The active version's report_contract as a plain dict, or None.
+
+    Stored as JSON (never a ReportContract instance); legacy rows are None.
+    Callers must read keys defensively."""
+    report = tool_context._report
+    contract = getattr(report, "report_contract", None) if report else None
+    return contract if isinstance(contract, dict) else None
+
+
+@tool
+async def research_live(query: str, focus: str = "general", max_results: int = 5) -> str:
+    """Run LIVE web research (real internet search) to ground an answer in current
+    sources — use whenever the user asks for research, evidence, benchmarks,
+    current capabilities/pricing of a tool, or whether a claim in the report
+    still holds.
+
+    Args:
+        query: What to research. Name actual technologies/versions ("LangGraph production failure modes"), not vague topics.
+        focus: 'general' | 'known_issues' (production gotchas for a tech/integration) | 'benchmarks' (comparable project costs/efforts/case studies).
+        max_results: How many sources to fetch (default 5, max 8).
+
+    Returns findings with REAL urls. CITE ONLY THESE URLS — never invent or
+    embellish a link. If findings are thin, say so plainly instead of padding.
+    """
+    from config import settings
+    from utils.web_research import tavily_search
+
+    if not settings.TAVILY_API_KEY:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "Live research is not configured (no TAVILY_API_KEY). Answer from the report and your expertise, and label unverified claims as assumptions.",
+        })
+
+    q = (query or "").strip()
+    if not q:
+        return json.dumps({"status": "error", "message": "Empty query."})
+    shaped = {
+        "known_issues": f"{q} known issues production gotchas pitfalls",
+        "benchmarks": f"{q} cost effort benchmark case study real-world",
+    }.get(focus, q)
+
+    results = await tavily_search(shaped, max_results=min(max(int(max_results or 5), 1), 8))
+    if not results:
+        return json.dumps({
+            "status": "no_results",
+            "message": "Search returned nothing usable. Say so honestly; do not fabricate sources.",
+            "query": shaped,
+        })
+
+    findings = [
+        {"title": r["title"], "url": r["url"], "snippet": (r.get("content") or "")[:600]}
+        for r in results
+    ]
+    return json.dumps({
+        "status": "success",
+        "query": shaped,
+        "findings": findings,
+        "instructions": (
+            "Synthesize an answer citing these urls as [title](url) markdown links — only these urls. "
+            "If a finding materially affects the report (a risk, a capability limit, a better option), "
+            "say so and OFFER to queue it via add_pending_change so the report can evolve."
+        ),
+    })
+
+
+@tool
+async def deep_research(topic: str, angle: str = "general") -> str:
+    """THOROUGH multi-round web research on a topic (the same iterative engine
+    that grounds report generation): searches, reads the most load-bearing pages
+    in full, follows up, and returns a typed dossier — findings with verbatim
+    quotes, prior art (who tried this and what happened), existing libraries,
+    and honest gaps. Takes 1-2 minutes. Use when the user asks to "research X",
+    "go deep on X", "has anyone done X", or when research_live's single search
+    is clearly too shallow for the question.
+
+    Args:
+        topic: What to research, specific ("agentic LLM migration of large Silverlight codebases"), not vague ("migration").
+        angle: 'general' | 'prior_art' | 'libraries' | 'limits' | 'benchmarks' — what to weight.
+
+    Premium-tier feature: on free/basic this degrades to a single quick search.
+    Cite ONLY returned urls. After synthesizing, offer to queue material
+    findings via add_pending_change so the report evolves.
+    """
+    from config import settings
+
+    if not settings.TAVILY_API_KEY:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "Live research is not configured (no TAVILY_API_KEY).",
+        })
+
+    t = (topic or "").strip()
+    if not t:
+        return json.dumps({"status": "error", "message": "Empty topic."})
+
+    # Tier gate — the iterative engine is frontier-only; lite degrades gracefully
+    # to one quick search (research_live behavior) with an upgrade note.
+    tier = "frontier"
+    try:
+        from utils.subscription import get_model_tier
+        tier = get_model_tier(tool_context.user_id, tool_context.db)
+    except Exception as e:  # noqa: BLE001 — a tier lookup blip must not break chat
+        logger.warning(f"deep_research: tier lookup failed ({e}); defaulting to frontier")
+    if tier != "frontier":
+        from utils.web_research import tavily_search
+        results = await tavily_search(t, max_results=5)
+        return json.dumps({
+            "status": "quick_only",
+            "message": (
+                "Deep research (multi-round, full-page reading, prior art) is a Plus/Pro feature; "
+                "ran a quick single search instead. Mention the upgrade ONCE, briefly, then answer from these."
+            ),
+            "findings": [
+                {"title": r["title"], "url": r["url"], "snippet": (r.get("content") or "")[:600]}
+                for r in results
+            ],
+        })
+
+    # Frontier: aim the pipeline's research agent at the topic, seeded with the
+    # engagement's context so findings are relevant to THIS project.
+    from agents.contract import ReportContract
+    from agents.contract_workflow import _resolve_smart
+    from agents.research_agent import run_deep_research
+
+    await _load_report()
+    contract_d = _contract_dict() or {}
+    angle_queries = {
+        "prior_art": [f"case study postmortem {t}", f"who has built {t}"],
+        "libraries": [f"open source libraries tools {t}", f"{t} framework comparison"],
+        "limits": [f"{t} limitations quotas production issues", f"{t} known issues"],
+        "benchmarks": [f"{t} cost effort benchmark", f"{t} real-world timeline case study"],
+    }.get(angle, [t])
+
+    topic_contract = ReportContract(
+        report_title=str(contract_d.get("report_title") or "Engagement"),
+        executive_summary_brief="(chat research)",
+        problem_statement=str(contract_d.get("problem_statement") or ""),
+        core_challenge=t,
+        research_queries=[t],
+        sections=[],
+    )
+    smart_llm, smart_model = _resolve_smart("frontier")
+    dossier = await run_deep_research(
+        contract=topic_contract,
+        smart_llm=smart_llm,
+        smart_model=smart_model,
+        extra_queries=angle_queries,
+    )
+    if not (dossier.findings or dossier.prior_art or dossier.libraries):
+        return json.dumps({
+            "status": "no_results",
+            "message": "Deep research returned nothing conclusive. Say so honestly; do not fabricate.",
+            "unanswered": dossier.unanswered,
+        })
+    return json.dumps({
+        "status": "success",
+        "stats": {
+            "rounds": dossier.rounds,
+            "queries": dossier.queries_run,
+            "sources": dossier.sources_consulted,
+        },
+        "dossier": dossier.model_dump(),
+        "instructions": (
+            "Synthesize a structured answer: lead with the bottom line, then prior art (who/what/outcome), "
+            "then key findings with [title](url) citations (only these urls), then honest gaps from "
+            "`unanswered`. If anything materially affects the report (risk, limit, better option), "
+            "OFFER to queue it via add_pending_change."
+        ),
+    }, default=str)
+
+
+@tool
+async def get_reality_gap() -> str:
+    """The engagement's full gap picture from the typed report contract: what
+    kind of problem this is (problem profile), what the client's brief
+    understates (underplay flags), every load-bearing assumption, the open
+    questions, staffing gaps, verdict conditions, and the pipeline's own
+    confidence notes (where the report's grounding is weakest).
+
+    Use for: "what are we assuming?", "where could this go wrong?", "what did
+    the client underplay?", "how confident is this report?", "what's still
+    open?", and as background before any advisory answer about risk or scope.
+    """
+    await _load_report()
+    contract = _contract_dict()
+    if not contract:
+        return json.dumps({
+            "status": "unavailable",
+            "message": "No typed contract on the active version (older report). Use get_risks_and_mitigations and get_project_blind_spots instead.",
+        })
+
+    feasibility = contract.get("feasibility") or {}
+    payload = {
+        "status": "success",
+        "problem_profile": contract.get("problem_profile"),
+        "core_challenge": contract.get("core_challenge"),
+        "underplay_flags": contract.get("underplay_flags") or [],
+        "global_assumptions": contract.get("global_assumptions") or [],
+        "open_questions_for_client": contract.get("open_questions_for_client") or [],
+        "staffing_gaps": contract.get("staffing_gaps") or [],
+        "verdict": {
+            "verdict": feasibility.get("verdict"),
+            "confidence": feasibility.get("confidence"),
+            "conditions": feasibility.get("conditions") or [],
+        },
+        "confidence_notes": contract.get("confidence_notes") or [],
+        "contingency_pct": contract.get("contingency_pct"),
+        "instructions": (
+            "These are the engagement's honest gaps. When the user resolves one in conversation "
+            "(answers an open question, confirms/disproves an assumption), OFFER to queue it via "
+            "add_pending_change so the next regeneration bakes it in."
+        ),
+    }
+    return json.dumps(payload, default=str)
+
+
+@tool
+async def whatif_estimate(
+    apply_conditions: str = "",
+    hours_delta_pct: float = 0.0,
+    contingency_pct_override: float = -1.0,
+) -> str:
+    """Deterministic what-if on the costed estimate — recomputes totals in Python
+    from the typed cost model, instantly, WITHOUT regenerating the report. Use for
+    "what if Salesforce is in scope?", "what does the worst case look like?",
+    "what if effort runs 20% over?", "what if we drop contingency to 10%?".
+
+    Args:
+        apply_conditions: Comma-separated keywords matching sensitivity conditions to apply (e.g. "salesforce, data migration"), or "all" for every adverse condition. Empty = none.
+        hours_delta_pct: Scale all effort hours by this percent (e.g. 20 = +20%, -10 = -10%).
+        contingency_pct_override: Replace the contract's contingency percent (e.g. 10). Negative = keep as-is.
+
+    NEVER compute estimate numbers yourself — always call this and cite its output.
+    """
+    from agents.contract import CostLine, Sensitivity
+    from agents.stitcher import compute_cost
+
+    await _load_report()
+    contract = _contract_dict()
+    if not contract or not contract.get("cost_lines"):
+        return json.dumps({
+            "status": "unavailable",
+            "message": "No typed cost lines on the active version — what-if math needs the contract pipeline's cost model. Quote the report's stated estimate instead.",
+        })
+
+    try:
+        cost_lines = [CostLine(**c) for c in contract["cost_lines"] if isinstance(c, dict)]
+        sensitivity = [Sensitivity(**s) for s in (contract.get("cost_sensitivity") or []) if isinstance(s, dict)]
+    except Exception as e:  # noqa: BLE001 — malformed legacy data degrades, never crashes the turn
+        return json.dumps({"status": "error", "message": f"Contract cost data unreadable: {e}"})
+
+    contingency = contract.get("contingency_pct") or 0.0
+    if contingency_pct_override is not None and contingency_pct_override >= 0:
+        contingency = float(contingency_pct_override)
+
+    if hours_delta_pct:
+        factor = 1.0 + float(hours_delta_pct) / 100.0
+        cost_lines = [
+            cl.model_copy(update={
+                "hours_low": max(0, round(cl.hours_low * factor)),
+                "hours_high": max(0, round(cl.hours_high * factor)),
+            })
+            for cl in cost_lines
+        ]
+
+    base = compute_cost(cost_lines, sensitivity, contingency)
+
+    wanted = [w.strip().lower() for w in (apply_conditions or "").split(",") if w.strip()]
+    applied: list[dict] = []
+    if wanted:
+        for s in sensitivity:
+            cond = (s.condition or "").lower()
+            if "all" in wanted:
+                if s.delta_pct > 0:
+                    applied.append({"condition": s.condition, "delta_pct": s.delta_pct})
+            elif any(w in cond for w in wanted):
+                applied.append({"condition": s.condition, "delta_pct": s.delta_pct})
+    applied_pct = sum(a["delta_pct"] for a in applied)
+    scenario_factor = 1.0 + applied_pct / 100.0
+
+    return json.dumps({
+        "status": "success",
+        "inputs": {
+            "hours_delta_pct": hours_delta_pct,
+            "contingency_pct": contingency,
+            "applied_conditions": applied,
+            "unmatched_condition_keywords": [
+                w for w in wanted
+                if w != "all" and not any(w in (s.condition or "").lower() for s in sensitivity)
+            ],
+        },
+        "base_estimate": {
+            "low_usd": round(base["grand_low"]),
+            "high_usd": round(base["grand_high"]),
+        },
+        "scenario_estimate": {
+            "low_usd": round(base["grand_low"] * scenario_factor),
+            "high_usd": round(base["grand_high"] * scenario_factor),
+            "delta_pct_applied": applied_pct,
+        },
+        "worst_case_all_adverse": {
+            "low_usd": round(base["worst_case_low"]),
+            "high_usd": round(base["worst_case_high"]),
+            "adverse_pct": base["adverse_sensitivity_pct"],
+        },
+        "available_sensitivity_conditions": [s.condition for s in sensitivity],
+        "instructions": (
+            "Quote these numbers exactly, state which conditions were applied, and note this is a "
+            "deterministic recomputation of the current version's cost model — a scope change still "
+            "needs add_pending_change + regenerate to become the plan of record."
+        ),
+    })

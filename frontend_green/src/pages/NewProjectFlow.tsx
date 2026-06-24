@@ -1,0 +1,539 @@
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { toast } from 'react-hot-toast';
+import { isAxiosError } from 'axios';
+import api from '../services/api';
+import * as presalesService from '../services/presalesService';
+import { startFullPipeline } from '../services/fullPipelineService';
+import type { PipelineStatus } from '../services/fullPipelineService';
+import type { UploadPresalesResponse } from '../services/uploadService';
+import WizardStepper, { type WizardPhase } from '../components/newproject/WizardStepper';
+import UploadStep from '../components/newproject/UploadStep';
+import QuestionsStep, { type PresalesQuestion } from '../components/newproject/QuestionsStep';
+import AnalysisStep, { type AnalysisAssumption, type AnalysisData } from '../components/newproject/AnalysisStep';
+import ReportStep from '../components/newproject/ReportStep';
+import { answerKeyForDisplayId, anchorIdForDisplayId } from '../utils/questionKey';
+import { useAuth } from '../context/AuthContext';
+
+const ASSUMPTION_TAG = '[SYSTEM ASSUMPTION]';
+
+function extractLatestPresalesBrief(message: unknown): string | null {
+  if (!message) return null;
+  let arr: unknown;
+  try {
+    arr = typeof message === 'string' ? JSON.parse(message) : message;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr)) return null;
+  for (let i = arr.length - 1; i >= 0; i -= 1) {
+    const m = arr[i] as { type?: string; content?: unknown; selected?: unknown } | null;
+    // Only the user-confirmed final brief (generated after Questions + Analysis)
+    // carries `selected: true`. The auto-scan brief saved at upload time does
+    // not — matching it here would skip the wizard straight to Report.
+    if (
+      m &&
+      m.type === 'presales_brief' &&
+      m.selected === true &&
+      typeof m.content === 'string' &&
+      m.content.trim()
+    ) {
+      return m.content;
+    }
+  }
+  return null;
+}
+
+interface ChatRecordResponse {
+  user_details?: {
+    chat_history_id: string;
+    document_id: string | null;
+    title: string | null;
+    analysis_mode?: 'presales' | 'full';
+    presales_id?: string | null;
+    message?: string | unknown;
+    pipeline_status?: PipelineStatus;
+  };
+}
+
+export default function NewProjectFlow() {
+  const navigate = useNavigate();
+  const { chatHistoryId: urlChatHistoryId } = useParams<{ chatHistoryId?: string }>();
+  const { subscription, showLimitHit } = useAuth();
+
+  const checkChatLimit = (): boolean => {
+    if (subscription && subscription.limits.max_chats !== null
+        && subscription.usage.chats >= subscription.limits.max_chats) {
+      // Credits are a universal top-up: if the wallet covers at least a presales
+      // brief (the cheapest billable action), allow the project — the backend bills
+      // each in-project action allowance-first, then credits.
+      const balance = subscription.credits?.balance ?? 0;
+      const presalesCost = subscription.credits?.costs?.presales ?? Infinity;
+      if (balance >= presalesCost) return true;
+      showLimitHit({
+        limit_type: 'max_chats',
+        current: subscription.usage.chats,
+        limit: subscription.limits.max_chats,
+      });
+      return false;
+    }
+    return true;
+  };
+
+  const [phase, setPhase] = useState<WizardPhase>('upload');
+  const [uploadData, setUploadData] = useState<UploadPresalesResponse | null>(null);
+  const [questions, setQuestions] = useState<PresalesQuestion[]>([]);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [additionalContext, setAdditionalContext] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [runningFullPipeline, setRunningFullPipeline] = useState(false);
+  const [reportContent, setReportContent] = useState<string | null>(null);
+  const [chatHistoryIdState, setChatHistoryIdState] = useState<string | null>(null);
+  const [projectTitle, setProjectTitle] = useState<string>('New project');
+  const [readinessStatus, setReadinessStatus] = useState<string | null>(null);
+  const [clientSubmission, setClientSubmission] = useState<
+    { submitted_at: string; name?: string; designation?: string; email?: string } | null
+  >(null);
+  const [hydrating, setHydrating] = useState<boolean>(Boolean(urlChatHistoryId));
+  // Last readiness analysis, lifted so the Questions step can show inline
+  // assumption previews; skip marks; and the "revise this answer" scroll target.
+  const [lastAnalysis, setLastAnalysis] = useState<AnalysisData | null>(null);
+  const [skippedQuestions, setSkippedQuestions] = useState<Record<string, boolean>>({});
+  const [focusAnchorId, setFocusAnchorId] = useState<string | null>(null);
+
+  const initialQuestions: PresalesQuestion[] = useMemo(() => {
+    if (!uploadData) return [];
+    return [
+      ...((uploadData.p1_blockers as PresalesQuestion[] | undefined) ?? []).map((b) => ({
+        ...b,
+        question_type: 'p1' as const,
+      })),
+      ...((uploadData.kickstart_questions as PresalesQuestion[] | undefined) ?? []).map((q) => ({
+        ...q,
+        question_type: 'kickstart' as const,
+      })),
+    ];
+  }, [uploadData]);
+
+  // Hydrate from URL param when resuming an existing project.
+  useEffect(() => {
+    if (!urlChatHistoryId) {
+      setHydrating(false);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      setHydrating(true);
+      try {
+        const { data } = await api.get<ChatRecordResponse>(`/chat/${urlChatHistoryId}`);
+        const details = data.user_details;
+        if (cancelled || !details) {
+          throw new Error('Project not found');
+        }
+
+        if (details.pipeline_status === 'running' || details.pipeline_status === 'queued') {
+          navigate(`/full-pipeline/${urlChatHistoryId}`, { replace: true });
+          return;
+        }
+
+        // Failed / cancelled: /full-pipeline owns the Retry/Resume surface
+        // and the stage-history view. The wizard would otherwise re-prompt
+        // the user to "Generate full report" they already generated.
+        if (details.pipeline_status === 'failed' || details.pipeline_status === 'cancelled') {
+          navigate(`/full-pipeline/${urlChatHistoryId}`, { replace: true });
+          return;
+        }
+
+        if (details.analysis_mode === 'full' || details.pipeline_status === 'completed') {
+          // Defensive: caller landed on /new-project/:id but the project is
+          // already past full-report generation. Send them to the chat view.
+          navigate(`/chat/${urlChatHistoryId}`, { replace: true });
+          return;
+        }
+
+        const presalesId = details.presales_id || null;
+        const documentId = details.document_id || null;
+        if (!presalesId || !documentId) {
+          throw new Error('Project missing presales metadata');
+        }
+
+        setProjectTitle(details.title || 'New project');
+        setUploadData({
+          presales_id: presalesId,
+          document_id: documentId,
+          chat_history_id: details.chat_history_id,
+        });
+        setChatHistoryIdState(details.chat_history_id);
+
+        const [briefRes, questionsRes] = await Promise.allSettled([
+          api.get(`/presales/${documentId}`),
+          presalesService.getQuestions(presalesId),
+        ]);
+
+        if (cancelled) return;
+
+        let hydratedQuestions: PresalesQuestion[] = [];
+        if (questionsRes.status === 'fulfilled') {
+          const raw = questionsRes.value;
+          const arr: PresalesQuestion[] = Array.isArray(raw)
+            ? raw
+            : Array.isArray((raw as { questions?: PresalesQuestion[] })?.questions)
+            ? (raw as { questions: PresalesQuestion[] }).questions
+            : [];
+          hydratedQuestions = arr;
+          setQuestions(arr);
+
+          const restored: Record<string, string> = {};
+          const p1Items: PresalesQuestion[] = [];
+          const kItems: PresalesQuestion[] = [];
+          const fItems: PresalesQuestion[] = [];
+          for (const q of arr) {
+            const t = q.question_type;
+            if (t === 'p1' || t === 'p1_blocker' || q.blocker) p1Items.push(q);
+            else if (t === 'follow_up') fItems.push(q);
+            else kItems.push(q);
+          }
+          p1Items.forEach((q, i) => {
+            const key = answerKeyForDisplayId(q.question_number) || `p1_${i}`;
+            if (q.answer) restored[key] = q.answer;
+          });
+          kItems.forEach((q, i) => {
+            const key = answerKeyForDisplayId(q.question_number) || `question_${i}`;
+            if (q.answer) restored[key] = q.answer;
+          });
+          fItems.forEach((q, i) => {
+            const key = answerKeyForDisplayId(q.question_number) || `followup_${i}`;
+            if (q.answer) restored[key] = q.answer;
+          });
+          setAnswers(restored);
+        }
+        if (briefRes.status === 'fulfilled') {
+          // The presales row carries the client-questionnaire submission record.
+          const p = (briefRes.value as { data?: { client_submitted_at?: string; client_respondent?: { name?: string; designation?: string; email?: string } | null } })?.data;
+          if (p?.client_submitted_at) {
+            setClientSubmission({ submitted_at: p.client_submitted_at, ...(p.client_respondent || {}) });
+          }
+        } else {
+          // Brief is optional for the wizard; analysis step will recompute.
+          console.warn('Failed to fetch presales brief during hydrate', briefRes.reason);
+        }
+
+        // If a presales brief was generated for this project (saved into
+        // chat_history.message as type='presales_brief'), the user is past
+        // Step 3. Hydrate that brief and land on Step 4 (Report) so they
+        // pick up where they left off — never re-prompted to "Generate full
+        // report" they already generated. Otherwise pick step by answers.
+        const briefContent = extractLatestPresalesBrief(details.message);
+        if (briefContent) {
+          setReportContent(briefContent);
+          setPhase('report');
+        } else {
+          // Resume where the firm LEFT OFF (persisted per project), not a derived
+          // default — leaving on Questions should return to Questions, not jump to
+          // the readiness screen. Fall back to the answer-state heuristic only when
+          // there's no saved step yet.
+          const stored = localStorage.getItem(`np_phase_${details.chat_history_id}`);
+          if (stored === 'questions' || stored === 'analysis') {
+            setPhase(stored);
+          } else {
+            const anyUnanswered = hydratedQuestions.some((q) => !q.answer || !String(q.answer).trim());
+            setPhase(anyUnanswered || hydratedQuestions.length === 0 ? 'questions' : 'analysis');
+          }
+        }
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Failed to hydrate project', err);
+        const detail =
+          (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
+          (err instanceof Error ? err.message : 'Project not found');
+        toast.error(detail);
+        navigate('/projects', { replace: true });
+      } finally {
+        if (!cancelled) setHydrating(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [urlChatHistoryId, navigate]);
+
+  // Remember the firm's current wizard step per project so reopening returns them
+  // here (not a derived default). Only the mid-funnel steps are worth restoring.
+  useEffect(() => {
+    if (chatHistoryIdState && (phase === 'questions' || phase === 'analysis')) {
+      localStorage.setItem(`np_phase_${chatHistoryIdState}`, phase);
+    }
+  }, [phase, chatHistoryIdState]);
+
+  // Analysis arrived: keep it for the Questions step's inline assumption
+  // previews, and swap in the refreshed question list (it now carries any
+  // newly created follow-up questions).
+  const handleAnalysisData = (analysis: AnalysisData) => {
+    setLastAnalysis(analysis);
+    if (Array.isArray(analysis.questions) && analysis.questions.length > 0) {
+      setQuestions(analysis.questions as PresalesQuestion[]);
+    }
+  };
+
+  // "Revise this answer" / "Answer follow-ups" from the Analysis step: back to
+  // Questions, scrolled to the named card.
+  const handleReviseAnswer = (displayId?: string) => {
+    setFocusAnchorId(anchorIdForDisplayId(displayId));
+    setPhase('questions');
+  };
+
+  const handleApplyAssumptions = (assumptions: AnalysisAssumption[]) => {
+    if (!assumptions.length) {
+      setPhase('questions');
+      return;
+    }
+    let applied = 0;
+    setAnswers((prev) => {
+      const next = { ...prev };
+      for (const a of assumptions) {
+        const key = answerKeyForDisplayId(a.for_question_id);
+        const text = a.assumption || a.text;
+        if (!key || !text) continue;
+        const tagged = `${ASSUMPTION_TAG} ${text}`;
+        const cur = next[key]?.trim();
+        next[key] = !cur ? tagged : `${cur}\n\n${tagged}`;
+        applied += 1;
+      }
+      return next;
+    });
+    if (applied > 0) {
+      toast.success(
+        `Applied ${applied} assumption${applied === 1 ? '' : 's'}. Review and edit, then Save & Analyse again.`,
+      );
+    } else {
+      toast.error('Could not map assumptions to question fields.');
+    }
+    setPhase('questions');
+  };
+
+  const checkRegenLimit = (): boolean => {
+    if (subscription && subscription.limits.monthly_report_regen !== null
+        && subscription.usage.report_regenerations_used >= subscription.limits.monthly_report_regen) {
+      // Yield to credits the same way the backend does: a report generation is
+      // funded allowance-first then credits, costed by the tier's model.
+      const balance = subscription.credits?.balance ?? 0;
+      const costKey = subscription.tier === 'plus' || subscription.tier === 'pro'
+        ? 'report_frontier' : 'report_lite';
+      const reportCost = subscription.credits?.costs?.[costKey] ?? Infinity;
+      if (balance >= reportCost) return true;
+      showLimitHit({
+        limit_type: 'monthly_report_regen',
+        current: subscription.usage.report_regenerations_used,
+        limit: subscription.limits.monthly_report_regen,
+      });
+      return false;
+    }
+    return true;
+  };
+
+  const handleGenerateReport = async (assumptions: AnalysisAssumption[], statusKey?: string) => {
+    if (!uploadData?.presales_id) return;
+    if (!checkRegenLimit()) return;
+    if (statusKey) setReadinessStatus(statusKey);
+    setGenerating(true);
+    try {
+      const res = await presalesService.generatePresalesReport(
+        uploadData.presales_id,
+        Object.keys(answers).length ? JSON.stringify(answers) : undefined,
+        assumptions.length ? JSON.stringify(assumptions) : undefined,
+        additionalContext.trim() || undefined,
+      );
+      const chatId = res.chat_history_id || uploadData.chat_history_id;
+      const content = res.report || '';
+      setChatHistoryIdState(chatId);
+      setReportContent(content);
+      toast.success('Presales brief ready.');
+      setPhase('report');
+      // Make the URL bookmarkable now that we have a stable chat_history_id.
+      if (chatId && chatId !== urlChatHistoryId) {
+        navigate(`/new-project/${chatId}`, { replace: true });
+      }
+    } catch (err: unknown) {
+      // 402 quota errors are surfaced by the global UpgradeModal; don't double-toast.
+      if (isAxiosError(err) && err.response?.status === 402) {
+        return;
+      }
+      const detail =
+        (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
+        (err instanceof Error ? err.message : 'Failed to generate report.');
+      toast.error(detail);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleOpenChat = async () => {
+    if (runningFullPipeline) return;  // guard double-clicks while the request is in flight
+    if (!chatHistoryIdState) {
+      toast.error('Missing chat reference.');
+      return;
+    }
+    if (!checkRegenLimit()) return;
+    setRunningFullPipeline(true);
+    try {
+      await startFullPipeline(chatHistoryIdState);
+      navigate(`/full-pipeline/${chatHistoryIdState}`);
+    } catch (err) {
+      setRunningFullPipeline(false);  // re-enable so they can retry (on success we navigate away)
+      // 402 quota errors handled by global UpgradeModal.
+      if (isAxiosError(err) && err.response?.status === 402) return;
+      const detail =
+        (isAxiosError(err) && (err.response?.data as { detail?: string })?.detail) ||
+        (err instanceof Error ? err.message : 'Failed to start pipeline.');
+      toast.error(detail);
+    }
+  };
+
+  if (hydrating) {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100%',
+        }}
+      >
+        <div
+          style={{
+            width: 28,
+            height: 28,
+            border: '2px solid var(--border-strong)',
+            borderTopColor: 'var(--accent)',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      <div
+        style={{
+          flexShrink: 0,
+          height: 52,
+          borderBottom: '1px solid var(--border)',
+          display: 'flex',
+          alignItems: 'center',
+          padding: '0 clamp(14px, 3vw, 28px)',
+          background: 'var(--surface)',
+          gap: 12,
+        }}
+      >
+        <span
+          style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 10,
+            color: 'var(--fg-muted)',
+            letterSpacing: '.1em',
+            textTransform: 'uppercase',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            minWidth: 0,
+          }}
+        >
+          {urlChatHistoryId ? projectTitle : 'New project'}
+        </span>
+        <div style={{ flex: 1 }} />
+        <div className="np-stepper-full">
+          <WizardStepper phase={phase} />
+        </div>
+        <span className="np-stepper-compact">
+          Step {Math.max(0, ['upload', 'questions', 'analysis', 'report'].indexOf(phase)) + 1} / 4
+        </span>
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          onClick={() => navigate('/projects')}
+          style={{
+            padding: '6px 12px',
+            background: 'transparent',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 8,
+            color: 'var(--fg-dim)',
+            fontSize: 12,
+            cursor: 'pointer',
+            fontFamily: 'var(--font-sans)',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+          }}
+        >
+          ← Projects
+        </button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        {/* The client-submission confirmation lives on the Questions step (with
+            date/who) + the projects dashboard badge. It is deliberately NOT shown
+            on the readiness/brief screens — a "Review answers" jump there would
+            cancel/abandon an in-progress run. */}
+        {phase === 'upload' && (
+          <UploadStep
+            onBeforeUpload={checkChatLimit}
+            onComplete={(res) => {
+              setUploadData(res);
+              setChatHistoryIdState(res.chat_history_id);
+              setPhase('questions');
+              if (res.chat_history_id) {
+                navigate(`/new-project/${res.chat_history_id}`, { replace: true });
+              }
+            }}
+          />
+        )}
+        {phase === 'questions' && uploadData && (
+          <QuestionsStep
+            presalesId={uploadData.presales_id}
+            initialQuestions={initialQuestions}
+            questions={questions}
+            setQuestions={setQuestions}
+            answers={answers}
+            setAnswers={setAnswers}
+            additionalContext={additionalContext}
+            setAdditionalContext={setAdditionalContext}
+            onBack={() => setPhase('upload')}
+            onComplete={() => setPhase('analysis')}
+            assumptions={lastAnalysis?.assumptions}
+            skipped={skippedQuestions}
+            setSkipped={setSkippedQuestions}
+            focusAnchorId={focusAnchorId}
+            onFocusConsumed={() => setFocusAnchorId(null)}
+            clientSubmittedAt={clientSubmission?.submitted_at ?? null}
+          />
+        )}
+        {phase === 'analysis' && uploadData && (
+          <AnalysisStep
+            presalesId={uploadData.presales_id}
+            generating={generating}
+            onBack={() => setPhase('questions')}
+            onApplyAssumptions={handleApplyAssumptions}
+            onGenerateReport={handleGenerateReport}
+            onData={handleAnalysisData}
+            onReviseAnswer={handleReviseAnswer}
+          />
+        )}
+        {phase === 'report' && reportContent && (
+          <ReportStep
+            reportContent={reportContent}
+            projectTitle={projectTitle}
+            chatHistoryId={chatHistoryIdState}
+            onOpenChat={handleOpenChat}
+            running={runningFullPipeline}
+            onBack={() => setPhase('analysis')}
+            onContentChange={setReportContent}
+            requireAssumptionAck={readinessStatus === 'ready_with_assumptions'}
+          />
+        )}
+      </div>
+    </div>
+  );
+}

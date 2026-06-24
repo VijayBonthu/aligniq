@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation, type NavigateFunction } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import ProfileDropdown from './ProfileDropdown';
 
-type IconKey = 'grid' | 'msg' | 'chart' | 'settings';
+type IconKey = 'grid' | 'msg' | 'chart' | 'settings' | 'firm';
 
 const ICONS: Record<IconKey, ReactNode> = {
   grid: (
@@ -22,6 +22,11 @@ const ICONS: Record<IconKey, ReactNode> = {
   chart: (
     <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
+  firm: (
+    <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path d="M3 21h18M5 21V7l7-4 7 4v14M9 9h.01M9 13h.01M9 17h.01M15 9h.01M15 13h.01M15 17h.01" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   ),
   settings: (
@@ -82,12 +87,15 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const { user, subscription } = useAuth();
   const [profileOpen, setProfileOpen] = useState(false);
 
-  const activeView: 'dashboard' | 'messages' | 'reports' | 'settings' =
+  const activeView: 'dashboard' | 'messages' | 'reports' | 'settings' | 'firm' =
     pathname.startsWith('/messages') ? 'messages'
+      : pathname.startsWith('/firm') ? 'firm'
       : pathname.startsWith('/projects') || pathname.startsWith('/new-project') || pathname.startsWith('/chat') || pathname.startsWith('/dashboard') ? 'dashboard'
       : pathname.startsWith('/reports') ? 'reports'
       : pathname.startsWith('/settings') ? 'settings'
       : 'dashboard';
+
+  const isFirmAdmin = user?.firm_role === 'firm_admin';
 
   const initials = (() => {
     const src = user?.username || user?.email || 'U';
@@ -135,6 +143,9 @@ export default function AppShell({ children }: { children: ReactNode }) {
           <NavIcon icon="grid" label="Projects" active={activeView === 'dashboard'} onClick={() => navigate('/projects')} />
           <NavIcon icon="msg" label="Messages" active={activeView === 'messages'} onClick={() => navigate('/messages')} />
           <NavIcon icon="chart" label="Reports" active={activeView === 'reports'} onClick={() => navigate('/reports')} />
+          {isFirmAdmin && (
+            <NavIcon icon="firm" label="Firm Settings" active={activeView === 'firm'} onClick={() => navigate('/firm/settings')} />
+          )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, paddingBottom: 4 }}>
           <NavIcon icon="settings" label="Settings" active={activeView === 'settings'} onClick={() => navigate('/settings')} />
@@ -164,7 +175,56 @@ export default function AppShell({ children }: { children: ReactNode }) {
           />
         )}
       </aside>
-      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>{children}</div>
+      <div style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+        {activeView === 'firm' && isFirmAdmin && <FirmSubNav pathname={pathname} navigate={navigate} />}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const FIRM_TABS: { path: string; label: string }[] = [
+  { path: '/firm/settings', label: 'Settings' },
+  { path: '/firm/rate-cards', label: 'Rate card' },
+  { path: '/firm/team-templates', label: 'Team templates' },
+  { path: '/firm/tech-preferences', label: 'Tech preferences' },
+  { path: '/firm/past-projects', label: 'Past projects' },
+];
+
+function FirmSubNav({ pathname, navigate }: { pathname: string; navigate: NavigateFunction }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 4,
+        padding: '12px 40px 0',
+        borderBottom: '1px solid var(--border)',
+        background: 'var(--surface)',
+        flexShrink: 0,
+      }}
+    >
+      {FIRM_TABS.map(t => {
+        const active = pathname === t.path || (t.path === '/firm/past-projects' && pathname.startsWith('/firm/past-projects'));
+        return (
+          <button
+            key={t.path}
+            onClick={() => navigate(t.path)}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              padding: '8px 14px',
+              fontSize: 13,
+              color: active ? 'var(--accent)' : 'var(--fg-muted)',
+              borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
+              marginBottom: -1,
+              cursor: 'pointer',
+              fontWeight: active ? 600 : 400,
+            }}
+          >
+            {t.label}
+          </button>
+        );
+      })}
     </div>
   );
 }

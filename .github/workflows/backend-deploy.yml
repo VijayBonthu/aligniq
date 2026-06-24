@@ -1,10 +1,16 @@
-name: Backend deploy (staging)
+name: Backend deploy
 
+# Branch → environment:
+#   push to `staging` → GitHub Environment "staging"  (auto-deploy)
+#   push to `main`    → GitHub Environment "production" (PAUSES for the required
+#                       reviewer configured on that environment = the approval gate)
 on:
   push:
-    branches: [main]
+    branches: [staging, main]
     paths:
       - "src/**"
+      - "alembic/**"
+      - "alembic.ini"
       - "requirements.txt"
       - "Dockerfile"
       - "entrypoint.sh"
@@ -18,16 +24,24 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPO: aligniq-api
+
+# Never run two deploys to the same environment at once.
+concurrency:
+  group: backend-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # The environment selects the per-env secrets/vars AND enforces the production
+    # approval gate. main→production, anything else (staging)→staging.
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # OIDC: no long-lived AWS keys, role ARN comes from Terraform output.
+      # OIDC: no long-lived AWS keys. Role ARN is an environment secret (the
+      # staging role trusts environment:staging, the prod role environment:production).
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -41,43 +55,50 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ECR_REPO is an environment variable: groundediq-api (staging) /
+      # groundediq-production-api (production).
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPO }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPO }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # SSM Run-Command — no SSH, no exposed port 22. EC2 pulls the new image
-      # and restarts the api container only (redis keeps running).
-      - name: Trigger EC2 redeploy via SSM
+      # SSM Run-Command — no SSH. Order matters and `set -e` makes it safe:
+      #   1. pull the new image
+      #   2. run `alembic upgrade head` from the NEW image (DB creds come from SSM
+      #      via entrypoint.sh). If a migration fails, the script aborts here and
+      #      the OLD container keeps serving — we never flip to a half-migrated app.
+      #   3. restart only the api container (redis keeps running)
+      - name: Migrate + redeploy via SSM
         env:
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           set -euo pipefail
+          COMPOSE=/usr/local/lib/docker/cli-plugins/docker-compose
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "GH Actions deploy ${{ github.sha }}" \
-            --parameters 'commands=[
-              "set -euxo pipefail",
-              "cd /opt/aligniq",
-              "aws ecr get-login-password --region '"$AWS_REGION"' | docker login --username AWS --password-stdin '"${{ steps.ecr.outputs.registry }}"'",
-              "/usr/local/lib/docker/cli-plugins/docker-compose pull api",
-              "/usr/local/lib/docker/cli-plugins/docker-compose up -d api",
-              "docker image prune -f"
-            ]' \
+            --comment "GH deploy ${{ github.sha }} (${{ github.ref_name }})" \
+            --parameters "commands=[
+              \"set -euxo pipefail\",
+              \"cd /opt/groundediq\",
+              \"aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY\",
+              \"$COMPOSE pull api\",
+              \"$COMPOSE run --rm --no-deps api alembic upgrade head\",
+              \"$COMPOSE up -d api\",
+              \"docker image prune -f\"
+            ]" \
             --query "Command.CommandId" --output text)
           echo "Command ID: $CMD_ID"
 
-          # Poll until the command terminates so the workflow surfaces real
-          # failures instead of going green when the pull/restart actually broke.
-          # 180 * 5s = 15 min. First-time pulls of the ~2.5GB image can take
-          # 5-10 min from a cold ECR cache; steady-state restarts are <30s.
+          # Poll until terminal so the workflow fails loudly on a broken
+          # migration/pull instead of going green. 180 * 5s = 15 min.
           for i in $(seq 1 180); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
@@ -85,8 +106,10 @@ jobs:
             echo "[$i] status=$STATUS"
             case "$STATUS" in
               Success) exit 0 ;;
-              Failed|Cancelled|TimedOut) aws ssm get-command-invocation \
-                --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"; exit 1 ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+                exit 1 ;;
             esac
             sleep 5
           done

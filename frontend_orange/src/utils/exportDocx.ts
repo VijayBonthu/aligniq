@@ -96,13 +96,14 @@ function canvasToArrayBuffer(canvas: HTMLCanvasElement): Promise<ArrayBuffer | n
   });
 }
 
-async function collectImages(): Promise<DiagramImage[]> {
+async function collectImages(root: ParentNode = document): Promise<DiagramImage[]> {
   // Capture rendered mermaid diagrams in document order so the walker can
   // dequeue one per ```mermaid``` token it visits. Each SVG is rasterized
   // at high DPI with the shared light-theme override so the embedded image
-  // is readable on a white Word page.
+  // is readable on a white Word page. Scoped to the exported report's node so
+  // diagrams from other on-screen messages can't shift this report's embeds.
   const out: DiagramImage[] = [];
-  const nodes = document.querySelectorAll<HTMLElement>('[data-diagram-id]');
+  const nodes = root.querySelectorAll<HTMLElement>('[data-diagram-id]');
   for (const node of Array.from(nodes)) {
     const svg = node.querySelector('svg');
     if (!svg) continue;
@@ -366,12 +367,12 @@ function walkTokens(
 export async function exportMarkdownToDocx(
   markdown: string,
   filename: string,
-  opts: { title?: string } = {},
+  opts: { title?: string; node?: HTMLElement | null } = {},
 ): Promise<void> {
   const docx = await import('docx');
   const prepared = wrapAsciiArt(markdown);
   const tokens = marked.lexer(prepared);
-  const images = await collectImages();
+  const images = await collectImages(opts.node ?? document);
   const children: Array<InstanceType<DocxNs['Paragraph']> | InstanceType<DocxNs['Table']>> = [];
   if (opts.title) {
     children.push(

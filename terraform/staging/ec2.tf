@@ -96,7 +96,7 @@ resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
-# Inline policy: read SecureString params under /aligniq/staging/*, decrypt with
+# Inline policy: read SecureString params under /groundediq/staging/*, decrypt with
 # the default SSM KMS key, and read/write the docs bucket.
 data "aws_caller_identity" "current" {}
 
@@ -105,7 +105,7 @@ data "aws_iam_policy_document" "ec2_inline" {
     sid     = "ReadStagingParams"
     actions = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
     resources = [
-      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/aligniq/staging/*"
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/groundediq/staging/*"
     ]
   }
 
@@ -166,10 +166,10 @@ locals {
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
     # App directory
-    mkdir -p /opt/aligniq
-    cd /opt/aligniq
+    mkdir -p /opt/groundediq
+    cd /opt/groundediq
 
-    cat >/opt/aligniq/docker-compose.yml <<'COMPOSE'
+    cat >/opt/groundediq/docker-compose.yml <<'COMPOSE'
     services:
       api:
         image: ${local.ecr_repo_url}:latest
@@ -178,10 +178,17 @@ locals {
           - "80:8080"
         environment:
           - AWS_REGION=${var.aws_region}
-          - SSM_PATH=/aligniq/staging/
+          - SSM_PATH=/groundediq/staging/
           - REDIS_HOST=redis
           - REDIS_PORT=6379
           - REDIS_SSL=false
+          - AUTO_CREATE_TABLES=false
+          - LOG_LEVEL=WARNING
+          # Turn on the shipped product (4-stage contract pipeline + streaming chat).
+          # Also set as SSM params so an already-running box picks them up on the
+          # next deploy; SSM-exported values win over these on conflict (both true).
+          - USE_CONTRACT_PIPELINE=true
+          - USE_STREAMING_CHAT=true
         depends_on:
           - redis
         logging:
@@ -208,8 +215,8 @@ locals {
     aws ecr get-login-password --region ${var.aws_region} \
       | docker login --username AWS --password-stdin ${local.ecr_repo_url} || true
 
-    /usr/local/lib/docker/cli-plugins/docker-compose -f /opt/aligniq/docker-compose.yml pull || true
-    /usr/local/lib/docker/cli-plugins/docker-compose -f /opt/aligniq/docker-compose.yml up -d || true
+    /usr/local/lib/docker/cli-plugins/docker-compose -f /opt/groundediq/docker-compose.yml pull || true
+    /usr/local/lib/docker/cli-plugins/docker-compose -f /opt/groundediq/docker-compose.yml up -d || true
   EOT
 }
 

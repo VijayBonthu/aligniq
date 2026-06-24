@@ -1,0 +1,214 @@
+import { useState, useCallback, useRef } from 'react';
+import api, { setAccessToken } from '../services/api';
+
+async function attemptTokenRefresh(): Promise<string | null> {
+  // The refresh token is an httpOnly cookie sent automatically — no body needed.
+  try {
+    const { data } = await api.post('/auth/refresh');
+    setAccessToken(data.access_token);
+    return data.access_token;
+  } catch {
+    return null;
+  }
+}
+
+function clearAllAuthTokens() {
+  setAccessToken(null);
+  ['user_id', 'user_email', 'user_provider'].forEach(k => localStorage.removeItem(k));
+}
+
+function getCsrfToken(): string {
+  const match = document.cookie.match(new RegExp('(^| )csrf_token=([^;]+)'));
+  return match ? match[2] : '';
+}
+
+export type StreamEventType =
+  | 'stream_start' | 'stream_end' | 'token' | 'content'
+  | 'tool_start' | 'tool_result' | 'tool_error' | 'thinking' | 'error';
+
+export interface StreamingState {
+  isStreaming: boolean;
+  currentContent: string;
+  currentTool: string | null;
+  toolStatus: 'idle' | 'running' | 'completed' | 'error';
+  thinkingMessage: string | null;
+  error: string | null;
+  toolsUsed: Array<{ tool: string; args?: Record<string, unknown> }>;
+}
+
+export interface StreamChatParams {
+  chatHistoryId: string;
+  userId: string;
+  messages: Array<{ role: string; content: string; selected?: boolean }>;
+  documentId?: string;
+  title?: string;
+  token: string;
+  onToken?: (token: string, accumulated: string) => void;
+  onToolStart?: (toolName: string, args?: Record<string, unknown>) => void;
+  onToolResult?: (toolName: string, result: string) => void;
+  onComplete?: (content: string, toolsUsed: Array<{ tool: string }>) => void;
+  // `silent` marks an error already surfaced elsewhere (e.g. a limit 402 that raises the global
+  // UpgradeModal) — the caller should show it in-line without an extra toast.
+  onError?: (error: string, opts?: { silent?: boolean }) => void;
+}
+
+export interface UseStreamingChatReturn extends StreamingState {
+  streamChat: (params: StreamChatParams) => Promise<string>;
+  cancelStream: () => void;
+  resetState: () => void;
+}
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1/';
+
+const initialState: StreamingState = {
+  isStreaming: false,
+  currentContent: '',
+  currentTool: null,
+  toolStatus: 'idle',
+  thinkingMessage: null,
+  error: null,
+  toolsUsed: []
+};
+
+export function useStreamingChat(): UseStreamingChatReturn {
+  const [state, setState] = useState<StreamingState>(initialState);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const resetState = useCallback(() => setState(initialState), []);
+
+  const cancelStream = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setState(prev => ({ ...prev, isStreaming: false, currentTool: null, toolStatus: 'idle', thinkingMessage: null }));
+  }, []);
+
+  const streamChat = useCallback(async (params: StreamChatParams): Promise<string> => {
+    const { chatHistoryId, userId, messages, documentId = '', title = '', token,
+            onToken, onToolStart, onToolResult, onComplete, onError } = params;
+
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
+    setState({ ...initialState, isStreaming: true });
+
+    let accumulatedContent = '';
+    const toolsUsed: Array<{ tool: string; args?: Record<string, unknown> }> = [];
+
+    try {
+      const makeRequest = (activeToken: string) =>
+        fetch(`${API_URL}chat-with-doc-stream`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeToken}`,
+            'Accept': 'text/event-stream',
+            'X-CSRF-Token': getCsrfToken()
+          },
+          body: JSON.stringify({ chat_history_id: chatHistoryId, user_id: userId,
+                                  message: messages, document_id: documentId, title }),
+          signal: abortControllerRef.current!.signal
+        });
+
+      let response = await makeRequest(token);
+
+      if (response.status === 401) {
+        const newToken = await attemptTokenRefresh();
+        if (!newToken) { clearAllAuthTokens(); window.location.href = '/login'; throw new Error('Session expired'); }
+        response = await makeRequest(newToken);
+      }
+
+      if (!response.ok) {
+        const bodyText = await response.text();
+        // A metering 402 (e.g. the per-chat message cap). This is a raw fetch, so it bypasses the
+        // axios interceptor that normally raises the UpgradeModal — mirror that here by dispatching
+        // billing:limit-hit, then surface a clean message the caller shows silently (no toast on
+        // top of the modal). Without this, the cap would throw a raw `HTTP 402: {json}` error.
+        if (response.status === 402) {
+          try {
+            const detail = JSON.parse(bodyText)?.detail;
+            if (detail && typeof detail === 'object' && detail.limit_type) {
+              window.dispatchEvent(new CustomEvent('billing:limit-hit', { detail }));
+              const msg = typeof detail.error === 'string' ? detail.error : 'You have reached a usage limit.';
+              setState(p => ({ ...p, isStreaming: false, error: msg, currentTool: null, toolStatus: 'idle', thinkingMessage: null }));
+              onError?.(msg, { silent: true });
+              return accumulatedContent;
+            }
+          } catch { /* not JSON — fall through to the generic error */ }
+        }
+        throw new Error(`HTTP ${response.status}: ${bodyText}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body reader');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        let eventType = '', eventData = '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) { eventType = line.slice(7).trim(); }
+          else if (line.startsWith('data: ')) {
+            eventData = line.slice(6);
+            if (eventType && eventData) {
+              try {
+                const data = JSON.parse(eventData);
+                switch (eventType as StreamEventType) {
+                  case 'stream_start':
+                    setState(p => ({ ...p, isStreaming: true, thinkingMessage: 'Connected...' })); break;
+                  case 'thinking':
+                    setState(p => ({ ...p, thinkingMessage: data.message || 'Processing...' })); break;
+                  case 'token':
+                    accumulatedContent = data.accumulated || (accumulatedContent + (data.token || ''));
+                    setState(p => ({ ...p, currentContent: accumulatedContent, thinkingMessage: null }));
+                    onToken?.(data.token || '', accumulatedContent); break;
+                  case 'content':
+                    accumulatedContent += data.content || '';
+                    setState(p => ({ ...p, currentContent: accumulatedContent })); break;
+                  case 'tool_start':
+                    toolsUsed.push({ tool: data.tool || 'unknown', args: data.args || {} });
+                    setState(p => ({ ...p, currentTool: data.tool, toolStatus: 'running', toolsUsed: [...toolsUsed] }));
+                    onToolStart?.(data.tool || '', data.args || {}); break;
+                  case 'tool_result':
+                    setState(p => ({ ...p, toolStatus: 'completed', currentTool: null }));
+                    onToolResult?.(data.tool || '', data.result || ''); break;
+                  case 'tool_error':
+                    setState(p => ({ ...p, toolStatus: 'error', currentTool: null })); break;
+                  case 'stream_end':
+                    accumulatedContent = data.content || accumulatedContent;
+                    setState(p => ({ ...p, isStreaming: false, currentContent: accumulatedContent,
+                                     currentTool: null, toolStatus: 'idle', thinkingMessage: null,
+                                     toolsUsed: data.tools_called || toolsUsed }));
+                    onComplete?.(accumulatedContent, data.tools_called || toolsUsed); break;
+                  case 'error':
+                    setState(p => ({ ...p, isStreaming: false, error: data.message, currentTool: null, toolStatus: 'idle' }));
+                    onError?.(data.message || 'Unknown error'); break;
+                }
+              } catch { /* ignore parse errors */ }
+              eventType = ''; eventData = '';
+            }
+          } else if (line === '') { eventType = ''; eventData = ''; }
+        }
+      }
+      return accumulatedContent;
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === 'AbortError') return accumulatedContent;
+      const msg = error instanceof Error ? error.message : 'Unknown streaming error';
+      setState(p => ({ ...p, isStreaming: false, error: msg }));
+      onError?.(msg);
+      throw error;
+    } finally {
+      abortControllerRef.current = null;
+    }
+  }, []);
+
+  return { ...state, streamChat, cancelStream, resetState };
+}
+
+export default useStreamingChat;

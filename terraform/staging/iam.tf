@@ -22,12 +22,12 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Only allow workflows from this specific repo's main branch to assume.
-    # Tighten further with `:ref:refs/tags/*` if you cut from tags instead.
+    # Only a workflow job running in the GitHub `staging` Environment can assume
+    # this role (staging deploys from the `staging` branch with environment:staging).
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_repo}:environment:staging"]
     }
   }
 }
@@ -40,8 +40,8 @@ resource "aws_iam_role" "github_deploy" {
 data "aws_iam_policy_document" "github_deploy" {
   # Push to ECR
   statement {
-    sid     = "ECRAuth"
-    actions = ["ecr:GetAuthorizationToken"]
+    sid       = "ECRAuth"
+    actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"]
   }
   statement {
@@ -58,14 +58,25 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = [aws_ecr_repository.api.arn]
   }
 
-  # Trigger a pull+restart on the EC2 via SSM Run-Command
+  # Trigger a pull+restart on the EC2 via SSM Run-Command. SendCommand supports
+  # resource-level scoping, so lock it to THIS instance + the RunShellScript doc.
   statement {
-    sid     = "SSMRunCommand"
-    actions = ["ssm:SendCommand", "ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    sid     = "SSMSendCommand"
+    actions = ["ssm:SendCommand"]
     resources = [
       aws_instance.api.arn,
       "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
+  }
+
+  # Poll the command result. ssm:GetCommandInvocation / ssm:ListCommandInvocations
+  # do NOT support resource-level permissions — they must be granted on "*". If
+  # scoped to ARNs they return AccessDenied, which the deploy workflow's poll loop
+  # swallows as "Pending" and then times out even though the command succeeded.
+  statement {
+    sid       = "SSMPoll"
+    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
+    resources = ["*"]
   }
 
   # Upload built frontend to S3. Cache invalidation lives at Cloudflare, not

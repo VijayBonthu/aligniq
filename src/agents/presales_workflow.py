@@ -23,7 +23,9 @@ from config import settings
 from utils.presales_prompts import (
     PRESALES_SCANNER_PROMPT,
     BLINDSPOT_DETECTOR_PROMPT,
-    PRESALES_BRIEF_PROMPT
+    BLINDSPOT_DETECTOR_PROMPT_LEGACY,
+    PRESALES_BRIEF_PROMPT,
+    DOCUMENT_CLASSIFIER_PROMPT,
 )
 from utils.logger import logger
 from utils.llm_metrics import callback_for, hash_prompt
@@ -95,7 +97,9 @@ fixed_parser = OutputFixingParser.from_llm(parser=json_parser, llm=llm_parser)
 _PRESALES_HASHES = {
     "presales_scanner":             hash_prompt(PRESALES_SCANNER_PROMPT),
     "presales_blindspot":           hash_prompt(BLINDSPOT_DETECTOR_PROMPT),
+    "presales_blindspot_legacy":    hash_prompt(BLINDSPOT_DETECTOR_PROMPT_LEGACY),
     "presales_brief_generator":     hash_prompt(PRESALES_BRIEF_PROMPT),
+    "presales_document_classifier": hash_prompt(DOCUMENT_CLASSIFIER_PROMPT),
 }
 
 
@@ -103,7 +107,7 @@ _PRESALES_HASHES = {
 # STATE DEFINITION
 # =============================================================================
 
-class PresalesState(TypedDict):
+class PresalesState(TypedDict, total=False):
     """
     State object passed through the pre-sales LangGraph pipeline.
 
@@ -129,6 +133,13 @@ class PresalesState(TypedDict):
     presales_brief: Optional[str]
     error: Optional[str]
     processing_times: dict
+    # Bet 2.A — pre-flight classifier output. Absent on legacy runs.
+    document_classification: Optional[dict]
+    aborted: Optional[bool]
+    abort_reason: Optional[str]
+    # Bet 3 — markdown <firm_context> block injected into brief_generator.
+    # Empty string when ENABLE_FIRM_CONTEXT is off or firm has no loaded context.
+    firm_context: Optional[str]
 
 
 # =============================================================================
@@ -215,6 +226,65 @@ def parse_json_response(content: str, agent_name: str) -> dict:
 # AGENT NODES
 # =============================================================================
 
+async def document_classifier_node(state: PresalesState) -> PresalesState:
+    """
+    Pre-flight gate (Bet 2.A) — classify the upload before spending 90s on it.
+
+    If the document is not a technical brief with confidence >= 0.7, set
+    `aborted=True` so the graph short-circuits to END and the caller can
+    surface a 422 to the UI instead of generating a fallback brief.
+    """
+    logger.info("Starting presales document_classifier_node")
+    start_time = time.time()
+
+    try:
+        prompt = ChatPromptTemplate.from_template(DOCUMENT_CLASSIFIER_PROMPT)
+        chain = prompt | llm_fast | fixed_parser
+
+        # Cap document at 8k chars — classification needs a sample, not the full doc.
+        sample = state["document"][:8000]
+
+        response = await invoke_presales_agent(
+            chain=chain,
+            input_dict={"document": sample},
+            timeout=30,
+            agent_name="presales_document_classifier",
+            prompt_hash=_PRESALES_HASHES["presales_document_classifier"],
+        )
+
+        if isinstance(response, str):
+            response = parse_json_response(response, "document_classifier")
+
+        state["document_classification"] = response
+        is_brief = bool(response.get("is_technical_brief"))
+        confidence = float(response.get("confidence") or 0.0)
+
+        if (not is_brief) and confidence >= 0.7:
+            state["aborted"] = True
+            state["abort_reason"] = response.get("rejection_reason") or "other_non_brief"
+            logger.warning(
+                f"document_classifier rejected upload: reason={state['abort_reason']}, "
+                f"confidence={confidence}"
+            )
+        else:
+            state["aborted"] = False
+            logger.info(
+                f"document_classifier accepted: is_brief={is_brief}, confidence={confidence}, "
+                f"domain={response.get('primary_domain')}"
+            )
+
+        state["processing_times"]["classifier"] = round(time.time() - start_time, 2)
+        return state
+
+    except Exception as e:
+        # On classifier failure, let the pipeline proceed — better than blocking a real RFP.
+        logger.error(f"document_classifier_node error (proceeding without gate): {str(e)}")
+        state["document_classification"] = None
+        state["aborted"] = False
+        state["processing_times"]["classifier"] = round(time.time() - start_time, 2)
+        return state
+
+
 async def scanner_node(state: PresalesState) -> PresalesState:
     """
     Requirements Scanner Node - Extract essentials quickly.
@@ -275,31 +345,45 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
     logger.info("Starting presales blindspot_node")
     start_time = time.time()
 
-    # Skip if previous node failed
-    if state.get("error"):
+    parallel_mode = settings.ENABLE_PARALLEL_BRIEF
+
+    # In serial (legacy) mode, skip when scanner already failed. In parallel mode
+    # the two nodes run independently, so we don't gate on each other's errors.
+    if not parallel_mode and state.get("error"):
         logger.warning("Skipping blindspot_node due to previous error")
         return state
 
     try:
-        # Extract technologies for focused risk analysis
-        technologies = []
-        if state.get("scanned_requirements"):
-            technologies = state["scanned_requirements"].get("technologies_mentioned", [])
+        if parallel_mode:
+            # Parallel-safe path: read only the document. No scanner dependency.
+            prompt = ChatPromptTemplate.from_template(BLINDSPOT_DETECTOR_PROMPT)
+            chain = prompt | llm_reasoning | fixed_parser
+            response = await invoke_presales_agent(
+                chain=chain,
+                input_dict={"document": state["document"]},
+                timeout=90,
+                agent_name="presales_blindspot",
+                prompt_hash=_PRESALES_HASHES["presales_blindspot"],
+            )
+        else:
+            # Legacy serial path: use scanner-augmented prompt.
+            technologies = []
+            if state.get("scanned_requirements"):
+                technologies = state["scanned_requirements"].get("technologies_mentioned", [])
 
-        prompt = ChatPromptTemplate.from_template(BLINDSPOT_DETECTOR_PROMPT)
-        chain = prompt | llm_reasoning | fixed_parser
-
-        response = await invoke_presales_agent(
-            chain=chain,
-            input_dict={
-                "document": state["document"],
-                "scanned_requirements": json.dumps(state["scanned_requirements"], indent=2),
-                "technologies": ", ".join(technologies) if technologies else "None specified"
-            },
-            timeout=90,
-            agent_name="presales_blindspot",
-            prompt_hash=_PRESALES_HASHES["presales_blindspot"],
-        )
+            prompt = ChatPromptTemplate.from_template(BLINDSPOT_DETECTOR_PROMPT_LEGACY)
+            chain = prompt | llm_reasoning | fixed_parser
+            response = await invoke_presales_agent(
+                chain=chain,
+                input_dict={
+                    "document": state["document"],
+                    "scanned_requirements": json.dumps(state.get("scanned_requirements") or {}, indent=2),
+                    "technologies": ", ".join(technologies) if technologies else "None specified",
+                },
+                timeout=90,
+                agent_name="presales_blindspot",
+                prompt_hash=_PRESALES_HASHES["presales_blindspot_legacy"],
+            )
 
         # Response should already be parsed by fixed_parser
         if isinstance(response, str):
@@ -362,7 +446,8 @@ async def brief_generator_node(state: PresalesState) -> PresalesState:
                 "p1_blockers": json.dumps(state.get("p1_blockers", []), indent=2),
                 "critical_unknowns": json.dumps(state.get("critical_unknowns", []), indent=2),
                 "technology_risks": json.dumps(state.get("technology_risks", []), indent=2),
-                "red_flags": json.dumps(state.get("red_flags", []), indent=2)
+                "red_flags": json.dumps(state.get("red_flags", []), indent=2),
+                "firm_context": state.get("firm_context", ""),
             },
             timeout=60,
             agent_name="presales_brief_generator",
@@ -390,24 +475,54 @@ def _build_presales_graph() -> StateGraph:
     """
     Build and return the pre-sales LangGraph pipeline.
 
-    Flow: scanner -> blindspot -> brief_generator
+    The shape depends on two feature flags:
 
-    This is a simple linear flow with no loops (speed is priority).
+      ENABLE_PREFLIGHT_GATE → prepend `classifier` node with a conditional
+        edge that short-circuits to END when the upload is rejected.
+      ENABLE_PARALLEL_BRIEF → run `scanner` and `blindspot` as parallel
+        branches that both feed `brief_generator`. LangGraph joins the two
+        branches before brief_generator runs because each node writes to a
+        disjoint set of state keys.
 
-    Returns:
-        Compiled StateGraph ready for execution
+    With both flags off the graph is the original linear chain:
+        scanner -> blindspot -> brief_generator
     """
-    graph = StateGraph(PresalesState)
+    use_gate     = settings.ENABLE_PREFLIGHT_GATE
+    use_parallel = settings.ENABLE_PARALLEL_BRIEF
 
-    # Add nodes
+    # Router closure — captures use_parallel so a single router handles all
+    # combinations and never registers two routers on the same source (which
+    # would be invalid in LangGraph).
+    def _route_after_classifier(state: PresalesState):
+        if state.get("aborted"):
+            return END
+        return ["scanner", "blindspot"] if use_parallel else "scanner"
+
+    graph = StateGraph(PresalesState)
     graph.add_node("scanner", scanner_node)
     graph.add_node("blindspot", blindspot_node)
     graph.add_node("brief_generator", brief_generator_node)
+    if use_gate:
+        graph.add_node("classifier", document_classifier_node)
 
-    # Linear flow - simple and fast
-    graph.add_edge(START, "scanner")
-    graph.add_edge("scanner", "blindspot")
-    graph.add_edge("blindspot", "brief_generator")
+    # Entry edges
+    if use_gate:
+        graph.add_edge(START, "classifier")
+        graph.add_conditional_edges("classifier", _route_after_classifier)
+    elif use_parallel:
+        graph.add_edge(START, "scanner")
+        graph.add_edge(START, "blindspot")
+    else:
+        graph.add_edge(START, "scanner")
+
+    # Body
+    if use_parallel:
+        graph.add_edge("scanner", "brief_generator")
+        graph.add_edge("blindspot", "brief_generator")
+    else:
+        graph.add_edge("scanner", "blindspot")
+        graph.add_edge("blindspot", "brief_generator")
+
     graph.add_edge("brief_generator", END)
 
     return graph.compile()
@@ -423,7 +538,8 @@ presales_agent = _build_presales_graph()
 
 async def run_presales_pipeline(
     document: str,
-    timeout: int = 180  # 3 minute default timeout for entire pipeline
+    timeout: int = 180,  # 3 minute default timeout for entire pipeline
+    firm_context: str = "",
 ) -> dict:
     """
     Run the pre-sales analysis pipeline.
@@ -472,7 +588,11 @@ async def run_presales_pipeline(
         "red_flags": None,
         "presales_brief": None,
         "error": None,
-        "processing_times": {}
+        "processing_times": {},
+        "document_classification": None,
+        "aborted": False,
+        "abort_reason": None,
+        "firm_context": firm_context,
     }
 
     try:
@@ -483,7 +603,11 @@ async def run_presales_pipeline(
 
         result["processing_times"]["total"] = round(time.time() - total_start, 2)
 
-        if result.get("error"):
+        if result.get("aborted"):
+            logger.warning(
+                f"Pre-sales pipeline aborted by classifier: reason={result.get('abort_reason')}"
+            )
+        elif result.get("error"):
             logger.error(f"Pre-sales pipeline completed with error: {result['error']}")
         else:
             logger.info(f"Pre-sales pipeline completed successfully in {result['processing_times']['total']}s")
@@ -599,6 +723,12 @@ async def generate_report_with_assumptions(
             blind_spot_lines.append(
                 f"- **P1 blocker** ({blocker.get('area', '')}): {blocker.get('blocker', '')} — "
                 f"{blocker.get('why_it_matters', '')}"
+            )
+        for flag in blind_spots.get("underplay_flags", []) or []:
+            blind_spot_lines.append(
+                f"- **Underplayed scope** (quote: “{flag.get('quote', '')}”): stated as "
+                f"{flag.get('stated_as', '—')}, usually involves {flag.get('usually_involves', '—')}"
+                + (f" · {flag['effort_note']}" if flag.get("effort_note") else "")
             )
 
         prompt = ChatPromptTemplate.from_template(FULL_REPORT_WITH_ASSUMPTIONS_PROMPT)
