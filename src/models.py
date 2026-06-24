@@ -926,3 +926,20 @@ class ChangelogEntry(Base):
     created_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
     created_by   = Column(String, nullable=True)
+
+
+class SupportTicket(Base):
+    """In-app Help & Support submission (bug report / feedback / question). The
+    response loop is email — on submit we notify SUPPORT_INBOX (reply_to = the user)
+    and confirm to the user — so this table is the durable record/queue, not an
+    in-app inbox. `ref_code` is the human-friendly id shown to the user."""
+    __tablename__ = "support_tickets"
+    ticket_id       = Column(String, primary_key=True, default=new_id, index=True)
+    ref_code        = Column(String(16), nullable=False, index=True)   # e.g. "GIQ-A1B2C3"
+    user_id         = Column(String, ForeignKey(User.user_id), nullable=False, index=True)
+    category        = Column(String(24), nullable=False)               # bug|idea|question|billing
+    subject         = Column(String(200), nullable=False)
+    message         = Column(Text, nullable=False)
+    screenshot_path = Column(String, nullable=True)                    # S3 key(s), comma-separated; optional
+    status          = Column(String(16), nullable=False, server_default=text("'open'"))
+    created_at      = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))

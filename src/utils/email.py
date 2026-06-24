@@ -19,28 +19,46 @@ from utils.logger import logger
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 
 
-async def send_email(to: str, subject: str, html: str) -> bool:
+async def send_email(
+    to: str,
+    subject: str,
+    html: str,
+    *,
+    reply_to: str | None = None,
+    attachments: list[dict] | None = None,
+) -> bool:
     """Send one HTML email. Returns True on success, False otherwise. Never raises
-    (logs instead) so a transient email outage can't 500 an auth endpoint."""
+    (logs instead) so a transient email outage can't 500 an auth endpoint.
+
+    ``reply_to`` sets the Reply-To header (e.g. a support request replies to the
+    requester). ``attachments`` is Resend's shape: ``[{"filename": str,
+    "content": <base64 str>}]`` — used to attach user screenshots."""
     if not settings.RESEND_API_KEY:
         logger.warning(
-            "RESEND_API_KEY unset — email NOT sent.\n  to=%s\n  subject=%s\n%s",
+            "RESEND_API_KEY unset — email NOT sent.\n  to=%s\n  reply_to=%s\n  attachments=%s\n  subject=%s\n%s",
             to,
+            reply_to,
+            [a.get("filename") for a in (attachments or [])],
             subject,
             html,
         )
         return False
     try:
+        payload: dict = {
+            "from": settings.EMAIL_FROM,
+            "to": [to],
+            "subject": subject,
+            "html": html,
+        }
+        if reply_to:
+            payload["reply_to"] = reply_to
+        if attachments:
+            payload["attachments"] = attachments
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 RESEND_ENDPOINT,
                 headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
-                json={
-                    "from": settings.EMAIL_FROM,
-                    "to": [to],
-                    "subject": subject,
-                    "html": html,
-                },
+                json=payload,
             )
         if resp.status_code >= 400:
             logger.error("Resend send failed (%s): %s", resp.status_code, resp.text)
@@ -280,3 +298,92 @@ def client_submission_notice_email_html(project_title: str, review_url: str, res
         cta_url=review_url,
         footer_reason="You received this because you're scoping this project in GroundedIQ.",
     )
+
+
+# Human-readable labels for the support categories the form posts.
+SUPPORT_CATEGORY_LABELS = {
+    "bug": "Bug",
+    "idea": "Feedback / idea",
+    "question": "Question / help",
+    "billing": "Billing",
+}
+
+
+def support_request_internal_html(
+    *, ref_code: str, category: str, subject: str, message: str,
+    user_name: str, user_email: str,
+) -> str:
+    """Team-facing notification for an in-app Help & Support request. Sent to
+    SUPPORT_INBOX with reply_to = the requester, so a reply goes straight back to
+    them. Plain, readable layout — the requester's screenshot rides along as an
+    email attachment."""
+    cat = _html.escape(SUPPORT_CATEGORY_LABELS.get(category, category or "—"))
+    safe_ref = _html.escape(ref_code)
+    safe_subject = _html.escape(subject or "(no subject)")
+    safe_name = _html.escape(user_name or "—")
+    safe_email = _html.escape(user_email or "—")
+    safe_msg = _html.escape(message or "").replace("\n", "<br/>")
+
+    def row(label: str, value: str) -> str:
+        return (
+            f'<tr><td style="padding:6px 0;font-size:13px;color:#6e6a5e;width:120px;'
+            f'vertical-align:top;">{label}</td>'
+            f'<td style="padding:6px 0;font-size:14px;color:#ece7dc;">{value}</td></tr>'
+        )
+
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
+    <div style="max-width:560px;margin:0 auto;padding:36px 28px;">
+      <div style="font-size:16px;font-weight:700;letter-spacing:-.02em;margin-bottom:8px;">
+        Grounded<span style="color:#34a37b;">IQ</span> · Support
+      </div>
+      <h1 style="font-size:20px;line-height:1.3;margin:0 0 4px;">New support request</h1>
+      <p style="font-size:13px;color:#6e6a5e;margin:0 0 22px;font-family:monospace;">{safe_ref}</p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        {row("Category", f'<strong>{cat}</strong>')}
+        {row("From", f'{safe_name} &lt;{safe_email}&gt;')}
+        {row("Subject", safe_subject)}
+      </table>
+      <div style="margin:18px 0 0;padding:16px 18px;background:#1c1c25;border:1px solid rgba(220,210,180,.12);border-radius:10px;font-size:14px;line-height:1.6;color:#ece7dc;">
+        {safe_msg}
+      </div>
+      <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:22px 0 0;">
+        Reply to this email to respond — it goes straight to {safe_email}. Any screenshot the user attached is included with this message.
+      </p>
+    </div>
+  </body>
+</html>"""
+
+
+def support_confirmation_html(name: str, ref_code: str, subject: str) -> str:
+    """User-facing 'we got your request' confirmation, in the same dark transactional
+    style as the verification / password-reset emails."""
+    safe_name = _html.escape(name or "there")
+    safe_ref = _html.escape(ref_code)
+    safe_subject = _html.escape(subject or "your request")
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
+    <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
+      <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
+        Grounded<span style="color:#34a37b;">IQ</span>
+      </div>
+      <h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;">We got your request</h1>
+      <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 16px;">
+        Hi {safe_name}, thanks for reaching out about "<strong style="color:#ece7dc;">{safe_subject}</strong>".
+        Our team will look into it and reply to this email address.
+      </p>
+      <p style="font-size:14px;line-height:1.6;color:#a39d8e;margin:0 0 24px;">
+        Your reference number is
+        <span style="font-family:monospace;color:#5fc69a;font-weight:600;">{safe_ref}</span> —
+        mention it if you follow up.
+      </p>
+      <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
+        You're receiving this because you submitted a support request in GroundedIQ.
+      </p>
+    </div>
+  </body>
+</html>"""

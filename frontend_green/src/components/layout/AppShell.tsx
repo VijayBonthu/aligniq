@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { useNavigate, useLocation, type NavigateFunction } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import ProfileDropdown from './ProfileDropdown';
+import HelpSupportModal from '../support/HelpSupportModal';
 import ThemeToggle from './ThemeToggle';
 import AnnouncementBar from '../ops/AnnouncementBar';
 import WhatsNew from '../ops/WhatsNew';
@@ -102,6 +103,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const { pathname } = useLocation();
   const { user, subscription } = useAuth();
   const [profileOpen, setProfileOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const activeView: 'dashboard' | 'messages' | 'reports' | 'settings' | 'firm' =
     pathname.startsWith('/messages') ? 'messages'
@@ -193,6 +195,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
         {profileOpen && (
           <ProfileDropdown
             onClose={() => setProfileOpen(false)}
+            onHelp={() => setHelpOpen(true)}
             initials={initials}
             displayName={displayName}
             tierLabel={tierLabel}
@@ -204,6 +207,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
         {activeView === 'firm' && isFirmAdmin && <FirmSubNav pathname={pathname} navigate={navigate} />}
         {children}
       </div>
+      <HelpSupportModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }
