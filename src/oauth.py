@@ -321,6 +321,13 @@ class MicrosoftOAuth:
             "scope": "openid email profile User.Read",
             "state": state,
             "nonce": nonce,
+            # Force Microsoft's account picker on every sign-in. Without this, Microsoft
+            # silently reuses the existing login.microsoftonline.com session (SSO): a user
+            # can't pick a different account, and a previously failed/cached account keeps
+            # getting re-submitted to our callback — re-erroring forever with no way to
+            # re-enter credentials. select_account always shows the picker (incl. "Use
+            # another account" → fresh login). Mirrors the GitHub/Google prompt fix.
+            "prompt": "select_account",
         }
         return f"{self.authority}/authorize?{urlencode(params)}", state
 
