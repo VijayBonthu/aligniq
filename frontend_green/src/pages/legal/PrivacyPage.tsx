@@ -2,7 +2,12 @@ import React from 'react';
 import LegalPage from './LegalPage';
 
 const PrivacyPage: React.FC = () => (
-  <LegalPage title="Privacy Policy" updated="June 9, 2026">
+  <LegalPage
+    title="Privacy Policy"
+    path="/privacy"
+    description="GroundedIQ Privacy Policy — what we collect, why, your rights, and our commitment to never use your documents to train AI models."
+    updated="June 9, 2026"
+  >
     <p className="legal-lead">
       This Privacy Policy explains how <strong>GroundedIQ, Inc.</strong> ("GroundedIQ", "we", "us")
       collects, uses, and shares information when you use our service. We aim to collect only what we

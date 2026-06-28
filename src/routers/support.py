@@ -27,6 +27,7 @@ from email.utils import parseaddr
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -40,17 +41,32 @@ from utils.email import (
     support_confirmation_html,
     SUPPORT_CATEGORY_LABELS,
 )
+from utils.email_validation import is_valid_email_format, is_disposable_email, normalize_email
 from utils.ids import new_id
 from utils.logger import logger
+from utils.rate_limit import get_client_ip
+from utils.turnstile import verify_turnstile
 
 router = APIRouter()
 
 VALID_CATEGORIES = set(SUPPORT_CATEGORY_LABELS.keys())  # bug | idea | question | billing
 MAX_SUBJECT_LEN = 200
 MAX_MESSAGE_LEN = 5000
+MAX_NAME_LEN = 120
 MAX_SCREENSHOTS = 3
 MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024  # 5 MB each
 SUPPORT_S3_FOLDER = "support"
+
+# Public contact form: the visitor picks a topic. Each topic maps to a stored
+# SupportTicket.category (the admin/ticket schema) and a human label. Sales/pricing
+# enquiries route to SALES_INBOX (hello@); everything else to SUPPORT_INBOX (support@).
+CONTACT_TOPICS = {
+    "general": {"category": "question", "label": "General question"},
+    "sales":   {"category": "billing",  "label": "Sales & pricing"},
+    "account": {"category": "question", "label": "Account & login help"},
+    "bug":     {"category": "bug",      "label": "Bug report"},
+}
+SALES_TOPICS = {"sales"}
 
 
 def _ref_code(ticket_id: str) -> str:
@@ -167,6 +183,105 @@ async def create_support_ticket(
         )
 
     return {"ticket_id": ticket_id, "ref_code": ref_code, "status": "open"}
+
+
+# ---------------------------------------------------------------------------
+# Public contact form — the same support loop, but reachable WITHOUT an account so
+# prospects and locked-out users are never stranded. Guarded by Cloudflare Turnstile
+# + a honeypot + a tight per-IP rate limit (middleware classifies /contact into the
+# auth bucket). Sales/pricing enquiries route to SALES_INBOX; the rest to SUPPORT_INBOX.
+# ---------------------------------------------------------------------------
+class ContactRequest(BaseModel):
+    name: str
+    email: str
+    topic: str = "general"
+    message: str
+    turnstile_token: str | None = None
+    # Honeypot: a hidden field real users never fill. Bots that fill every input trip
+    # it and we silently no-op. Named innocuously so scrapers target it.
+    company: str | None = None
+
+
+@router.post("/contact")
+async def submit_public_contact(body: ContactRequest, request: Request, db: Session = Depends(get_db)):
+    # ---- honeypot: pretend success, do nothing (don't tip off the bot) ----
+    if (body.company or "").strip():
+        logger.info("Public contact honeypot tripped from ip=%s", await get_client_ip(request))
+        return {"ref_code": _ref_code(new_id()), "status": "open"}
+
+    # ---- bot challenge (fail-open in dev when TURNSTILE_SECRET_KEY is unset) ----
+    client_ip = await get_client_ip(request)
+    if not await verify_turnstile(body.turnstile_token or "", client_ip):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Verification failed. Please complete the challenge and try again.")
+
+    # ---- validate ----
+    name = (body.name or "").strip()
+    email = normalize_email(body.email)
+    message = (body.message or "").strip()
+    topic = (body.topic or "general").strip().lower()
+    if topic not in CONTACT_TOPICS:
+        topic = "general"
+    if not name or len(name) > MAX_NAME_LEN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Name is required and must be ≤ {MAX_NAME_LEN} characters.")
+    if not is_valid_email_format(email) or is_disposable_email(email):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Please enter a valid, non-disposable email address.")
+    if not message or len(message) > MAX_MESSAGE_LEN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Message is required and must be ≤ {MAX_MESSAGE_LEN} characters.")
+
+    topic_cfg = CONTACT_TOPICS[topic]
+    category = topic_cfg["category"]
+    topic_label = topic_cfg["label"]
+    # First line of the message makes a useful ticket subject in the admin list.
+    first_line = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
+    subject = (f"{topic_label}: {first_line}" if first_line else topic_label)[:MAX_SUBJECT_LEN]
+
+    ticket_id = new_id()
+    ref_code = _ref_code(ticket_id)
+
+    # ---- persist (user_id stays NULL — no account) ----
+    ticket = SupportTicket(
+        ticket_id=ticket_id,
+        ref_code=ref_code,
+        user_id=None,
+        requester_email=email,
+        category=category,
+        subject=subject,
+        message=message,
+        screenshot_path=None,
+        status="open",
+    )
+    try:
+        db.add(ticket)
+        db.commit()
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        logger.error("Failed to persist public contact ticket %s: %s", ref_code, e)
+        raise HTTPException(status_code=500, detail="Could not send your message. Please try again.")
+
+    # ---- notify the right inbox (reply_to = the sender) ----
+    inbox = settings.SALES_INBOX if topic in SALES_TOPICS else settings.SUPPORT_INBOX
+    await send_email(
+        to=inbox,
+        subject=f"[Contact] {topic_label}: {subject}"[:200],
+        html=support_request_internal_html(
+            ref_code=ref_code, category=category, subject=subject, message=message,
+            user_name=name, user_email=email,
+        ),
+        reply_to=email,
+    )
+
+    # ---- confirm to the sender ----
+    await send_email(
+        to=email,
+        subject=f"We got your message ({ref_code})",
+        html=support_confirmation_html(name, ref_code, subject),
+    )
+
+    return {"ref_code": ref_code, "status": "open"}
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,10 @@ def _classify(method: str, path: str):
     # check-readiness is further capped per-token (Redis + DB lifetime) elsewhere.
     if path.startswith("/api/v1/public/"):
         return "public", settings.RATE_LIMIT_PUBLIC, True
+    # Public contact form — unauthenticated and triggers email, so a tight per-IP
+    # ceiling (the auth bucket) backstops the Turnstile + honeypot guards on it.
+    if path == "/api/v1/contact":
+        return "auth", settings.RATE_LIMIT_AUTH, True
     if path in AUTH_PATHS:
         return "auth", settings.RATE_LIMIT_AUTH, True
     if method in ("POST", "PUT", "PATCH") and _is_expensive(path):
@@ -131,7 +135,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # the Stripe webhook (HMAC) and the X-Admin-Key break-glass admin endpoints.
             # Public client-questionnaire POSTs come from an anonymous visitor who
             # holds no CSRF cookie; the opaque share token in the URL is the secret.
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp"] or request.url.path.startswith("/api/v1/public/"):
+            # The public contact form is likewise anonymous (no session to forge) and
+            # is gated by Turnstile + honeypot + a tight per-IP limit instead.
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp", "/api/v1/contact"] or request.url.path.startswith("/api/v1/public/"):
                 return await call_next(request)
 
             # Validate CSRF token. Return a clean 403 (NOT raise) — an HTTPException

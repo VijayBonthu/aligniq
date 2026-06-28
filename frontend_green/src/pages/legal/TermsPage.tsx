@@ -2,7 +2,12 @@ import React from 'react';
 import LegalPage from './LegalPage';
 
 const TermsPage: React.FC = () => (
-  <LegalPage title="Terms of Service" updated="June 9, 2026">
+  <LegalPage
+    title="Terms of Service"
+    path="/terms"
+    description="GroundedIQ Terms of Service — the terms that govern your access to and use of the GroundedIQ websites, applications, and services."
+    updated="June 9, 2026"
+  >
     <p className="legal-lead">
       These Terms of Service ("Terms") govern your access to and use of GroundedIQ — the
       websites, applications, and services operated by <strong>GroundedIQ, Inc.</strong> ("GroundedIQ",

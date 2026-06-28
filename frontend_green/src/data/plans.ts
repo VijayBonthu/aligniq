@@ -26,7 +26,7 @@ export interface PlanDescriptor {
   };
 }
 
-export const PRO_CONTACT_EMAIL = 'vijaybhaskarbonthu@gmail.com';
+export const PRO_CONTACT_EMAIL = 'hello@grounded-iq.com';
 
 export const PLANS: PlanDescriptor[] = [
   {

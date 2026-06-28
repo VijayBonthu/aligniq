@@ -7,6 +7,8 @@ User-agent: *
 Allow: /
 
 # Authenticated app surfaces — no value to index, save crawl budget.
+# /q/:token is a private, firm-branded client questionnaire — keep it out of search.
+Disallow: /q
 Disallow: /projects
 Disallow: /new-project
 Disallow: /chat

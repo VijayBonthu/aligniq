@@ -173,6 +173,10 @@ class Settings:
     # sent with reply_to set to the requester, so the team can reply straight from
     # their inbox.
     SUPPORT_INBOX          = os.getenv("SUPPORT_INBOX", "support@grounded-iq.com")
+    # Inbox for general/sales enquiries from the public contact form (topic = sales).
+    # Support-type topics still route to SUPPORT_INBOX; sales/pricing go here so the
+    # right team sees them. Same reply_to-the-requester pattern.
+    SALES_INBOX            = os.getenv("SALES_INBOX", "hello@grounded-iq.com")
     # Svix signing secret (whsec_...) for the Resend INBOUND email webhook
     # (/api/v1/webhooks/resend-inbound). When a user replies to a support email, Resend
     # parses it and POSTs an `email.received` event we verify with this secret. Unset →
