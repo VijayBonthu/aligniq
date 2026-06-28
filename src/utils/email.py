@@ -387,3 +387,30 @@ def support_confirmation_html(name: str, ref_code: str, subject: str) -> str:
     </div>
   </body>
 </html>"""
+
+
+def support_reply_html(name: str, ref_code: str, staff_message: str) -> str:
+    """A staff reply to a support request, sent from the admin panel. The user can
+    reply to this email — the ref code keeps it threaded to the same ticket."""
+    safe_name = _html.escape(name or "there")
+    safe_ref = _html.escape(ref_code)
+    safe_msg = _html.escape(staff_message or "").replace("\n", "<br/>")
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
+    <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
+      <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
+        Grounded<span style="color:#34a37b;">IQ</span> <span style="color:#6e6a5e;font-weight:400;">· Support</span>
+      </div>
+      <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 16px;">Hi {safe_name},</p>
+      <div style="font-size:15px;line-height:1.65;color:#ece7dc;margin:0 0 24px;">
+        {safe_msg}
+      </div>
+      <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
+        Reply to this email to continue the conversation — please keep
+        <span style="font-family:monospace;color:#5fc69a;">{safe_ref}</span> in the subject.
+      </p>
+    </div>
+  </body>
+</html>"""

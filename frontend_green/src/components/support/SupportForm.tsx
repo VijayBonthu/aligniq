@@ -1,7 +1,10 @@
 import { useEffect, useId, useMemo, useState, type CSSProperties } from 'react';
 import { toast } from 'react-hot-toast';
-import { useAuth } from '../../context/AuthContext';
 import { submitSupportRequest, type SupportCategory } from '../../services/supportService';
+
+// Where requests are routed — matches the backend SUPPORT_INBOX. Shown so users
+// know it reaches our support desk, not an individual.
+const SUPPORT_EMAIL = 'support@grounded-iq.com';
 
 interface Props {
   /** Called after a successful submit — lets a host modal auto-close. */
@@ -40,7 +43,6 @@ const label: CSSProperties = {
 };
 
 export default function SupportForm({ onDone }: Props) {
-  const { user } = useAuth();
   const inputId = useId();
 
   const [category, setCategory] = useState<SupportCategory>('bug');
@@ -50,8 +52,6 @@ export default function SupportForm({ onDone }: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [doneRef, setDoneRef] = useState<string | null>(null);
-
-  const replyTo = user?.email ?? 'your email';
 
   const previews = useMemo(
     () => screenshots.map(f => ({ file: f, url: URL.createObjectURL(f) })),
@@ -124,7 +124,7 @@ export default function SupportForm({ onDone }: Props) {
           Thanks — we got it.
         </h3>
         <p style={{ fontSize: 13.5, color: 'var(--fg-dim)', margin: '0 0 6px', lineHeight: 1.6 }}>
-          We'll reply to <strong style={{ color: 'var(--fg)' }}>{replyTo}</strong>.
+          Our team will reply to the email on your account.
         </p>
         <p style={{ fontSize: 12.5, color: 'var(--fg-muted)', margin: '0 0 22px', fontFamily: 'var(--font-mono)' }}>
           Reference <span style={{ color: 'var(--accent)' }}>{doneRef}</span>
@@ -272,7 +272,7 @@ export default function SupportForm({ onDone }: Props) {
       {/* Footer */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginTop: 2 }}>
         <p style={{ fontSize: 12, color: 'var(--fg-muted)', margin: 0, fontFamily: 'var(--font-mono)' }}>
-          Replies go to {replyTo}
+          Sent to {SUPPORT_EMAIL}
         </p>
         <button type="submit" className="btn btn-primary" disabled={!canSubmit}>
           {submitting ? 'Sending…' : 'Send request'}

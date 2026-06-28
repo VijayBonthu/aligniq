@@ -6,7 +6,7 @@ import { friendlyError } from '../../services/api';
 import * as ops from '../../services/adminOpsService';
 import EmojiInsert from '../../components/ops/EmojiInsert';
 
-type Tab = 'ops' | 'announcements' | 'changelog' | 'staff' | 'emails';
+type Tab = 'ops' | 'announcements' | 'changelog' | 'staff' | 'emails' | 'support';
 
 const labelStyle: React.CSSProperties = {
   display: 'block', fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.06em',
@@ -473,6 +473,7 @@ const TAB_LABELS: Record<Tab, string> = {
   changelog: 'Changelog',
   staff: 'Staff access',
   emails: 'Client emails',
+  support: 'Support',
 };
 
 const EMAIL_TEMPLATE_KEYS: { key: string; label: string }[] = [
@@ -580,6 +581,164 @@ function EmailTemplatesTab() {
   );
 }
 
+// ── Tab: Help & Support inbox ──
+const SUPPORT_CAT: Record<string, string> = {
+  bug: 'Bug', idea: 'Feedback', question: 'Question', billing: 'Billing',
+};
+
+function fmtTime(s?: string | null): string {
+  if (!s) return '';
+  return new Date(s).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function MsgBubble({ direction, who, time, body }: {
+  direction: string; who: string; time?: string | null; body: string;
+}) {
+  const outbound = direction === 'outbound';
+  return (
+    <div style={{
+      alignSelf: outbound ? 'flex-end' : 'flex-start', maxWidth: '85%',
+      background: outbound ? 'var(--accent-soft)' : 'var(--surface-2)',
+      border: `1px solid ${outbound ? 'var(--accent)' : 'var(--border)'}`,
+      borderRadius: 10, padding: '9px 12px',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginBottom: 4 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: outbound ? 'var(--accent)' : 'var(--fg-dim)' }}>
+          {outbound ? 'You' : who}
+        </span>
+        <span style={{ fontSize: 10, color: 'var(--fg-muted)' }}>{fmtTime(time)}</span>
+      </div>
+      <div style={{ fontSize: 13, color: 'var(--fg)', whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{body}</div>
+    </div>
+  );
+}
+
+function SupportTab() {
+  const [filter, setFilter] = useState<'open' | 'resolved' | 'all'>('open');
+  const [tickets, setTickets] = useState<ops.SupportTicketRow[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<{ ticket: ops.SupportTicketDetail; messages: ops.SupportMessage[] } | null>(null);
+  const [reply, setReply] = useState('');
+  const [sending, setSending] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const loadList = () => ops.listSupportTickets(filter).then(setTickets).catch((e) => toast.error(friendlyError(e)));
+  useEffect(() => { loadList(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [filter]);
+
+  const openTicket = async (id: string) => {
+    setSelectedId(id);
+    setDetail(null);
+    setReply('');
+    try { setDetail(await ops.getSupportTicket(id)); }
+    catch (e) { toast.error(friendlyError(e)); }
+  };
+
+  const sendReply = async () => {
+    if (!selectedId || !reply.trim()) return;
+    setSending(true);
+    try {
+      const res = await ops.replySupportTicket(selectedId, reply.trim());
+      toast.success(res.email_sent ? 'Reply sent.' : 'Reply saved (email not sent — check RESEND_API_KEY).');
+      setReply('');
+      await openTicket(selectedId);
+      loadList();
+    } catch (e) { toast.error(friendlyError(e)); }
+    finally { setSending(false); }
+  };
+
+  const toggleStatus = async (next: 'open' | 'resolved') => {
+    if (!selectedId) return;
+    setBusy(true);
+    try { await ops.setSupportTicketStatus(selectedId, next); await openTicket(selectedId); loadList(); }
+    catch (e) { toast.error(friendlyError(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+      <div style={{ width: 290, flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+          {(['open', 'resolved', 'all'] as const).map((f) => (
+            <button key={f} className="btn btn-ghost" onClick={() => setFilter(f)}
+              style={{ padding: '4px 10px', fontSize: 12, textTransform: 'capitalize',
+                border: `1px solid ${filter === f ? 'var(--accent)' : 'var(--border)'}`,
+                color: filter === f ? 'var(--accent)' : 'var(--fg-dim)' }}>{f}</button>
+          ))}
+        </div>
+        {tickets.length === 0 && <p style={{ color: 'var(--fg-muted)', fontSize: 13 }}>No tickets.</p>}
+        {tickets.map((t) => (
+          <button key={t.ticket_id} onClick={() => openTicket(t.ticket_id)} style={{
+            display: 'block', width: '100%', textAlign: 'left', cursor: 'pointer',
+            background: selectedId === t.ticket_id ? 'var(--surface-2)' : 'var(--surface)',
+            border: `1px solid ${selectedId === t.ticket_id ? 'var(--accent)' : 'var(--border)'}`,
+            borderRadius: 'var(--radius)', padding: '10px 12px', marginBottom: 8,
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--fg-muted)' }}>{t.ref_code}</span>
+              <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '.04em',
+                color: t.status === 'resolved' ? 'var(--ok)' : 'var(--accent)' }}>{t.status}</span>
+            </div>
+            <div style={{ fontSize: 13, color: 'var(--fg)', marginBottom: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.subject}</div>
+            <div style={{ fontSize: 11, color: 'var(--fg-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {SUPPORT_CAT[t.category] || t.category} · {t.requester_email || 'unknown'}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {!detail && <div style={card}><p style={{ color: 'var(--fg-muted)', fontSize: 13, margin: 0 }}>Select a ticket to view the conversation and reply.</p></div>}
+        {detail && (
+          <div style={card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
+              <div style={{ minWidth: 0 }}>
+                <h3 style={{ margin: '0 0 4px', fontSize: 16 }}>{detail.ticket.subject}</h3>
+                <p style={{ fontSize: 12, color: 'var(--fg-muted)', margin: 0, fontFamily: 'var(--font-mono)' }}>
+                  {detail.ticket.ref_code} · {SUPPORT_CAT[detail.ticket.category] || detail.ticket.category} · {detail.ticket.requester_email || 'unknown'}
+                </p>
+              </div>
+              <button className="btn btn-ghost" disabled={busy}
+                onClick={() => toggleStatus(detail.ticket.status === 'resolved' ? 'open' : 'resolved')}
+                style={{ padding: '4px 12px', flexShrink: 0, color: detail.ticket.status === 'resolved' ? 'var(--accent)' : 'var(--ok)' }}>
+                {detail.ticket.status === 'resolved' ? 'Reopen' : 'Mark resolved'}
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 16 }}>
+              <MsgBubble direction="inbound" who={detail.ticket.requester_email || 'User'} time={detail.ticket.created_at} body={detail.ticket.message} />
+              {detail.ticket.screenshots.length > 0 && (
+                <span style={{ fontSize: 11, color: 'var(--fg-muted)', alignSelf: 'flex-start' }}>
+                  📎 {detail.ticket.screenshots.length} screenshot(s) stored in S3
+                </span>
+              )}
+              {detail.messages.map((m) => (
+                <div key={m.message_id} style={{ display: 'flex', flexDirection: 'column' }}>
+                  <MsgBubble direction={m.direction} who={m.author_name || m.author_email || 'User'} time={m.created_at} body={m.body} />
+                  {m.attachments.length > 0 && (
+                    <span style={{ fontSize: 11, color: 'var(--fg-muted)', alignSelf: m.direction === 'outbound' ? 'flex-end' : 'flex-start', marginTop: 2 }}>
+                      📎 {m.attachments.map((a) => a.filename).join(', ')}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <textarea className="input" style={{ width: '100%', minHeight: 90 }}
+              placeholder="Type your reply… (emailed to the requester)"
+              value={reply} onChange={(e) => setReply(e.target.value)} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8, gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 11, color: 'var(--fg-muted)' }}>Sent from support@grounded-iq.com — their reply threads back here.</span>
+              <button className="btn btn-primary" disabled={sending || !reply.trim()} onClick={sendReply}>
+                {sending ? 'Sending…' : 'Send reply'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function AdminConsole() {
   const [tab, setTab] = useState<Tab>('ops');
   return (
@@ -606,6 +765,7 @@ export default function AdminConsole() {
       {tab === 'changelog' && <ChangelogTab />}
       {tab === 'staff' && <StaffTab />}
       {tab === 'emails' && <EmailTemplatesTab />}
+      {tab === 'support' && <SupportTab />}
     </div>
   );
 }
