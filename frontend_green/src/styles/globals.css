@@ -666,6 +666,39 @@ button { font-family: inherit; }
 .footer-bottom a { color: inherit; transition: color .15s; }
 .footer-bottom a:hover { color: var(--fg); }
 
+/* ── Social icon links (footer + contact page) ── */
+.social-icons { display: flex; gap: 10px; }
+.social-icons a {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px; border-radius: 9px;
+  border: 1px solid var(--border-strong); color: var(--fg-dim);
+  transition: color .15s, border-color .15s, background .15s;
+}
+.social-icons a:hover { color: var(--fg); border-color: var(--accent); background: var(--accent-soft); }
+.footer-social { margin-top: 18px; }
+
+/* ══════════════════════════════════════════════════════════════════
+   CONTACT PAGE
+   ══════════════════════════════════════════════════════════════════ */
+.contact-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 36px; align-items: start; }
+.contact-card {
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); padding: 28px;
+}
+.contact-aside { display: flex; flex-direction: column; gap: 16px; }
+.contact-channel {
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px;
+}
+.contact-channel-h {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--fg-muted); margin-bottom: 12px;
+}
+.contact-channel a { font-size: 14px; color: var(--accent); transition: opacity .15s; }
+.contact-channel a:hover { opacity: 0.8; }
+.contact-channel-note { font-size: 12.5px; color: var(--fg-dim); line-height: 1.55; margin-top: 3px; }
+
 /* ══════════════════════════════════════════════════════════════════
    LEGAL PAGES (Terms, Privacy)
    ══════════════════════════════════════════════════════════════════ */
@@ -1460,6 +1493,7 @@ button { font-family: inherit; }
   .faq-grid { grid-template-columns: 1fr; gap: 40px; }
   .report-body { grid-template-columns: 1fr; }
   .report-sidebar { display: none; }
+  .contact-grid { grid-template-columns: 1fr; gap: 24px; }
   .footer { grid-template-columns: 1fr; gap: 40px; }
   .nav-links { display: none; }
   .auth-wrap { grid-template-columns: 1fr; }

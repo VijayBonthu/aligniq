@@ -4,6 +4,7 @@ import { useAuth } from '../context/AuthContext';
 import { startPlanChange, getPortalUrl, buyCreditPack, PaidTier, CreditPackSize } from '../services/billingService';
 import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, CREDIT_PACKS, PlanDescriptor, Tier } from '../data/plans';
 import { Logo } from '../components/Logo';
+import { usePageMeta } from '../hooks/usePageMeta';
 
 export default function PricingPage() {
   const navigate = useNavigate();
@@ -11,6 +12,13 @@ export default function PricingPage() {
   const { isAuthenticated, subscription, refreshSubscription } = useAuth();
   const [loading, setLoading] = useState<string | null>(null);
   const [creditsAdded, setCreditsAdded] = useState(false);
+
+  usePageMeta({
+    title: 'Pricing — GroundedIQ',
+    description:
+      'GroundedIQ pricing — start free, then Basic $30/mo or Plus $70/mo with white-label exports. Turn a raw brief into an evidence-grounded scope clients sign before kickoff.',
+    path: '/pricing',
+  });
 
   const currentTier: Tier | null = subscription?.tier ?? null;
   // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.

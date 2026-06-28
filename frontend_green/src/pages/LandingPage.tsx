@@ -5,7 +5,12 @@ import ThemeToggle from '../components/layout/ThemeToggle';
 import { HeroVisual } from '../components/landing/HeroVisual';
 import { RealFlowTour } from '../components/landing/RealFlowTour';
 import { Reveal } from '../components/landing/Reveal';
+import { SocialIcons } from '../components/SocialIcons';
 import { PLANS, PRO_CONTACT_EMAIL } from '../data/plans';
+import { usePageMeta } from '../hooks/usePageMeta';
+
+const X_URL = 'https://x.com/GroundedIQ';
+const INSTAGRAM_URL = 'https://www.instagram.com/groundediq';
 
 // ── Small icon set ────────────────────────────────────────────────────────────
 const Ico = {
@@ -50,10 +55,23 @@ const FAQS = [
     a: 'A structured alignment report: risks ranked by severity, clarifying questions, a first-pass architecture, week-level phasing, and a resource plan. All Markdown-exportable.' },
   { q: 'Is my client data used for training?',
     a: 'No. Your documents are processed only to generate your report and are never used to train any AI models.' },
+  { q: 'How do I get in touch?',
+    a: 'Use the contact form for the fastest reply, or email us — hello@grounded-iq.com for general and sales questions, support@grounded-iq.com for support. You can also find us on X (@GroundedIQ) and Instagram (@groundediq).' },
+  { q: "I can't log in or access my account — what do I do?",
+    a: 'Start with the password reset link on the sign-in page. If you\'re still stuck, the contact form works without logging in (pick "Account & login help") and a real person will get you back in.' },
 ];
 
 const LandingPage: React.FC = () => {
   const [openFaq, setOpenFaq] = useState<number | null>(0);
+
+  // Mirrors the static index.html homepage meta so client-side navigation back to "/"
+  // resets title/canonical/og/description from whatever a sub-route last set.
+  usePageMeta({
+    title: 'GroundedIQ — AI scoping & alignment reports for teams',
+    description:
+      'Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect.',
+    path: '/',
+  });
 
   return (
     <div>
@@ -199,7 +217,7 @@ const LandingPage: React.FC = () => {
               <div className="eyebrow section-eyebrow">FAQ</div>
               <h2 className="display section-h">Questions teams actually ask us.</h2>
               <p className="section-sub" style={{ margin: 0 }}>
-                Can't find it? <a href="mailto:hello@grounded-iq.com" style={{ color: 'var(--accent)' }}>Ask the team →</a>
+                Can't find it? <Link to="/contact" style={{ color: 'var(--accent)' }}>Ask the team →</Link>
               </p>
             </Reveal>
             <div className="faq-list">
@@ -234,6 +252,9 @@ const LandingPage: React.FC = () => {
             <div>
               <Logo />
               <div className="footer-tag">Grounded scoping, before kickoff.</div>
+              <div className="footer-social">
+                <SocialIcons x={X_URL} instagram={INSTAGRAM_URL} />
+              </div>
             </div>
             <div className="footer-cols">
               <div>
@@ -244,15 +265,15 @@ const LandingPage: React.FC = () => {
               </div>
               <div>
                 <div className="footer-col-h">Company</div>
-                <a href="#">About</a>
-                <a href="#">Careers</a>
-                <a href="mailto:hello@grounded-iq.com">Contact</a>
+                <Link to="/about">About</Link>
+                <Link to="/careers">Careers</Link>
+                <Link to="/contact">Contact</Link>
               </div>
               <div>
                 <div className="footer-col-h">Resources</div>
                 <a href="#faq">FAQ</a>
-                <a href="#">Changelog</a>
-                <a href="#">Security</a>
+                <Link to="/changelog">Changelog</Link>
+                <Link to="/security">Security</Link>
               </div>
             </div>
           </div>

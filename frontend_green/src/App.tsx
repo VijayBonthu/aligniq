@@ -25,6 +25,11 @@ import Messages from './pages/Messages';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
+import ContactPage from './pages/ContactPage';
+import AboutPage from './pages/AboutPage';
+import SecurityPage from './pages/SecurityPage';
+import CareersPage from './pages/CareersPage';
+import ChangelogPage from './pages/ChangelogPage';
 import TermsPage from './pages/legal/TermsPage';
 import PrivacyPage from './pages/legal/PrivacyPage';
 import AppShell from './components/layout/AppShell';
@@ -153,6 +158,11 @@ function App() {
             <Route path="/verify-email" element={<VerifyEmailPage />} />
             <Route path="/verify-email-required" element={<VerifyEmailRequiredPage />} />
             <Route path="/pricing" element={<PricingPage />} />
+            <Route path="/contact" element={<ContactPage />} />
+            <Route path="/about" element={<AboutPage />} />
+            <Route path="/security" element={<SecurityPage />} />
+            <Route path="/careers" element={<CareersPage />} />
+            <Route path="/changelog" element={<ChangelogPage />} />
             <Route path="/q/:token" element={<PublicQuestionnaire />} />
             <Route path="/terms" element={<TermsPage />} />
             <Route path="/privacy" element={<PrivacyPage />} />
