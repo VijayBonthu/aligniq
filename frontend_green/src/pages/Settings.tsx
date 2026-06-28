@@ -7,8 +7,9 @@ import { connectJira, disconnectJira, getJiraStatus } from '../services/chatActi
 import { tierLabel } from '../data/plans';
 import UsageCounter from '../components/billing/UsageCounter';
 import PlanBadge from '../components/billing/PlanBadge';
+import SupportForm from '../components/support/SupportForm';
 
-type Tab = 'profile' | 'billing' | 'integrations';
+type Tab = 'profile' | 'billing' | 'integrations' | 'support';
 
 export default function Settings() {
   const [tab, setTab] = useState<Tab>('billing');
@@ -125,7 +126,7 @@ export default function Settings() {
           marginBottom: 28,
         }}
       >
-        {(['billing', 'profile', 'integrations'] as Tab[]).map(t => (
+        {(['billing', 'profile', 'integrations', 'support'] as Tab[]).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -393,6 +394,23 @@ export default function Settings() {
               Confluence, Slack, GitHub, Notion — connect from one place.
             </p>
           </div>
+        </div>
+      )}
+
+      {tab === 'support' && (
+        <div
+          style={{
+            padding: 24,
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-lg)',
+          }}
+        >
+          <p className="eyebrow" style={{ marginBottom: 6 }}>Help &amp; support</p>
+          <p style={{ fontSize: 13, color: 'var(--fg-dim)', margin: '0 0 22px', lineHeight: 1.5 }}>
+            Found a bug or have feedback? Send it here — we read every message and reply by email.
+          </p>
+          <SupportForm />
         </div>
       )}
     </div>

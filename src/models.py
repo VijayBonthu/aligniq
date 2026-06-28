@@ -926,3 +926,42 @@ class ChangelogEntry(Base):
     created_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
     updated_at   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
     created_by   = Column(String, nullable=True)
+
+
+class SupportTicket(Base):
+    """In-app Help & Support submission (bug report / feedback / question), and the
+    head of an email-driven conversation. The original message is stored here; later
+    replies (user→inbound via the Resend webhook, staff→outbound via the admin panel)
+    live in `SupportMessage`. `ref_code` is the human-friendly id shown to the user
+    and embedded in every outbound subject so inbound replies thread back here.
+    `user_id` is nullable: an inbound email from a non-user still opens a ticket."""
+    __tablename__ = "support_tickets"
+    ticket_id       = Column(String, primary_key=True, default=new_id, index=True)
+    ref_code        = Column(String(16), nullable=False, index=True)   # e.g. "GIQ-A1B2C3"
+    user_id         = Column(String, ForeignKey(User.user_id), nullable=True, index=True)
+    requester_email = Column(String, nullable=True, index=True)        # who we reply to
+    category        = Column(String(24), nullable=False)               # bug|idea|question|billing
+    subject         = Column(String(200), nullable=False)
+    message         = Column(Text, nullable=False)
+    screenshot_path = Column(String, nullable=True)                    # S3 key(s), comma-separated; optional
+    status          = Column(String(16), nullable=False, server_default=text("'open'"))  # open|resolved
+    created_at      = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at      = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"), onupdate=func.now())
+
+
+class SupportMessage(Base):
+    """One message in a support ticket's conversation. `direction='inbound'` is a
+    reply from the requester (ingested from the Resend inbound webhook);
+    `direction='outbound'` is a staff reply sent from the admin panel via Resend.
+    `provider_message_id` carries the Resend `email_id` for inbound dedupe."""
+    __tablename__ = "support_messages"
+    message_id          = Column(String, primary_key=True, default=new_id, index=True)
+    ticket_id           = Column(String, ForeignKey("support_tickets.ticket_id"), nullable=False, index=True)
+    direction           = Column(String(10), nullable=False)           # inbound | outbound
+    author_email        = Column(String, nullable=True)
+    author_name         = Column(String, nullable=True)
+    body                = Column(Text, nullable=False, server_default=text("''"))
+    body_html           = Column(Text, nullable=True)
+    attachments         = Column(JSON, nullable=True)                  # [{filename, key?}]
+    provider_message_id = Column(String, nullable=True, index=True)    # Resend email_id (inbound) — dedupe key
+    created_at          = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text("now()"))

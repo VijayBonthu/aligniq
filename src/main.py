@@ -9,7 +9,7 @@ import models
 from models import engine
 from config import settings
 from fastapi.middleware.cors import CORSMiddleware
-from routers import authentication, services, third_party_integrations, billing, firm_admin, admin_ops
+from routers import authentication, services, third_party_integrations, billing, firm_admin, admin_ops, support
 from utils.logger import setup_logger
 from utils.rate_limit import lifespan as rate_limit_lifespan
 from utils.middleware import CSRFMiddleware, RateLimitMiddleware, MaintenanceMiddleware
@@ -169,6 +169,7 @@ app.include_router(third_party_integrations.router, prefix="/api/v1", tags=["thi
 app.include_router(billing.router, prefix="/api/v1", tags=["billing"])
 app.include_router(firm_admin.router, prefix="/api/v1", tags=["firm"])
 app.include_router(admin_ops.router, prefix="/api/v1", tags=["ops"])
+app.include_router(support.router, prefix="/api/v1", tags=["support"])
 
 
 # ---------------------------------------------------------------------------

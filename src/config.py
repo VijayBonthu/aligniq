@@ -169,6 +169,15 @@ class Settings:
     # does NOT send, so the flow stays testable locally without provisioning email.
     RESEND_API_KEY         = os.getenv("RESEND_API_KEY", "")
     EMAIL_FROM             = os.getenv("EMAIL_FROM", "GroundedIQ <noreply@grounded-iq.com>")
+    # Inbox that in-app Help & Support requests are emailed to. The notification is
+    # sent with reply_to set to the requester, so the team can reply straight from
+    # their inbox.
+    SUPPORT_INBOX          = os.getenv("SUPPORT_INBOX", "support@grounded-iq.com")
+    # Svix signing secret (whsec_...) for the Resend INBOUND email webhook
+    # (/api/v1/webhooks/resend-inbound). When a user replies to a support email, Resend
+    # parses it and POSTs an `email.received` event we verify with this secret. Unset →
+    # the webhook fails closed (rejects) so it can't be spoofed. Set per environment.
+    RESEND_WEBHOOK_SECRET  = os.getenv("RESEND_WEBHOOK_SECRET", "")
 
     # Schema management. Local dev lets SQLAlchemy create tables from models.
     # Staging/prod set AUTO_CREATE_TABLES=false and rely solely on `alembic upgrade head`.

@@ -139,3 +139,51 @@ export async function getFirmEmailTemplates(firmId: string): Promise<FirmEmailTe
 export async function saveFirmEmailTemplate(firmId: string, key: string, fields: EmailTemplateFields): Promise<void> {
   await api.put(`/admin/firm-email-templates/${firmId}/${key}`, fields);
 }
+
+// ── Help & Support inbox (staff) ──
+export interface SupportTicketRow {
+  ticket_id: string;
+  ref_code: string;
+  category: string;            // bug | idea | question | billing
+  subject: string;
+  status: string;             // open | resolved
+  requester_email?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface SupportMessage {
+  message_id: string;
+  direction: 'inbound' | 'outbound';
+  author_email?: string | null;
+  author_name?: string | null;
+  body: string;
+  body_html?: string | null;
+  attachments: { filename: string }[];
+  created_at?: string | null;
+}
+
+export interface SupportTicketDetail extends SupportTicketRow {
+  message: string;             // the original submission body
+  screenshots: string[];       // S3 keys
+}
+
+export async function listSupportTickets(status?: string): Promise<SupportTicketRow[]> {
+  const { data } = await api.get('/admin/support/tickets', { params: status && status !== 'all' ? { status } : {} });
+  return data.tickets || [];
+}
+
+export async function getSupportTicket(id: string): Promise<{ ticket: SupportTicketDetail; messages: SupportMessage[] }> {
+  const { data } = await api.get(`/admin/support/tickets/${id}`);
+  return data;
+}
+
+export async function replySupportTicket(id: string, message: string): Promise<{ ok: boolean; email_sent: boolean }> {
+  const { data } = await api.post(`/admin/support/tickets/${id}/reply`, { message });
+  return data;
+}
+
+export async function setSupportTicketStatus(id: string, status: string): Promise<{ ok: boolean; status: string }> {
+  const { data } = await api.post(`/admin/support/tickets/${id}/status`, { status });
+  return data;
+}

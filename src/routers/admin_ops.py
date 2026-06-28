@@ -21,14 +21,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import settings
-from models import get_db, User, SiteSetting, Announcement, ChangelogEntry
+from models import get_db, User, SiteSetting, Announcement, ChangelogEntry, SupportTicket, SupportMessage
 from utils.token_generation import require_staff, token_validator
+from utils.email import send_email, support_reply_html
 from utils import ops_state
 from utils.logger import logger
 
@@ -534,3 +535,143 @@ async def set_staff(
     db.commit()
     logger.info("ADMIN set-staff email=%s is_staff=%s", body.email, body.is_staff)
     return {"email": user.email_address, "is_staff": user.is_staff}
+
+
+# ---------------------------------------------------------------------------
+# Staff — Help & Support inbox. Staff read submitted tickets + the email thread,
+# reply from the panel (sent via Resend; the user's reply threads back via the
+# inbound webhook in routers/support.py), and resolve.
+# ---------------------------------------------------------------------------
+_SUPPORT_STATUSES = ("open", "resolved")
+
+
+def _support_msg(m: SupportMessage) -> dict:
+    return {
+        "message_id": m.message_id,
+        "direction": m.direction,
+        "author_email": m.author_email,
+        "author_name": m.author_name,
+        "body": m.body,
+        "body_html": m.body_html,
+        "attachments": m.attachments or [],
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _ticket_row(t: SupportTicket) -> dict:
+    return {
+        "ticket_id": t.ticket_id,
+        "ref_code": t.ref_code,
+        "category": t.category,
+        "subject": t.subject,
+        "status": t.status,
+        "requester_email": t.requester_email,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if getattr(t, "updated_at", None) else None,
+    }
+
+
+def _ticket_detail(t: SupportTicket) -> dict:
+    return {
+        **_ticket_row(t),
+        "message": t.message,
+        "screenshots": [k for k in (t.screenshot_path or "").split(",") if k],
+    }
+
+
+@router.get("/admin/support/tickets")
+async def list_support_tickets(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    current: dict = Depends(require_staff),
+    db: Session = Depends(get_db),
+):
+    q = db.query(SupportTicket)
+    if status_filter in _SUPPORT_STATUSES:
+        q = q.filter(SupportTicket.status == status_filter)
+    rows = (
+        q.order_by(SupportTicket.updated_at.desc().nullslast(), SupportTicket.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    return {"tickets": [_ticket_row(t) for t in rows]}
+
+
+@router.get("/admin/support/tickets/{ticket_id}")
+async def get_support_ticket(
+    ticket_id: str, current: dict = Depends(require_staff), db: Session = Depends(get_db)
+):
+    t = db.query(SupportTicket).filter(SupportTicket.ticket_id == ticket_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    msgs = (
+        db.query(SupportMessage)
+        .filter(SupportMessage.ticket_id == ticket_id)
+        .order_by(SupportMessage.created_at.asc())
+        .all()
+    )
+    return {"ticket": _ticket_detail(t), "messages": [_support_msg(m) for m in msgs]}
+
+
+class SupportReplyIn(BaseModel):
+    message: str
+
+
+@router.post("/admin/support/tickets/{ticket_id}/reply")
+async def reply_support_ticket(
+    ticket_id: str, body: SupportReplyIn,
+    current: dict = Depends(require_staff), db: Session = Depends(get_db),
+):
+    t = db.query(SupportTicket).filter(SupportTicket.ticket_id == ticket_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    msg_text = (body.message or "").strip()
+    if not msg_text:
+        raise HTTPException(status_code=400, detail="Reply cannot be empty.")
+    if not t.requester_email:
+        raise HTTPException(status_code=400, detail="This ticket has no requester email to reply to.")
+
+    name = None
+    if t.user_id:
+        u = db.query(User).filter(User.user_id == t.user_id).first()
+        name = getattr(u, "full_name", None) if u else None
+    name = name or t.requester_email.split("@")[0]
+
+    # reply_to = the support inbox, so the user's reply lands back on the inbound webhook.
+    sent = await send_email(
+        to=t.requester_email,
+        subject=f"Re: [{t.ref_code}] {t.subject}"[:200],
+        html=support_reply_html(name, t.ref_code, msg_text),
+        reply_to=settings.SUPPORT_INBOX,
+    )
+
+    db.add(SupportMessage(
+        ticket_id=t.ticket_id,
+        direction="outbound",
+        author_email=_actor(current),
+        body=msg_text,
+    ))
+    t.status = "open"
+    t.updated_at = _now()
+    db.commit()
+    logger.info("ADMIN support reply ticket=%s by=%s sent=%s", t.ref_code, _actor(current), sent)
+    return {"ok": True, "email_sent": sent}
+
+
+class SupportStatusIn(BaseModel):
+    status: str
+
+
+@router.post("/admin/support/tickets/{ticket_id}/status")
+async def set_support_status(
+    ticket_id: str, body: SupportStatusIn,
+    current: dict = Depends(require_staff), db: Session = Depends(get_db),
+):
+    if body.status not in _SUPPORT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Status must be one of {_SUPPORT_STATUSES}")
+    t = db.query(SupportTicket).filter(SupportTicket.ticket_id == ticket_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    t.status = body.status
+    t.updated_at = _now()
+    db.commit()
+    return {"ok": True, "status": t.status}

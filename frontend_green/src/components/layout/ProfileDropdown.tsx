@@ -3,12 +3,13 @@ import { useAuth } from '../../context/AuthContext';
 
 interface Props {
   onClose: () => void;
+  onHelp: () => void;
   initials: string;
   displayName: string;
   tierLabel: string;
 }
 
-export default function ProfileDropdown({ onClose, initials, displayName, tierLabel }: Props) {
+export default function ProfileDropdown({ onClose, onHelp, initials, displayName, tierLabel }: Props) {
   const { logout, subscription } = useAuth();
   const navigate = useNavigate();
   const credits = subscription?.credits?.balance ?? 0;
@@ -23,6 +24,7 @@ export default function ProfileDropdown({ onClose, initials, displayName, tierLa
     { label: 'Account settings', action: onClose },
     { label: 'Workspace', action: onClose },
     { label: 'Billing & plan', action: () => { onClose(); navigate('/pricing'); } },
+    { label: 'Help & support', action: () => { onClose(); onHelp(); } },
     { label: '', divider: true },
     { label: 'Sign out', action: handleSignOut, danger: true },
   ];
