@@ -132,12 +132,13 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             # so CSRF does not apply (and must be skipped, or it 403s → 500 in middleware).
             # CSRF-exempt: cookieless server-to-server POSTs authenticated by their own
             # secret/signature, where a browser CSRF token can't (and needn't) exist —
-            # the Stripe webhook (HMAC) and the X-Admin-Key break-glass admin endpoints.
+            # the Stripe webhook (HMAC), the Resend inbound-email webhook (Svix HMAC,
+            # verified in support.py), and the X-Admin-Key break-glass admin endpoints.
             # Public client-questionnaire POSTs come from an anonymous visitor who
             # holds no CSRF cookie; the opaque share token in the URL is the secret.
             # The public contact form is likewise anonymous (no session to forge) and
             # is gated by Turnstile + honeypot + a tight per-IP limit instead.
-            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp", "/api/v1/contact"] or request.url.path.startswith("/api/v1/public/"):
+            if request.url.path in ["/api/v1/login", "/api/v1/registration", "/api/v1/auth/callback", "/api/v1/auth/jira/callback", "/api/v1/auth/github/callback", "/api/v1/auth/microsoft/callback", "/api/v1/auth/refresh", "/api/v1/auth/forgot-password", "/api/v1/auth/reset-password", "/api/v1/auth/verify-email", "/api/v1/webhooks/stripe", "/api/v1/webhooks/resend-inbound", "/api/v1/admin/set-staff", "/api/v1/admin/grant-comp", "/api/v1/contact"] or request.url.path.startswith("/api/v1/public/"):
                 return await call_next(request)
 
             # Validate CSRF token. Return a clean 403 (NOT raise) — an HTTPException
