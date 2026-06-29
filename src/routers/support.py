@@ -292,7 +292,7 @@ async def submit_public_contact(body: ContactRequest, request: Request, db: Sess
 # Stripe webhook in routers/billing.py.
 # ---------------------------------------------------------------------------
 _REF_RE = re.compile(r"GIQ-[A-Z0-9]{6}")
-RESEND_RECEIVED_ENDPOINT = "https://api.resend.com/emails/received/{email_id}"
+RESEND_RECEIVED_ENDPOINT = "https://api.resend.com/emails/receiving/{email_id}"
 _SVIX_TOLERANCE_SECONDS = 300
 
 
