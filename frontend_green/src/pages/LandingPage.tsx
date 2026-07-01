@@ -11,6 +11,7 @@ import { usePageMeta } from '../hooks/usePageMeta';
 
 const X_URL = 'https://x.com/GroundedIQ';
 const INSTAGRAM_URL = 'https://www.instagram.com/groundediq';
+const LINKEDIN_URL = 'https://www.linkedin.com/company/grounded-iq';
 
 // ── Small icon set ────────────────────────────────────────────────────────────
 const Ico = {
@@ -56,7 +57,7 @@ const FAQS = [
   { q: 'Is my client data used for training?',
     a: 'No. Your documents are processed only to generate your report and are never used to train any AI models.' },
   { q: 'How do I get in touch?',
-    a: 'Use the contact form for the fastest reply, or email us — hello@grounded-iq.com for general and sales questions, support@grounded-iq.com for support. You can also find us on X (@GroundedIQ) and Instagram (@groundediq).' },
+    a: 'Use the contact form for the fastest reply, or email us — hello@grounded-iq.com for general and sales questions, support@grounded-iq.com for support. You can also find us on X (@GroundedIQ), Instagram (@groundediq), and LinkedIn (Grounded IQ).' },
   { q: "I can't log in or access my account — what do I do?",
     a: 'Start with the password reset link on the sign-in page. If you\'re still stuck, the contact form works without logging in (pick "Account & login help") and a real person will get you back in.' },
 ];
@@ -253,7 +254,7 @@ const LandingPage: React.FC = () => {
               <Logo />
               <div className="footer-tag">Grounded scoping, before kickoff.</div>
               <div className="footer-social">
-                <SocialIcons x={X_URL} instagram={INSTAGRAM_URL} />
+                <SocialIcons x={X_URL} instagram={INSTAGRAM_URL} linkedin={LINKEDIN_URL} />
               </div>
             </div>
             <div className="footer-cols">
