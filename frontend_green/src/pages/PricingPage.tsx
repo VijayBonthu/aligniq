@@ -8,6 +8,19 @@ import SiteFooter from '../components/layout/SiteFooter';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { track } from '../lib/analytics';
 
+// Launch promo: percentage shown on the pricing cards. MUST match the Stripe launch
+// coupon's percent_off (config STRIPE_LAUNCH_COUPON_ID) or the displayed price won't
+// match what Stripe charges. Only shown when VITE_LAUNCH_OFFER is set.
+const LAUNCH_DISCOUNT_PCT = 70;
+
+// "$30" -> "$9" at the launch discount. Falls back to the original string if it
+// isn't a plain "$N" price (e.g. Free's "$0" or Pro's "Contact us").
+function discountedPrice(price: string): string {
+  const n = parseFloat(price.replace(/[^0-9.]/g, ''));
+  if (!isFinite(n) || n <= 0) return price;
+  return `$${Math.round(n * (1 - LAUNCH_DISCOUNT_PCT / 100))}`;
+}
+
 export default function PricingPage() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -16,6 +29,9 @@ export default function PricingPage() {
   const [creditsAdded, setCreditsAdded] = useState(false);
 
   usePageMeta('/pricing');
+
+  // Launch promo flag (gated build-time via VITE_LAUNCH_OFFER).
+  const offer = import.meta.env.VITE_LAUNCH_OFFER;
 
   const currentTier: Tier | null = subscription?.tier ?? null;
   // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.
@@ -132,7 +148,7 @@ export default function PricingPage() {
           <p style={{ fontSize: 16, color: 'var(--fg-dim)', margin: 0 }}>
             Upgrade anytime. Downgrade or cancel when you need to.
           </p>
-          {import.meta.env.VITE_LAUNCH_OFFER && (
+          {offer && (
             <div
               style={{
                 marginTop: 18, display: 'inline-block', padding: '8px 16px',
@@ -214,12 +230,30 @@ export default function PricingPage() {
                   {plan.description}
                 </p>
 
-                <div style={{ marginBottom: 22, display: 'flex', alignItems: 'baseline', gap: 4 }}>
-                  <span className="display" style={{ fontSize: 32 }}>{plan.price}</span>
-                  {plan.period && (
-                    <span style={{ fontSize: 13, color: 'var(--fg-muted)' }}>{plan.period}</span>
-                  )}
-                </div>
+                {offer && plan.ctaKind === 'checkout' ? (
+                  <div style={{ marginBottom: 22 }}>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 18, color: 'var(--fg-muted)', textDecoration: 'line-through' }}>
+                        {plan.price}
+                      </span>
+                      <span className="display" style={{ fontSize: 32 }}>{discountedPrice(plan.price)}</span>
+                      <span style={{ fontSize: 13, color: 'var(--fg-muted)' }}>{plan.period}</span>
+                      <span className="badge badge-accent" style={{ fontSize: 10, padding: '2px 8px' }}>
+                        {LAUNCH_DISCOUNT_PCT}% off
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12.5, color: 'var(--accent)', marginTop: 6, fontWeight: 500 }}>
+                      for your first 2 months, then {plan.price}{plan.period}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ marginBottom: 22, display: 'flex', alignItems: 'baseline', gap: 4 }}>
+                    <span className="display" style={{ fontSize: 32 }}>{plan.price}</span>
+                    {plan.period && (
+                      <span style={{ fontSize: 13, color: 'var(--fg-muted)' }}>{plan.period}</span>
+                    )}
+                  </div>
+                )}
 
                 <ul style={{ listStyle: 'none', padding: 0, margin: 0, marginBottom: 22, flex: 1 }}>
                   {plan.features.map(f => (
