@@ -132,6 +132,18 @@ export default function PricingPage() {
           <p style={{ fontSize: 16, color: 'var(--fg-dim)', margin: 0 }}>
             Upgrade anytime. Downgrade or cancel when you need to.
           </p>
+          {import.meta.env.VITE_LAUNCH_OFFER && (
+            <div
+              style={{
+                marginTop: 18, display: 'inline-block', padding: '8px 16px',
+                borderRadius: 999, background: 'var(--accent-soft)',
+                border: '1px solid rgba(52,163,123,.35)', fontSize: 13.5, color: 'var(--fg)',
+              }}
+            >
+              🎉 Launch offer — <strong>70% off your first 2 months</strong> on Basic &amp; Plus.
+              New subscribers; applied automatically at checkout.
+            </div>
+          )}
         </div>
 
         <div

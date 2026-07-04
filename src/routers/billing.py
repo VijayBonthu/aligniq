@@ -196,6 +196,23 @@ async def create_checkout_session(
 
     # No live subscription → fresh Checkout session.
     customer_id = _get_or_create_customer(user, db)
+
+    # Launch discount — 70%-off-first-2-months coupon, FIRST-TIME subscribers only.
+    # A customer who has EVER had a subscription (any status, incl. cancelled) is
+    # excluded, so cancel-and-resubscribe can't re-trigger it. Stripe applies the
+    # coupon's 2-month duration then reverts to full price on its own. Unset coupon
+    # id ⇒ no discount (feature off). `discounts` and `allow_promotion_codes` are
+    # mutually exclusive in Checkout — we only ever set `discounts`.
+    discounts = None
+    if settings.STRIPE_LAUNCH_COUPON_ID:
+        try:
+            prior = stripe.Subscription.list(customer=customer_id, status="all", limit=1)
+            if not prior.get("data"):
+                discounts = [{"coupon": settings.STRIPE_LAUNCH_COUPON_ID}]
+        except Exception:
+            logger.warning("Launch-discount eligibility check failed for user %s; "
+                           "proceeding without discount", user_id)
+
     session = stripe.checkout.Session.create(
         customer=customer_id,
         payment_method_types=["card"],
@@ -204,6 +221,7 @@ async def create_checkout_session(
         success_url=f"{settings.FRONTEND_URL}/projects?upgrade=success",
         cancel_url=f"{settings.FRONTEND_URL}/pricing?upgrade=cancelled",
         metadata={"user_id": user_id, "tier": tier},
+        **({"discounts": discounts} if discounts else {}),
     )
     return {"updated": False, "checkout_url": session.url}
 

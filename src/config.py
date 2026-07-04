@@ -95,6 +95,11 @@ class Settings:
     # shows "Contact sales"). Set it only if you ever want pro self-serve. The
     # $70 self-serve tier is now `plus` (STRIPE_PLUS_PRICE_ID must point to $70/mo).
     STRIPE_PRO_PRICE_ID    = os.getenv("STRIPE_PRO_PRICE_ID")
+    # Launch discount: id of a Stripe Coupon (percent_off=70, duration=repeating,
+    # duration_in_months=2). Auto-applied to a FIRST-TIME subscriber's Checkout so
+    # their first 2 invoices are 70% off, then Stripe charges full price. Unset = off.
+    # Create the coupon in BOTH test and live mode (ids differ per mode).
+    STRIPE_LAUNCH_COUPON_ID = os.getenv("STRIPE_LAUNCH_COUPON_ID")
     # Pin the Stripe API version so request/response shapes are stable. Kept at a
     # version where `current_period_end` still lives on the Subscription object
     # (it moved onto subscription *items* in 2025-03-31+). Webhook payloads use the
