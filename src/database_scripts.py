@@ -35,14 +35,23 @@ async def create_user(user_data:dict,provider:str, db:Session):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"unable to connect to DB {e}")
     
     if not user_details:
+        # Google's /userinfo only guarantees id + email + verified_email; given_name,
+        # family_name, name and picture are optional and ARE omitted for some profiles
+        # (e.g. accounts with no surname). first/last/full_name are NOT NULL columns, so
+        # derive non-null fallbacks instead of indexing (a bare user_data["family_name"]
+        # crashed new-account signup with KeyError). The Local path always sets these keys,
+        # so .get() is behaviour-preserving there.
+        given = (user_data.get("given_name") or "").strip()
+        family = (user_data.get("family_name") or "").strip()
+        full = (user_data.get("name") or "").strip() or f"{given} {family}".strip() or user_data["email"].split("@")[0]
         user_details = models.User(
-            oauth_id = user_data["id"],
+            oauth_id = user_data.get("id"),
             email_address = user_data["email"],
-            first_name = user_data["given_name"],
-            last_name = user_data["family_name"],
-            verified_email = user_data["verified_email"],
-            full_name = user_data["name"],
-            picture = user_data["picture"],
+            first_name = given or full,
+            last_name = family,
+            verified_email = user_data.get("verified_email", False),
+            full_name = full,
+            picture = user_data.get("picture"),
             provider = provider,
             company = user_data.get("company"),
             subscription_tier = "free",
