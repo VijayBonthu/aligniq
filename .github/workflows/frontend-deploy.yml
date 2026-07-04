@@ -73,39 +73,44 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # FRONTEND_BUCKET is an environment variable (staging.grounded-iq.com /
-      # grounded-iq.com). Hashed assets get a 1-year immutable cache; index.html
-      # is no-cache so a deploy is visible immediately (Cloudflare honours these).
+      # grounded-iq.com). Hashed JS/CSS/image assets get a 1-year immutable cache.
+      # HTML + sitemap/robots are handled in the next step (they must not be immutable
+      # and the per-route HTML needs extensionless keys). --delete prunes stale assets;
+      # it also prunes the extensionless route keys (they're not in dist/), which the
+      # next step re-creates immediately.
       - name: Upload hashed assets to S3
         env:
           FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
         run: |
           BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
-          aws s3 sync dist/ "s3://${BUCKET}/" --delete --cache-control "public,max-age=31536000,immutable" --exclude "index.html"
+          aws s3 sync dist/ "s3://${BUCKET}/" --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "*.html" --exclude "sitemap.xml" --exclude "robots.txt"
 
-      - name: Upload index.html (no cache, correct content-type)
+      # Per-route prerendered HTML. `npm run build` runs scripts/prerender-meta.mjs,
+      # which writes dist/index.html plus dist/<route>.html for every public route in
+      # src/seo/routes.mjs — each with its own title/description/canonical/OG/JSON-LD.
+      # We upload each dist/<route>.html to the EXTENSIONLESS S3 key (e.g. dist/pricing.html
+      # -> key "pricing") so S3 serves /pricing at HTTP 200 with that page's real HTML.
+      # index.html serves "/". All HTML is no-cache so a deploy is visible immediately.
+      # sitemap.xml/robots.txt get a short cache. Deriving the route list from the built
+      # files means new routes need no change here — just add them to routes.mjs.
+      - name: Upload prerendered HTML + sitemap/robots
         env:
           FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
         run: |
           BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
-          aws s3 cp dist/index.html "s3://${BUCKET}/index.html" --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"
-
-      # SEO fix for SPA deep links. S3 static-website hosting serves index.html for
-      # any unknown key but returns it with a 404 status, so crawlers refused to
-      # index /pricing, /about, … (they only ever indexed the homepage, which is a
-      # real key). Publish a real object at each PUBLIC marketing route — same SPA
-      # shell, but now returned with HTTP 200 — so Googlebot indexes them. React
-      # Router still renders the correct page on load. The authenticated app routes
-      # (/projects, /chat, …) intentionally stay 404-fallback: they're Disallow'd in
-      # robots.txt and don't need indexing. Runs AFTER the `s3 sync --delete` above,
-      # which would otherwise prune these keys. Keep this list in sync with the
-      # public <url> entries in frontend_green/public/sitemap.xml.
-      - name: Publish public routes as HTTP 200 pages (SPA deep-link SEO fix)
-        env:
-          FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
-        run: |
-          BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
-          for route in about careers changelog contact pricing privacy security terms; do
-            aws s3 cp dist/index.html "s3://${BUCKET}/${route}" \
-              --cache-control "public,max-age=0,must-revalidate" \
-              --content-type "text/html"
+          aws s3 cp dist/index.html "s3://${BUCKET}/index.html" \
+            --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"
+          for f in dist/*.html; do
+            name="$(basename "$f" .html)"
+            [ "$name" = "index" ] && continue
+            aws s3 cp "$f" "s3://${BUCKET}/${name}" \
+              --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"
           done
+          aws s3 cp dist/sitemap.xml "s3://${BUCKET}/sitemap.xml" \
+            --cache-control "public,max-age=3600" --content-type "application/xml"
+          if [ -f dist/robots.txt ]; then
+            aws s3 cp dist/robots.txt "s3://${BUCKET}/robots.txt" \
+              --cache-control "public,max-age=3600" --content-type "text/plain"
+          fi

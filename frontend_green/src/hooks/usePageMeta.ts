@@ -1,16 +1,5 @@
 import { useEffect } from 'react';
-
-// Production canonical host. Must match the canonical/og base in index.html.
-const SITE = 'https://grounded-iq.com';
-
-interface PageMeta {
-  /** Full document title, e.g. "Pricing — GroundedIQ". Omit to keep the index.html default (homepage). */
-  title?: string;
-  /** Page-specific meta description (also fills og:description + twitter:description). */
-  description?: string;
-  /** Route path beginning with "/", e.g. "/pricing". Sets canonical + og:url to SITE + path. */
-  path: string;
-}
+import { SITE, getRoute } from '../seo/routes.mjs';
 
 function setMeta(selector: string, attr: 'content' | 'href', value: string) {
   const el = document.head.querySelector(selector);
@@ -18,30 +7,30 @@ function setMeta(selector: string, attr: 'content' | 'href', value: string) {
 }
 
 /**
- * Per-route SEO head management for this SPA. index.html ships static homepage meta;
- * this updates title / description / canonical / og in place on navigation so each
- * marketing route self-describes — and no longer reports the homepage as its canonical
- * (the bug that made Google treat /pricing, /security, … as duplicates of /).
+ * Per-route SEO head management for this SPA. The build-time prerender
+ * (scripts/prerender-meta.mjs) bakes the correct title / description / canonical /
+ * OG / JSON-LD into each route's static HTML from the SAME source of truth
+ * (src/seo/routes.mjs), so crawlers and social scrapers get them with zero JS.
+ * This hook keeps the in-page <head> correct during client-side navigation, reading
+ * that same source so runtime and raw HTML can never disagree.
  *
- * Vanilla DOM (no react-helmet) to match the existing `document.title`-in-useEffect
- * idiom; Googlebot renders JS and reads these client-side updates. All target tags
- * already exist in index.html, so we mutate in place rather than inject.
+ * Pass the route path (e.g. "/pricing"); title/description come from routes.mjs.
+ * All target tags already exist in index.html, so we mutate in place.
  */
-export function usePageMeta({ title, description, path }: PageMeta) {
+export function usePageMeta(path: string) {
   useEffect(() => {
+    const route = getRoute(path);
     const url = SITE + path;
 
-    if (title) {
-      document.title = title;
-      setMeta('meta[property="og:title"]', 'content', title);
-      setMeta('meta[name="twitter:title"]', 'content', title);
-    }
-    if (description) {
-      setMeta('meta[name="description"]', 'content', description);
-      setMeta('meta[property="og:description"]', 'content', description);
-      setMeta('meta[name="twitter:description"]', 'content', description);
+    if (route) {
+      document.title = route.title;
+      setMeta('meta[property="og:title"]', 'content', route.title);
+      setMeta('meta[name="twitter:title"]', 'content', route.title);
+      setMeta('meta[name="description"]', 'content', route.description);
+      setMeta('meta[property="og:description"]', 'content', route.description);
+      setMeta('meta[name="twitter:description"]', 'content', route.description);
     }
     setMeta('link[rel="canonical"]', 'href', url);
     setMeta('meta[property="og:url"]', 'content', url);
-  }, [title, description, path]);
+  }, [path]);
 }

@@ -8,6 +8,7 @@ import { Reveal } from '../components/landing/Reveal';
 import { SocialIcons } from '../components/SocialIcons';
 import { PLANS, PRO_CONTACT_EMAIL } from '../data/plans';
 import { usePageMeta } from '../hooks/usePageMeta';
+import { FAQS } from '../seo/routes.mjs';
 
 const X_URL = 'https://x.com/GroundedIQ';
 const INSTAGRAM_URL = 'https://www.instagram.com/groundediq';
@@ -47,32 +48,12 @@ const FEATURES = [
   { icon: Ico.doc,   title: 'Shared source of truth', body: 'One alignment report. Client and consultant read the same doc, sign the same assumptions.' },
 ];
 
-const FAQS = [
-  { q: 'How is this different from an RFP tool?',
-    a: 'RFP tools capture requirements. GroundedIQ interrogates them — it flags ambiguity, proposes architecture, and produces a doc clients actually sign off on before kickoff.' },
-  { q: 'Does it replace discovery workshops?',
-    a: 'No. It kills 80% of the "what did you mean by X" questions so your discovery time is spent on judgment calls, not information gathering.' },
-  { q: 'What does the output look like?',
-    a: 'A structured alignment report: risks ranked by severity, clarifying questions, a first-pass architecture, week-level phasing, and a resource plan. All Markdown-exportable.' },
-  { q: 'Is my client data used for training?',
-    a: 'No. Your documents are processed only to generate your report and are never used to train any AI models.' },
-  { q: 'How do I get in touch?',
-    a: 'Use the contact form for the fastest reply, or email us — hello@grounded-iq.com for general and sales questions, support@grounded-iq.com for support. You can also find us on X (@GroundedIQ), Instagram (@groundediq), and LinkedIn (Grounded IQ).' },
-  { q: "I can't log in or access my account — what do I do?",
-    a: 'Start with the password reset link on the sign-in page. If you\'re still stuck, the contact form works without logging in (pick "Account & login help") and a real person will get you back in.' },
-];
-
 const LandingPage: React.FC = () => {
   const [openFaq, setOpenFaq] = useState<number | null>(0);
 
-  // Mirrors the static index.html homepage meta so client-side navigation back to "/"
-  // resets title/canonical/og/description from whatever a sub-route last set.
-  usePageMeta({
-    title: 'GroundedIQ — AI scoping & alignment reports for teams',
-    description:
-      'Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect.',
-    path: '/',
-  });
+  // Resets title/canonical/og/description from routes.mjs when navigating back to "/".
+  // The same source feeds the FAQPage structured data baked into the homepage HTML.
+  usePageMeta('/');
 
   return (
     <div>

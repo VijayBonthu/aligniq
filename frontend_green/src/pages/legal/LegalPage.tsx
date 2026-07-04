@@ -2,6 +2,7 @@ import React from 'react';
 import { Link } from 'react-router-dom';
 import { Logo } from '../../components/Logo';
 import ThemeToggle from '../../components/layout/ThemeToggle';
+import SiteFooter from '../../components/layout/SiteFooter';
 import { usePageMeta } from '../../hooks/usePageMeta';
 
 interface Props {
@@ -20,10 +21,13 @@ interface Props {
 // Shared content-page shell (Terms, Privacy, About, Security, Careers, Changelog).
 // Reuses the landing nav + container styling; prose styled by the `.legal*` block in
 // globals.css. Legal pages get the default policy note; marketing pages pass their own.
-const LegalPage: React.FC<Props> = ({ title, path, description, updated, note, children }) => {
+// SEO title/description now come from src/seo/routes.mjs (keyed by `path`) — the
+// `title` prop is the visible <h1>, and `description` is accepted for back-compat but
+// no longer feeds meta (routes.mjs is the single source of truth).
+const LegalPage: React.FC<Props> = ({ title, path, updated, note, children }) => {
   const isPrivacy = title.toLowerCase().includes('privacy');
 
-  usePageMeta({ title: `${title} — GroundedIQ`, description, path });
+  usePageMeta(path);
 
   return (
     <div>
@@ -57,6 +61,8 @@ const LegalPage: React.FC<Props> = ({ title, path, description, updated, note, c
           </article>
         </div>
       </main>
+
+      <SiteFooter />
     </div>
   );
 };
