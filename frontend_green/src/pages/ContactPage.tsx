@@ -15,6 +15,7 @@ const SUPPORT_EMAIL = 'support@grounded-iq.com';
 const SALES_EMAIL = 'hello@grounded-iq.com';
 const X_URL = 'https://x.com/GroundedIQ';
 const INSTAGRAM_URL = 'https://www.instagram.com/groundediq';
+const LINKEDIN_URL = 'https://www.linkedin.com/company/grounded-iq';
 
 const TOPICS: { value: ContactTopic; label: string }[] = [
   { value: 'general', label: 'General question' },
@@ -241,7 +242,7 @@ const ContactPage: React.FC = () => {
 
               <div className="contact-channel">
                 <div className="contact-channel-h">Follow us</div>
-                <SocialIcons x={X_URL} instagram={INSTAGRAM_URL} />
+                <SocialIcons x={X_URL} instagram={INSTAGRAM_URL} linkedin={LINKEDIN_URL} />
               </div>
 
               <div className="contact-channel">

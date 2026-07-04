@@ -59,7 +59,10 @@ resource "aws_s3_bucket_website_configuration" "frontend" {
     suffix = "index.html"
   }
   error_document {
-    key = "index.html" # SPA fallback for React Router deep links
+    # SPA fallback: unknown keys render index.html — but S3 returns it with a 404
+    # status. Public marketing routes are published as real 200 objects by the
+    # frontend-deploy workflow so crawlers index them; app routes stay 404-fallback.
+    key = "index.html"
   }
 }
 
