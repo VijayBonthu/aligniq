@@ -25,11 +25,12 @@
     </script>
     <title>GroundedIQ — AI scoping & alignment reports for teams</title>
 
-    <!-- ── SEO: primary meta ── -->
-    <meta
-      name="description"
-      content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect."
-    />
+    <!-- ── SEO: primary meta ──
+         title / description / canonical / og:* / twitter:* below are the HOMEPAGE
+         defaults. The build-time prerender (scripts/prerender-meta.mjs) rewrites them
+         per route from src/seo/routes.mjs; each field is kept on a single line so the
+         injection regex stays robust. Do not reformat to multi-line. -->
+    <meta name="description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
     <link rel="canonical" href="https://grounded-iq.com/" />
     <meta id="robots-tag" name="robots" content="index, follow" />
     <meta name="theme-color" content="#0d0d11" />
@@ -54,10 +55,7 @@
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="GroundedIQ" />
     <meta property="og:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
-    <meta
-      property="og:description"
-      content="Reads a raw brief like your sharpest architect — surfacing the buried risks, raising the questions that move the estimate, and grounding every assumption in evidence. The alignment report your client signs before kickoff."
-    />
+    <meta property="og:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
     <meta property="og:url" content="https://grounded-iq.com/" />
     <meta property="og:image" content="https://grounded-iq.com/og-image.png" />
     <meta property="og:image:width" content="1200" />
@@ -68,14 +66,14 @@
     <!-- ── Twitter / X card ── -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
-    <meta
-      name="twitter:description"
-      content="Reads a raw brief like your sharpest architect — surfacing buried risks, raising the questions that move the estimate, grounding every assumption. The report your client signs before kickoff."
-    />
+    <meta name="twitter:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
     <meta name="twitter:image" content="https://grounded-iq.com/og-image.png" />
 
-    <!-- ── Structured data (Organization + SoftwareApplication) ── -->
-    <script type="application/ld+json">
+    <!-- ── Structured data ──
+         Homepage default graph; the prerender replaces this block per route from
+         src/seo/routes.mjs (adds WebSite, FAQPage, BreadcrumbList, Product, etc.).
+         The id="ld-json" is the injection anchor — keep it. -->
+    <script type="application/ld+json" id="ld-json">
       {
         "@context": "https://schema.org",
         "@graph": [
@@ -123,12 +121,28 @@
       }
     </script>
 
+    <!-- Fonts load non-render-blocking: preload the CSS, then apply it via the
+         media="print"/onload swap so it never blocks first paint. &display=swap keeps
+         text visible in a fallback face until the web font arrives (better LCP). -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
+      rel="preload"
+      as="style"
       href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Inter+Tight:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;600&display=swap"
-      rel="stylesheet"
     />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Inter+Tight:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;600&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Inter+Tight:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@400;500;600&display=swap"
+      />
+    </noscript>
   </head>
   <body>
     <div id="root"></div>

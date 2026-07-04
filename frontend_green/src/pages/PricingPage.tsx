@@ -4,7 +4,9 @@ import { useAuth } from '../context/AuthContext';
 import { startPlanChange, getPortalUrl, buyCreditPack, PaidTier, CreditPackSize } from '../services/billingService';
 import { PLANS, PRO_CONTACT_EMAIL, TIER_ORDER, CREDIT_PACKS, PlanDescriptor, Tier } from '../data/plans';
 import { Logo } from '../components/Logo';
+import SiteFooter from '../components/layout/SiteFooter';
 import { usePageMeta } from '../hooks/usePageMeta';
+import { track } from '../lib/analytics';
 
 export default function PricingPage() {
   const navigate = useNavigate();
@@ -13,12 +15,7 @@ export default function PricingPage() {
   const [loading, setLoading] = useState<string | null>(null);
   const [creditsAdded, setCreditsAdded] = useState(false);
 
-  usePageMeta({
-    title: 'Pricing — GroundedIQ',
-    description:
-      'GroundedIQ pricing — start free, then Basic $30/mo or Plus $70/mo with white-label exports. Turn a raw brief into an evidence-grounded scope clients sign before kickoff.',
-    path: '/pricing',
-  });
+  usePageMeta('/pricing');
 
   const currentTier: Tier | null = subscription?.tier ?? null;
   // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.
@@ -44,6 +41,7 @@ export default function PricingPage() {
   }, [location.search]);
 
   async function handleCta(plan: PlanDescriptor) {
+    track('Pricing CTA', { plan: plan.id, kind: plan.ctaKind });
     if (plan.ctaKind === 'contact') {
       window.location.href = `mailto:${PRO_CONTACT_EMAIL}?subject=GroundedIQ Pro Plan`;
       return;
@@ -245,6 +243,15 @@ export default function PricingPage() {
           })}
         </div>
 
+        {!isAuthenticated && (
+          <p style={{ textAlign: 'center', marginTop: 28, fontSize: 14, color: 'var(--fg-dim)' }}>
+            New to GroundedIQ?{' '}
+            <Link to="/signup" style={{ color: 'var(--accent)', fontWeight: 500 }}>
+              Create a free account →
+            </Link>
+          </p>
+        )}
+
         {/* Credit packs — prepaid top-ups, every tier. Spent when a plan's
             monthly allowance runs out (a frontier report ≈ 74 credits ≈ $7.40). */}
         <div style={{ maxWidth: 1100, margin: '56px auto 0' }}>
@@ -328,6 +335,8 @@ export default function PricingPage() {
           </div>
         )}
       </div>
+
+      <SiteFooter cta={false} />
     </div>
   );
 }

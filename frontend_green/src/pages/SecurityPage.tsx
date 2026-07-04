@@ -12,7 +12,7 @@ const note = (
 
 const SecurityPage: React.FC = () => (
   <LegalPage
-    title="Security &amp; data privacy"
+    title="Security & data privacy"
     path="/security"
     description="How GroundedIQ protects your data — encryption in transit and at rest, least-privilege access, and a commitment to never use your documents to train AI models."
     updated="June 28, 2026"

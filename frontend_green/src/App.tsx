@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'react-hot-toast';
@@ -7,23 +7,14 @@ import { SiteConfigProvider } from './context/SiteConfigContext';
 import MaintenanceGate from './components/ops/MaintenanceGate';
 import { ThemeProvider } from './context/ThemeContext';
 import ThemeToggle from './components/layout/ThemeToggle';
+// Public marketing + auth pages load eagerly — they're the entry points crawlers and
+// first-time visitors hit, so they must paint fast (and are lightweight).
 import LandingPage from './pages/LandingPage';
 import SignupPage from './pages/SignupPage';
 import LoginPage from './pages/LoginPage';
 import ResetPasswordPage from './pages/ResetPasswordPage';
 import VerifyEmailPage from './pages/VerifyEmailPage';
 import VerifyEmailRequiredPage from './pages/VerifyEmailRequiredPage';
-import PublicQuestionnaire from './pages/PublicQuestionnaire';
-import Dashboard from './pages/Dashboard';
-import ProjectsPage from './pages/ProjectsPage';
-import NewProjectFlow from './pages/NewProjectFlow';
-import ChatView from './pages/ChatView';
-import CompareView from './pages/CompareView';
-import FullPipelineProgress from './pages/FullPipelineProgress';
-import DeliverableBuilder from './pages/DeliverableBuilder';
-import Messages from './pages/Messages';
-import Reports from './pages/Reports';
-import Settings from './pages/Settings';
 import PricingPage from './pages/PricingPage';
 import ContactPage from './pages/ContactPage';
 import AboutPage from './pages/AboutPage';
@@ -32,18 +23,33 @@ import CareersPage from './pages/CareersPage';
 import ChangelogPage from './pages/ChangelogPage';
 import TermsPage from './pages/legal/TermsPage';
 import PrivacyPage from './pages/legal/PrivacyPage';
-import AppShell from './components/layout/AppShell';
 import ErrorBoundary from './components/ErrorBoundary';
 import UpgradeModal from './components/billing/UpgradeModal';
 import FirmAdminRoute from './components/auth/FirmAdminRoute';
 import StaffRoute from './components/auth/StaffRoute';
-import AdminConsole from './pages/admin/AdminConsole';
-import FirmSettings from './pages/firm/FirmSettings';
-import RateCardPage from './pages/firm/RateCard';
-import TeamTemplatesPage from './pages/firm/TeamTemplates';
-import TechPreferencesPage from './pages/firm/TechPreferences';
-import PastProjectsPage from './pages/firm/PastProjects';
-import PastProjectEditor from './pages/firm/PastProjectEditor';
+
+// Authenticated app surfaces are code-split: a marketing visitor never downloads the
+// Dashboard / Chat / Reports bundles or their heavy deps (marked, react-zoom-pan-pinch,
+// mermaid, docx/pdf export). Each loads on demand behind the <Suspense> below.
+const AppShell = lazy(() => import('./components/layout/AppShell'));
+const PublicQuestionnaire = lazy(() => import('./pages/PublicQuestionnaire'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const ProjectsPage = lazy(() => import('./pages/ProjectsPage'));
+const NewProjectFlow = lazy(() => import('./pages/NewProjectFlow'));
+const ChatView = lazy(() => import('./pages/ChatView'));
+const CompareView = lazy(() => import('./pages/CompareView'));
+const FullPipelineProgress = lazy(() => import('./pages/FullPipelineProgress'));
+const DeliverableBuilder = lazy(() => import('./pages/DeliverableBuilder'));
+const Messages = lazy(() => import('./pages/Messages'));
+const Reports = lazy(() => import('./pages/Reports'));
+const Settings = lazy(() => import('./pages/Settings'));
+const AdminConsole = lazy(() => import('./pages/admin/AdminConsole'));
+const FirmSettings = lazy(() => import('./pages/firm/FirmSettings'));
+const RateCardPage = lazy(() => import('./pages/firm/RateCard'));
+const TeamTemplatesPage = lazy(() => import('./pages/firm/TeamTemplates'));
+const TechPreferencesPage = lazy(() => import('./pages/firm/TechPreferences'));
+const PastProjectsPage = lazy(() => import('./pages/firm/PastProjects'));
+const PastProjectEditor = lazy(() => import('./pages/firm/PastProjectEditor'));
 
 function BgLayers() {
   const { pathname } = useLocation();
@@ -108,6 +114,23 @@ function UpgradeReturnRefresher() {
   return null;
 }
 
+// Shown while a code-split route chunk loads (only the authenticated app is lazy, so
+// this appears on first navigation into the app, not on the marketing pages).
+function RouteFallback() {
+  return (
+    <div style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center' }}>
+      <span
+        aria-label="Loading"
+        style={{
+          width: 26, height: 26, borderRadius: '50%',
+          border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)',
+          animation: 'spin 1s linear infinite',
+        }}
+      />
+    </div>
+  );
+}
+
 const queryClient = new QueryClient();
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -150,6 +173,7 @@ function App() {
           <GlobalUpgradeModal />
           <UpgradeReturnRefresher />
           <MaintenanceGate>
+          <Suspense fallback={<RouteFallback />}>
           <Routes>
             <Route path="/" element={<LandingPage />} />
             <Route path="/login" element={<LoginPage />} />
@@ -364,6 +388,7 @@ function App() {
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </Suspense>
           </MaintenanceGate>
           </SiteConfigProvider>
         </AuthProvider>

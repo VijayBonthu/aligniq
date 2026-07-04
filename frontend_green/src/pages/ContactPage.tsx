@@ -8,6 +8,8 @@ import { TurnstileWidget } from '../components/auth/TurnstileWidget';
 import { submitPublicContact, type ContactTopic } from '../services/supportService';
 import { notifyError } from '../services/api';
 import { SocialIcons } from '../components/SocialIcons';
+import SiteFooter from '../components/layout/SiteFooter';
+import { track } from '../lib/analytics';
 
 const TURNSTILE_ENABLED = !!import.meta.env.VITE_TURNSTILE_SITE_KEY;
 
@@ -57,12 +59,7 @@ const ContactPage: React.FC = () => {
   const [submitting, setSubmitting] = useState(false);
   const [doneRef, setDoneRef] = useState<string | null>(null);
 
-  usePageMeta({
-    title: 'Contact — GroundedIQ',
-    description:
-      'Contact GroundedIQ about sales, pricing, your account, or a bug. Reach the team via the form or email — a real person replies, usually within one business day.',
-    path: '/contact',
-  });
+  usePageMeta('/contact');
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -83,6 +80,7 @@ const ContactPage: React.FC = () => {
         honeypot,
       });
       setDoneRef(res.ref_code);
+      track('Contact Submitted', { topic });
     } catch (err) {
       notifyError(err, 'Could not send your message. Please try again.');
     } finally {
@@ -257,6 +255,8 @@ const ContactPage: React.FC = () => {
           </div>
         </div>
       </main>
+
+      <SiteFooter cta={false} />
     </div>
   );
 };

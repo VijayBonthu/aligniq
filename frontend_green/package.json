@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/prerender-meta.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -28,10 +28,8 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-hot-toast": "^2.5.2",
-    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.3.0",
     "react-zoom-pan-pinch": "^3.7.0",
-    "remark-gfm": "^4.0.1",
     "zod": "^3.24.2",
     "zustand": "^5.0.3"
   },
