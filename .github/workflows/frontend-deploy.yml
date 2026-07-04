@@ -88,3 +88,24 @@ jobs:
         run: |
           BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
           aws s3 cp dist/index.html "s3://${BUCKET}/index.html" --cache-control "public,max-age=0,must-revalidate" --content-type "text/html"
+
+      # SEO fix for SPA deep links. S3 static-website hosting serves index.html for
+      # any unknown key but returns it with a 404 status, so crawlers refused to
+      # index /pricing, /about, … (they only ever indexed the homepage, which is a
+      # real key). Publish a real object at each PUBLIC marketing route — same SPA
+      # shell, but now returned with HTTP 200 — so Googlebot indexes them. React
+      # Router still renders the correct page on load. The authenticated app routes
+      # (/projects, /chat, …) intentionally stay 404-fallback: they're Disallow'd in
+      # robots.txt and don't need indexing. Runs AFTER the `s3 sync --delete` above,
+      # which would otherwise prune these keys. Keep this list in sync with the
+      # public <url> entries in frontend_green/public/sitemap.xml.
+      - name: Publish public routes as HTTP 200 pages (SPA deep-link SEO fix)
+        env:
+          FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
+        run: |
+          BUCKET="$(printf '%s' "$FRONTEND_BUCKET" | tr -d '[:space:]')"
+          for route in about careers changelog contact pricing privacy security terms; do
+            aws s3 cp dist/index.html "s3://${BUCKET}/${route}" \
+              --cache-control "public,max-age=0,must-revalidate" \
+              --content-type "text/html"
+          done

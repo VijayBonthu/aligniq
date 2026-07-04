@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  The site is a single-page app served from S3 whose website config rewrites any
-  unknown path to index.html with HTTP 200 (error_document = index.html), so React
-  Router deep links like /contact and /security load correctly. List the public,
-  crawlable marketing routes here; the authenticated app routes are excluded via
-  robots.txt. Keep this in sync when adding a public page.
+  The site is a single-page app served from S3. S3's error_document (index.html)
+  makes deep links RENDER, but it returns them with an HTTP 404 status — which kept
+  crawlers from indexing them. So the frontend-deploy workflow publishes a real
+  index.html object at each public route below (returned as HTTP 200). List the
+  public, crawlable marketing routes here; the authenticated app routes are excluded
+  via robots.txt. When adding a public page, keep BOTH this file and the route list
+  in .github/workflows/frontend-deploy.yml in sync.
 -->
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>

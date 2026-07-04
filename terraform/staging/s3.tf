@@ -57,6 +57,8 @@ resource "aws_s3_bucket" "frontend" {
 
 # S3 website hosting: serves index.html for unknown keys (SPA fallback for
 # React Router deep links like /chat/abc, /projects, /full-pipeline/xyz).
+# NOTE: this fallback returns a 404 status. Public marketing routes are published
+# as real 200 objects by the frontend-deploy workflow so crawlers can index them.
 resource "aws_s3_bucket_website_configuration" "frontend" {
   bucket = aws_s3_bucket.frontend.id
   index_document {
