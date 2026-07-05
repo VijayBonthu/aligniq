@@ -7,19 +7,7 @@ import { Logo } from '../components/Logo';
 import SiteFooter from '../components/layout/SiteFooter';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { track } from '../lib/analytics';
-
-// Launch promo: percentage shown on the pricing cards. MUST match the Stripe launch
-// coupon's percent_off (config STRIPE_LAUNCH_COUPON_ID) or the displayed price won't
-// match what Stripe charges. Only shown when VITE_LAUNCH_OFFER is set.
-const LAUNCH_DISCOUNT_PCT = 70;
-
-// "$30" -> "$9" at the launch discount. Falls back to the original string if it
-// isn't a plain "$N" price (e.g. Free's "$0" or Pro's "Contact us").
-function discountedPrice(price: string): string {
-  const n = parseFloat(price.replace(/[^0-9.]/g, ''));
-  if (!isFinite(n) || n <= 0) return price;
-  return `$${Math.round(n * (1 - LAUNCH_DISCOUNT_PCT / 100))}`;
-}
+import { LAUNCH_OFFER, LAUNCH_DISCOUNT_PCT, discountedPrice } from '../lib/launchOffer';
 
 export default function PricingPage() {
   const navigate = useNavigate();
@@ -29,9 +17,6 @@ export default function PricingPage() {
   const [creditsAdded, setCreditsAdded] = useState(false);
 
   usePageMeta('/pricing');
-
-  // Launch promo flag (gated build-time via VITE_LAUNCH_OFFER).
-  const offer = import.meta.env.VITE_LAUNCH_OFFER;
 
   const currentTier: Tier | null = subscription?.tier ?? null;
   // pro is contact-sales (no self-serve Stripe portal); basic/plus self-manage.
@@ -148,7 +133,7 @@ export default function PricingPage() {
           <p style={{ fontSize: 16, color: 'var(--fg-dim)', margin: 0 }}>
             Upgrade anytime. Downgrade or cancel when you need to.
           </p>
-          {offer && (
+          {LAUNCH_OFFER && (
             <div
               style={{
                 marginTop: 18, display: 'inline-block', padding: '8px 16px',
@@ -230,7 +215,7 @@ export default function PricingPage() {
                   {plan.description}
                 </p>
 
-                {offer && plan.ctaKind === 'checkout' ? (
+                {LAUNCH_OFFER &&plan.ctaKind === 'checkout' ? (
                   <div style={{ marginBottom: 22 }}>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
                       <span style={{ fontSize: 18, color: 'var(--fg-muted)', textDecoration: 'line-through' }}>

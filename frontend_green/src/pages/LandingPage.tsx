@@ -9,6 +9,7 @@ import { SocialIcons } from '../components/SocialIcons';
 import { PLANS, PRO_CONTACT_EMAIL } from '../data/plans';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { FAQS } from '../seo/routes.mjs';
+import { LAUNCH_OFFER, LAUNCH_DISCOUNT_PCT, discountedPrice } from '../lib/launchOffer';
 
 const X_URL = 'https://x.com/GroundedIQ';
 const INSTAGRAM_URL = 'https://www.instagram.com/groundediq';
@@ -143,6 +144,11 @@ const LandingPage: React.FC = () => {
           <Reveal>
             <div className="eyebrow section-eyebrow">Pricing</div>
             <h2 className="display section-h">Priced to scope your whole pipeline.</h2>
+            {LAUNCH_OFFER && (
+              <p className="section-sub" style={{ margin: '8px 0 0', color: 'var(--accent)', fontWeight: 500 }}>
+                🎉 Launch offer — {LAUNCH_DISCOUNT_PCT}% off your first 2 months on Basic &amp; Plus for new subscribers.
+              </p>
+            )}
           </Reveal>
           <Reveal delay={80}>
             <div className="tiers">
@@ -161,9 +167,29 @@ const LandingPage: React.FC = () => {
                     {plan.highlight && <div className="tier-badge">MOST POPULAR</div>}
                     <div className="tier-name display">{plan.name}</div>
                     <div className="tier-price-row">
-                      <span className="display tier-price">{plan.price}</span>
-                      {periodLabel && <span className="tier-per">{periodLabel}</span>}
+                      {LAUNCH_OFFER && plan.ctaKind === 'checkout' ? (
+                        <>
+                          <span
+                            className="display tier-price"
+                            style={{ textDecoration: 'line-through', opacity: 0.45, fontSize: '0.62em', marginRight: 8 }}
+                          >
+                            {plan.price}
+                          </span>
+                          <span className="display tier-price">{discountedPrice(plan.price)}</span>
+                          {periodLabel && <span className="tier-per">{periodLabel}</span>}
+                        </>
+                      ) : (
+                        <>
+                          <span className="display tier-price">{plan.price}</span>
+                          {periodLabel && <span className="tier-per">{periodLabel}</span>}
+                        </>
+                      )}
                     </div>
+                    {LAUNCH_OFFER && plan.ctaKind === 'checkout' && (
+                      <div style={{ fontSize: 11.5, color: 'var(--accent)', fontWeight: 500, marginTop: 2 }}>
+                        {LAUNCH_DISCOUNT_PCT}% off · first 2 months, then {plan.price}{periodLabel}
+                      </div>
+                    )}
                     <div className="tier-sub">{plan.description}</div>
                     <div className="tier-sep" />
                     <ul className="tier-feats">
