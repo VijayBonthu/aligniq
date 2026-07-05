@@ -2804,6 +2804,26 @@ def revoke_share_token(presales_id: str, user_id: str, db: Session) -> dict:
     return {"status": "revoked", "presales_id": presales_id}
 
 
+def reopen_client_questionnaire(presales_id: str, user_id: str, db: Session) -> dict:
+    """Undo an (accidental) client submission so they can continue on the SAME link
+    (owner-scoped). Clears `client_submitted_at` (the "done/locked" signal the public
+    page reads) and ensures a working share token exists — restoring it if report
+    generation had auto-revoked it. Their already-submitted answers are kept (the
+    client edits them and re-submits). Returns the (possibly restored) token."""
+    import uuid
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Presales analysis not found")
+    row.client_submitted_at = None
+    if not row.client_share_token:
+        row.client_share_token = uuid.uuid4().hex
+    db.commit()
+    return {"token": row.client_share_token, "presales_id": presales_id, "reopened": True}
+
+
 def get_presales_by_share_token(token: str, db: Session):
     """Return the PresalesAnalysis ORM row for a share token, or None. No user scope —
     the token IS the authorization."""

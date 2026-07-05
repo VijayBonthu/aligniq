@@ -107,8 +107,11 @@ export default function QuestionsStep({
   const [shareOpen, setShareOpen] = useState(false);
   const [shareLink, setShareLink] = useState<string | null>(null);
   const [clientEmail, setClientEmail] = useState('');
-  const [sharing, setSharing] = useState<null | 'send' | 'remind' | 'revoke' | 'copy' | 'mark'>(null);
+  const [sharing, setSharing] = useState<null | 'send' | 'remind' | 'revoke' | 'copy' | 'mark' | 'reopen'>(null);
   const [markedShared, setMarkedShared] = useState(false);
+  // Locally track an "unlock" so the firm can let a client who submitted by mistake
+  // continue on the same link (clears the parent-provided clientSubmittedAt for display).
+  const [reopened, setReopened] = useState(false);
   const linkInputRef = useRef<HTMLInputElement | null>(null);
 
   // Pre-mint the link as soon as the panel opens so the Copy button can write to the
@@ -209,6 +212,22 @@ export default function QuestionsStep({
       toast.success('Client link revoked');
     } catch {
       toast.error('Could not revoke the link');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  const reopenForClient = async () => {
+    if (!window.confirm('Reopen this questionnaire for the client? They can continue and re-submit on the same link. Their current answers are kept.')) return;
+    setSharing('reopen');
+    try {
+      const { token } = await presalesService.reopenClientLink(presalesId);
+      setShareLink(`${window.location.origin}/q/${token}`);
+      setReopened(true);
+      setShareOpen(true);  // surface the share panel so they can remind/copy the link
+      toast.success('Reopened — your client can continue on the same link. Send a reminder or copy it below.');
+    } catch {
+      toast.error('Could not reopen the questionnaire');
     } finally {
       setSharing(null);
     }
@@ -439,9 +458,21 @@ export default function QuestionsStep({
           Answer what you can — the more precise your answers to the critical blockers, the tighter the
           estimate. Anything left blank becomes an explicit, reviewable assumption in the next step.
         </p>
-        {clientSubmittedAt ? (
-          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--ok-soft)', border: '1px solid var(--border)', color: 'var(--ok)', fontSize: 13 }}>
-            ✓ Client submitted {clientAnswered} answer{clientAnswered === 1 ? '' : 's'} on {new Date(clientSubmittedAt).toLocaleString()} — review them below, then run the readiness analysis.
+        {clientSubmittedAt && !reopened ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--ok-soft)', border: '1px solid var(--border)', color: 'var(--ok)', fontSize: 13, display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+            <span>✓ Client submitted {clientAnswered} answer{clientAnswered === 1 ? '' : 's'} on {new Date(clientSubmittedAt).toLocaleString()} — review them below, then run the readiness analysis.</span>
+            <button
+              onClick={reopenForClient}
+              disabled={!!sharing}
+              title="Submitted by mistake? Reopen so the client can continue and re-submit on the same link."
+              style={{ flexShrink: 0, background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 8, color: 'var(--fg-dim)', fontSize: 12, padding: '6px 11px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              {sharing === 'reopen' ? 'Reopening…' : '↩ Reopen for client'}
+            </button>
+          </div>
+        ) : reopened ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: 13 }}>
+            ↩ Reopened — your client can continue and re-submit on the same link. Use “Send to client” below to remind them or copy the link.
           </div>
         ) : clientAnswered > 0 ? (
           <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: 13 }}>

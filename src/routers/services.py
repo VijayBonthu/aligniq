@@ -5755,6 +5755,26 @@ async def revoke_questionnaire_share_link(
         raise HTTPException(status_code=500, detail=f"Error revoking share link: {str(e)}")
 
 
+@router.post('/presales/{presales_id}/reopen-client-link')
+async def reopen_questionnaire_for_client(
+    presales_id: str,
+    current_user=Depends(token_validator),
+    db: Session = Depends(get_db),
+):
+    """Undo an accidental client submission: clears the 'submitted/locked' flag and
+    ensures the share link works again, so the client can continue and re-submit on the
+    same URL. Their answers are preserved. Returns the (restored) token."""
+    from database_scripts import reopen_client_questionnaire
+    user_id = current_user["regular_login_token"]["id"]
+    try:
+        return reopen_client_questionnaire(presales_id, user_id, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reopening client questionnaire: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error reopening client questionnaire: {str(e)}")
+
+
 def _firm_name_for_user(user_id: str, db: Session) -> str:
     try:
         u = db.query(models.User).filter(models.User.user_id == user_id).first()

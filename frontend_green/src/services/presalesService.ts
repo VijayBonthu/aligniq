@@ -78,6 +78,12 @@ export async function revokeShareLink(presalesId: string) {
   return data;
 }
 
+/** Undo an accidental client submission so they can continue on the same link. */
+export async function reopenClientLink(presalesId: string): Promise<{ token: string; reopened: boolean }> {
+  const { data } = await api.post(`/presales/${presalesId}/reopen-client-link`);
+  return data;
+}
+
 /** Ensure a link, store the client's email, and email them the questionnaire. */
 export async function sendClientLink(presalesId: string, clientEmail: string, message?: string): Promise<{ token: string; link: string; emailed: boolean }> {
   const { data } = await api.post(`/presales/${presalesId}/send-client-link`, { client_email: clientEmail, message });
