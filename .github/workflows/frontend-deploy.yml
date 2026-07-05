@@ -57,10 +57,18 @@ jobs:
       # doesn't bake in ".../api/v1%20/..." or a key with a trailing newline.
       # (The Stripe publishable key is NOT here — the SPA fetches it at runtime
       # from GET /billing/publishable-key.)
+      #
+      # Feature flags below are read directly from the env by Vite (they need no
+      # transform). MUST be listed here or the GitHub Actions variable is invisible
+      # to the build and the feature silently stays off:
+      #   VITE_LAUNCH_OFFER      — "true" shows the pricing-page launch-discount banner + card prices
+      #   VITE_PLAUSIBLE_DOMAIN  — set to enable cookieless analytics (lib/analytics.ts)
       - name: Build
         env:
           VITE_API_URL_RAW: ${{ vars.VITE_API_URL }}
           VITE_TURNSTILE_SITE_KEY_RAW: ${{ vars.VITE_TURNSTILE_SITE_KEY }}
+          VITE_LAUNCH_OFFER: ${{ vars.VITE_LAUNCH_OFFER }}
+          VITE_PLAUSIBLE_DOMAIN: ${{ vars.VITE_PLAUSIBLE_DOMAIN }}
         run: |
           export VITE_API_URL="$(printf '%s' "$VITE_API_URL_RAW" | tr -d '[:space:]')"
           export VITE_TURNSTILE_SITE_KEY="$(printf '%s' "$VITE_TURNSTILE_SITE_KEY_RAW" | tr -d '[:space:]')"
