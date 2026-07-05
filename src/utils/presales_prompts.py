@@ -188,7 +188,15 @@ Look for:
 - Scope that sounds small but is actually large
 - Missing critical information that blocks estimation
 
-For each blocker, create a specific QUESTION to ask the client.
+For each blocker, create a specific QUESTION to ask the client. Then enrich it so it is
+answerable in one click, not a survey:
+- `priority`: "blocking" — a P1 blocker is blocking by definition.
+- `theme`: the normalized group (systems_data | identity_access | payments | integration |
+  compliance_security | scale_ops | delivery | commercial | other).
+- `respondent_role`: who can actually answer it — "business", "technical", "security", or "procurement".
+- `estimate_impact`: one line on how much this swings cost/timeline/architecture if the answer surprises you.
+- `default_assumption` (+ `default_assumption_risk`: low|medium|high): the single most likely answer we'll
+  assume if the client says nothing — so they can accept the default in one click instead of writing an essay.
 
 ### 2. Kickstart Questions (Critical Unknowns)
 Questions that MUST be answered before accurate scoping, drawn from the dominant axes' banks above. Categorize by:
@@ -197,6 +205,17 @@ Questions that MUST be answered before accurate scoping, drawn from the dominant
 - **Integration**: APIs, protocols, data contracts, SLAs
 - **Scale**: Users, transactions, growth projections
 - **Compliance**: Regulations, data residency, audit requirements
+
+Enrich EACH kickstart question the same way as blockers — `theme`, `respondent_role`,
+`estimate_impact`, and a `default_assumption` (+risk) so it is answerable in one click. Set
+`priority` per question: "blocking" if we genuinely cannot price without it, "clarifying" if it
+merely sharpens the estimate, "optional" if it is a nice-to-have. Be ruthless — most are clarifying,
+few are truly blocking.
+
+CONSOLIDATE before you output: never ask the same thing as a P1 blocker AND again as a kickstart
+question, and don't split one concern into several near-identical questions. Merge duplicates into the
+single sharpest question. Ask the FEWEST questions that still capture the requirements and surface the
+risks — a Fortune-500 buyer judges you on signal, not volume.
 
 ### 3. Technology Risks
 If they specified technologies, flag known issues. BE SPECIFIC, and ANCHOR EVERY RISK to this document:
@@ -243,17 +262,29 @@ Return ONLY valid JSON with this exact structure:
   "p1_blockers": [
     {{
       "area": "Integration|Performance|Security|Data|Timeline|Scope|Other",
+      "theme": "systems_data|identity_access|payments|integration|compliance_security|scale_ops|delivery|commercial|other",
+      "priority": "blocking",
+      "respondent_role": "business|technical|security|procurement",
       "blocker": "What the issue/blocker is",
       "why_it_matters": "Why this must be resolved before proceeding",
-      "question": "Specific question to ask the client"
+      "estimate_impact": "How much this swings cost/timeline/architecture if the answer surprises you",
+      "question": "Specific question to ask the client",
+      "default_assumption": "The single most likely answer we'll assume if unanswered",
+      "default_assumption_risk": "low|medium|high"
     }}
   ],
   "critical_unknowns": [
     {{
       "category": "data|security|integration|scale|compliance|other",
+      "theme": "systems_data|identity_access|payments|integration|compliance_security|scale_ops|delivery|commercial|other",
+      "priority": "blocking|clarifying|optional",
+      "respondent_role": "business|technical|security|procurement",
       "question": "The specific question to ask the client",
       "why_critical": "Why this must be answered before scoping",
-      "impact_if_unknown": "What goes wrong if we proceed without this answer"
+      "impact_if_unknown": "What goes wrong if we proceed without this answer",
+      "estimate_impact": "How much this swings cost/timeline/architecture if the answer surprises you",
+      "default_assumption": "The single most likely answer we'll assume if unanswered",
+      "default_assumption_risk": "low|medium|high"
     }}
   ],
   "technology_risks": [
@@ -281,8 +312,12 @@ Return ONLY valid JSON with this exact structure:
 3. Prioritize by what changes the COST, TIMELINE, or ARCHITECTURE the most if the answer
    surprises you — that variance, not topical importance, is the ranking key. Most
    consequential items first.
-4. Maximum items: 5 P1 blockers, 10 critical unknowns, 10 technology risks, 5 red flags, 5 underplay flags
+4. Maximum items: 5 P1 blockers, 8 critical unknowns, 10 technology risks, 5 red flags, 5 underplay flags.
+   Fewer is better — only ask what genuinely changes the estimate.
 5. If no items for a category, return empty array []
+6. Every "blocking" item (all P1 blockers + any blocking kickstart question) MUST include a concrete
+   `default_assumption` so it is answerable in one click. No blocking item without a default.
+7. A concern appears ONCE, as the single sharpest question — never as both a P1 blocker and a kickstart question.
 
 Think: "What would bite a team 3 months into this project?"
 Return ONLY the JSON, no other text.
@@ -331,7 +366,15 @@ Look for:
 - Scope that sounds small but is actually large
 - Missing critical information that blocks estimation
 
-For each blocker, create a specific QUESTION to ask the client.
+For each blocker, create a specific QUESTION to ask the client. Then enrich it so it is
+answerable in one click, not a survey:
+- `priority`: "blocking" — a P1 blocker is blocking by definition.
+- `theme`: the normalized group (systems_data | identity_access | payments | integration |
+  compliance_security | scale_ops | delivery | commercial | other).
+- `respondent_role`: who can actually answer it — "business", "technical", "security", or "procurement".
+- `estimate_impact`: one line on how much this swings cost/timeline/architecture if the answer surprises you.
+- `default_assumption` (+ `default_assumption_risk`: low|medium|high): the single most likely answer we'll
+  assume if the client says nothing — so they can accept the default in one click instead of writing an essay.
 
 ### 2. Kickstart Questions (Critical Unknowns)
 Questions that MUST be answered before accurate scoping, drawn from the dominant axes' banks above. Categorize by:
@@ -340,6 +383,17 @@ Questions that MUST be answered before accurate scoping, drawn from the dominant
 - **Integration**: APIs, protocols, data contracts, SLAs
 - **Scale**: Users, transactions, growth projections
 - **Compliance**: Regulations, data residency, audit requirements
+
+Enrich EACH kickstart question the same way as blockers — `theme`, `respondent_role`,
+`estimate_impact`, and a `default_assumption` (+risk) so it is answerable in one click. Set
+`priority` per question: "blocking" if we genuinely cannot price without it, "clarifying" if it
+merely sharpens the estimate, "optional" if it is a nice-to-have. Be ruthless — most are clarifying,
+few are truly blocking.
+
+CONSOLIDATE before you output: never ask the same thing as a P1 blocker AND again as a kickstart
+question, and don't split one concern into several near-identical questions. Merge duplicates into the
+single sharpest question. Ask the FEWEST questions that still capture the requirements and surface the
+risks — a Fortune-500 buyer judges you on signal, not volume.
 
 ### 3. Technology Risks
 First, identify the technologies, frameworks, or platforms named in the document.
@@ -388,17 +442,29 @@ Return ONLY valid JSON with this exact structure:
   "p1_blockers": [
     {{
       "area": "Integration|Performance|Security|Data|Timeline|Scope|Other",
+      "theme": "systems_data|identity_access|payments|integration|compliance_security|scale_ops|delivery|commercial|other",
+      "priority": "blocking",
+      "respondent_role": "business|technical|security|procurement",
       "blocker": "What the issue/blocker is",
       "why_it_matters": "Why this must be resolved before proceeding",
-      "question": "Specific question to ask the client"
+      "estimate_impact": "How much this swings cost/timeline/architecture if the answer surprises you",
+      "question": "Specific question to ask the client",
+      "default_assumption": "The single most likely answer we'll assume if unanswered",
+      "default_assumption_risk": "low|medium|high"
     }}
   ],
   "critical_unknowns": [
     {{
       "category": "data|security|integration|scale|compliance|other",
+      "theme": "systems_data|identity_access|payments|integration|compliance_security|scale_ops|delivery|commercial|other",
+      "priority": "blocking|clarifying|optional",
+      "respondent_role": "business|technical|security|procurement",
       "question": "The specific question to ask the client",
       "why_critical": "Why this must be answered before scoping",
-      "impact_if_unknown": "What goes wrong if we proceed without this answer"
+      "impact_if_unknown": "What goes wrong if we proceed without this answer",
+      "estimate_impact": "How much this swings cost/timeline/architecture if the answer surprises you",
+      "default_assumption": "The single most likely answer we'll assume if unanswered",
+      "default_assumption_risk": "low|medium|high"
     }}
   ],
   "technology_risks": [
@@ -426,8 +492,12 @@ Return ONLY valid JSON with this exact structure:
 3. Prioritize by what changes the COST, TIMELINE, or ARCHITECTURE the most if the answer
    surprises you — that variance, not topical importance, is the ranking key. Most
    consequential items first.
-4. Maximum items: 5 P1 blockers, 10 critical unknowns, 10 technology risks, 5 red flags, 5 underplay flags
+4. Maximum items: 5 P1 blockers, 8 critical unknowns, 10 technology risks, 5 red flags, 5 underplay flags.
+   Fewer is better — only ask what genuinely changes the estimate.
 5. If no items for a category, return empty array []
+6. Every "blocking" item (all P1 blockers + any blocking kickstart question) MUST include a concrete
+   `default_assumption` so it is answerable in one click. No blocking item without a default.
+7. A concern appears ONCE, as the single sharpest question — never as both a P1 blocker and a kickstart question.
 
 Think: "What would bite a team 3 months into this project?"
 Return ONLY the JSON, no other text.
@@ -740,6 +810,9 @@ Our goal is to SAVE TIME while capturing requirements that would cause project d
 **Questions and Answers:**
 {questions_with_answers}
 
+**Additional Context (free-text notes from the client/team — treat as authoritative as answers):**
+{additional_context}
+
 ## ANALYSIS TASKS
 
 ### 1. Contradiction Detection (BE STRICT)
@@ -797,18 +870,26 @@ Score should reflect: "Can we start the project with this information?"
 
 BE GENEROUS with scoring - our goal is to help them move forward, not block them.
 
-### 6. Follow-up Questions (ONLY IF CRITICAL)
-Suggest follow-up questions ONLY if:
-- There's a critical gap that assumptions can't safely cover
-- The answer revealed something that fundamentally changes scope
-- Maximum 2 follow-up questions per analysis (respect user's time)
-- Never suggest follow-ups for things mentioned in the document
-- NEVER re-ask anything semantically equivalent to ANY question in the
-  Questions and Answers list above — including F-numbered follow-ups from a
-  previous analysis — no matter how differently you word it. If an existing
-  question already covers the gap and is unanswered, the correct move is an
-  assumption for it, not a reworded duplicate. Most analyses should return
-  an EMPTY follow_up_questions list.
+### 6. Follow-up Questions — cascade a NEW blocking risk (only when real)
+The most valuable follow-up is one an ANSWER just revealed. When a user's answer (or the
+additional context) exposes a NEW blocking risk that no existing question covers — e.g. "we take
+card payments online" reveals PCI-DSS scope, or "the same customer has several logins across two
+systems" reveals an identity-resolution problem, or "there's no test environment" reveals a
+vendor-access risk — raise it as a follow-up with `priority: "blocking"`. This is precisely how the
+tool fishes out the risk the client didn't know to mention.
+
+Rules:
+- Raise a follow-up ONLY for a genuinely NEW blocking risk (or a critical gap assumptions can't
+  safely cover) that an answer/context surfaced — never for things already in the document or
+  covered by an existing question.
+- NEVER re-ask anything semantically equivalent to ANY question in the Questions and Answers list
+  above — including F-numbered follow-ups from previous analyses — however differently worded. If an
+  existing unanswered question already covers the gap, make an ASSUMPTION for it instead of a
+  reworded duplicate.
+- Maximum 5 follow-ups, blocking ones first. Most routine analyses return an EMPTY list — silence is
+  correct when no answer revealed anything new.
+- Enrich every follow-up like a curated question: `theme`, `respondent_role`, `estimate_impact`, and
+  a `default_assumption` (+risk) so it is answerable in one click.
 
 ## OUTPUT FORMAT
 Return ONLY valid JSON with this exact structure:
@@ -848,7 +929,14 @@ Return ONLY valid JSON with this exact structure:
     "kickstart_total": 8,
     "good_quality_answers": 6,
     "vague_count": 2,
-    "summary": "Friendly summary of where we stand - focus on what's GOOD"
+    "summary": "Friendly summary of where we stand - focus on what's GOOD",
+    "themes": [
+      {{"theme": "payments", "answered": 0, "total": 2, "status": "weak"}},
+      {{"theme": "identity_access", "answered": 1, "total": 2, "status": "partial"}}
+    ],
+    "top_gaps": [
+      "One line on the single most important thing still missing or covered only by a high-risk assumption"
+    ]
   }},
   "assumptions": [
     {{
@@ -861,9 +949,14 @@ Return ONLY valid JSON with this exact structure:
   ],
   "follow_up_questions": [
     {{
-      "question_text": "Specific follow-up question",
-      "reason": "Why this is critically needed",
-      "priority": "high",
+      "question_text": "Specific follow-up question the answer revealed we must ask",
+      "reason": "Why this is critically needed / what new risk it surfaces",
+      "priority": "blocking|clarifying",
+      "theme": "systems_data|identity_access|payments|integration|compliance_security|scale_ops|delivery|commercial|other",
+      "respondent_role": "business|technical|security|procurement",
+      "estimate_impact": "How much this swings cost/timeline if unanswered",
+      "default_assumption": "The default we'll assume if unanswered",
+      "default_assumption_risk": "low|medium|high",
       "based_on": "Which answer triggered this"
     }}
   ],

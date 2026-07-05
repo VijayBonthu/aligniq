@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import * as presalesService from '../../services/presalesService';
+import { ThemeSectionHeader } from '../ui/QuestionMeta';
 
 export interface AnalysisAssumption {
   id?: string;
@@ -26,11 +27,20 @@ interface AnalysisStepProps {
   onReviseAnswer?: (displayId?: string) => void;
 }
 
+export interface ReadinessTheme {
+  theme?: string;
+  answered?: number;
+  total?: number;
+  status?: string;
+}
+
 export interface AnalysisData {
   readiness?: {
     score?: number;
     status?: string;
     summary?: string;
+    themes?: ReadinessTheme[];
+    top_gaps?: string[];
   };
   created_followups?: Array<{
     question_id?: string;
@@ -283,6 +293,50 @@ export default function AnalysisStep({
           </div>
         </div>
       </div>
+
+      {((data.readiness?.themes?.length ?? 0) > 0 || (data.readiness?.top_gaps?.length ?? 0) > 0) && (
+        <div
+          style={{
+            padding: '16px 18px',
+            borderRadius: 12,
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            marginBottom: 20,
+          }}
+        >
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: '.12em',
+            textTransform: 'uppercase', color: 'var(--fg-muted)', margin: '0 0 12px' }}>
+            What's lacking — readiness by area
+          </p>
+          {(data.readiness?.themes || []).map((t, i) => (
+            <ThemeSectionHeader
+              key={t.theme || i}
+              theme={t.theme || 'other'}
+              answered={t.answered ?? 0}
+              total={t.total ?? 0}
+              right={
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, textTransform: 'uppercase',
+                  color: (t.status === 'weak') ? 'var(--danger)' : (t.status === 'partial') ? 'var(--warn)' : 'var(--ok)' }}>
+                  {t.status || ''}
+                </span>
+              }
+            />
+          ))}
+          {(data.readiness?.top_gaps?.length ?? 0) > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <p style={{ fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: '.1em',
+                textTransform: 'uppercase', color: 'var(--danger)', margin: '0 0 6px' }}>
+                Biggest gaps
+              </p>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {(data.readiness?.top_gaps || []).map((g, i) => (
+                  <li key={i} style={{ fontSize: 13, color: 'var(--fg-dim)', lineHeight: 1.55, marginBottom: 3 }}>{g}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
 
       {statusKey === 'needs_more_info' && (
         <div

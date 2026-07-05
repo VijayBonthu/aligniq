@@ -10,6 +10,7 @@ import IntegrationsSidebar from '../components/chat/IntegrationsSidebar';
 import PreMortemPanel from '../components/chat/PreMortemPanel';
 import ToolActivity from '../components/chat/ToolActivity';
 import PendingChangesPanel from '../components/chat/PendingChangesPanel';
+import ChatOpenItemsPanel from '../components/chat/ChatOpenItemsPanel';
 import VersionsPanel from '../components/chat/VersionsPanel';
 import CostEditor from '../components/chat/CostEditor';
 import LockedFeature from '../components/billing/LockedFeature';
@@ -113,6 +114,7 @@ export default function ChatView() {
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<TabKey>('chat');
   const [pendingOpen, setPendingOpen] = useState(false);
+  const [openItemsOpen, setOpenItemsOpen] = useState(false);
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [costEditorOpen, setCostEditorOpen] = useState(false);
   const [changeDraft, setChangeDraft] = useState<string | undefined>(undefined);
@@ -517,6 +519,14 @@ export default function ChatView() {
             style={headerPill(reportReady)}
           >
             Changes
+          </button>
+          <button
+            onClick={() => { if (reportReady) setOpenItemsOpen(true); }}
+            disabled={!reportReady}
+            title="Answer still-open questions and regenerate a sharper report"
+            style={headerPill(reportReady)}
+          >
+            Open questions
           </button>
           <button
             onClick={() => { if (reportReady) setCostEditorOpen(true); }}
@@ -1200,6 +1210,14 @@ export default function ChatView() {
           open={pendingOpen}
           onClose={() => { setPendingOpen(false); setChangeDraft(undefined); }}
           draft={changeDraft}
+        />
+      )}
+      {chatHistoryId && (
+        <ChatOpenItemsPanel
+          presalesId={record?.presales_id}
+          chatHistoryId={chatHistoryId}
+          open={openItemsOpen}
+          onClose={() => setOpenItemsOpen(false)}
         />
       )}
       {chatHistoryId && (

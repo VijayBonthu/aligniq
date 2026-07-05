@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import * as presalesService from '../../services/presalesService';
 import type { AnalysisAssumption } from './AnalysisStep';
+import { PriorityPill, RoleChip, ThemeChip, EstimateImpact, DefaultAssumption } from '../ui/QuestionMeta';
 
 export interface PresalesQuestion {
   question_id?: string;
@@ -23,6 +24,12 @@ export interface PresalesQuestion {
   area_or_category?: string;
   impact_description?: string;
   status?: string;
+  // Enterprise curation (A2)
+  theme?: string | null;
+  respondent_role?: string | null;
+  estimate_impact?: string | null;
+  default_assumption?: string | null;
+  default_assumption_risk?: string | null;
 }
 
 interface QuestionsStepProps {
@@ -347,8 +354,10 @@ export default function QuestionsStep({
       pushFor(kickstart, 'question');
       pushFor(followUps, 'followup');
 
-      if (payload.length > 0) {
-        await presalesService.saveAnswers(presalesId, payload);
+      // Always persist when there are answers OR free-text context, so the durable
+      // additional_context reaches the analyzer + CRD (it used to only ride on report gen).
+      if (payload.length > 0 || additionalContext.trim()) {
+        await presalesService.saveAnswers(presalesId, payload, additionalContext);
       }
       onComplete();
     } catch (err) {
@@ -488,8 +497,8 @@ export default function QuestionsStep({
         <main style={{ minWidth: 0 }}>
           {p1.length > 0 && (
             <QuestionGroup
-              eyebrow={`P1 BLOCKERS · ${p1.length} CRITICAL`}
-              note="Must answer before report generation"
+              eyebrow={`BLOCKING · ${p1.length} CRITICAL`}
+              note="Answer or accept a default before generating — these move the estimate most"
               accent="var(--danger)"
               questions={p1}
               numberPrefix="P1"
@@ -520,8 +529,8 @@ export default function QuestionsStep({
           )}
           {kickstart.length > 0 && (
             <QuestionGroup
-              eyebrow={`KICKSTART QUESTIONS · ${kickstart.length} ITEMS`}
-              note="Sharpen the plan — optional but valuable"
+              eyebrow={`CLARIFYING · ${kickstart.length} ITEMS`}
+              note="Sharpen the plan — each has a smart default you can accept"
               accent="var(--accent)"
               questions={kickstart}
               numberPrefix="Q"
@@ -901,6 +910,7 @@ function QuestionCard({
               {why}
             </p>
           )}
+          <EstimateImpact text={q.estimate_impact} />
           {showImpact && (
             <div
               style={{
@@ -934,8 +944,10 @@ function QuestionCard({
               </p>
             </div>
           )}
-          <div style={{ display: 'flex', gap: 5, marginTop: 9, flexWrap: 'wrap' }}>
-            {category && <MetaTag>{category}</MetaTag>}
+          <div style={{ display: 'flex', gap: 5, marginTop: 9, flexWrap: 'wrap', alignItems: 'center' }}>
+            <PriorityPill priority={q.priority || (isBlocker ? 'blocking' : 'clarifying')} />
+            {q.theme ? <ThemeChip theme={q.theme} /> : (category ? <MetaTag>{category}</MetaTag> : null)}
+            <RoleChip role={q.respondent_role} />
             {hasAssumption && (
               <span
                 style={{
@@ -1025,6 +1037,17 @@ function QuestionCard({
           >
             {skippedNoAnswer ? '✓ Will be assumed — undo' : 'I can’t answer this — assume for me'}
           </button>
+        )}
+        {state === 'empty' && !assumption && q.default_assumption && (
+          <DefaultAssumption
+            text={q.default_assumption}
+            risk={q.default_assumption_risk}
+            onAccept={() => setAnswers((p) => ({ ...p, [answerKey]: q.default_assumption || '' }))}
+            onOverride={() => {
+              const el = document.getElementById(anchorId)?.querySelector('textarea') as HTMLTextAreaElement | null;
+              el?.focus();
+            }}
+          />
         )}
         {state === 'empty' && assumption && (
           <div

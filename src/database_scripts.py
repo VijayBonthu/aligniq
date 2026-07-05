@@ -2376,6 +2376,102 @@ async def get_user_presales_history(user_id: str, db: Session, limit: int = 20) 
 # PRESALES QUESTION MANAGEMENT
 # =============================================================================
 
+# Normalized enums for curated questions — the deterministic guard around the LLM's
+# free-form output (per the project's "LLM writes need deterministic guards" rule).
+_VALID_THEMES = {
+    "systems_data", "identity_access", "payments", "integration",
+    "compliance_security", "scale_ops", "delivery", "commercial", "other",
+}
+_VALID_ROLES = {"business", "technical", "security", "procurement"}
+_VALID_PRIORITIES = {"blocking", "clarifying", "optional"}
+_VALID_RISK = {"low", "medium", "high"}
+_PRIORITY_RANK = {"blocking": 0, "clarifying": 1, "optional": 2}
+
+# Volume caps keep the client from facing a survey. Blocking is the ceiling that matters;
+# overflow is demoted to clarifying (which the UI collapses), never silently dropped.
+_MAX_BLOCKING_QUESTIONS = 8
+_MAX_NONBLOCKING_QUESTIONS = 10
+
+
+def _norm_enum(value, allowed: set, fallback: str) -> str:
+    v = (value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return v if v in allowed else fallback
+
+
+def consolidate_questions(p1_blockers: list, kickstart_questions: list) -> list:
+    """Deterministically curate the blind-spot detector's raw output into a single,
+    deduped, prioritized, role-tagged, default-guaranteed question set.
+
+    The detector emits two overlapping lists (p1_blockers + critical_unknowns) that can
+    ask the same thing twice and don't always fill the enrichment fields. This function is
+    the deterministic guard: it merges + fuzzy-dedupes both lists (a P1 and a kickstart
+    often say the same thing), normalizes the enums, GUARANTEES every blocking question
+    carries a default_assumption so it's answerable in one click, orders blocking-first,
+    and caps the volume. Returns unified curated-question dicts in final display order.
+    """
+    from difflib import SequenceMatcher
+
+    curated: list = []
+    seen_norms: list = []
+
+    def _add(raw: dict, source_type: str, forced_priority: str = None):
+        if not isinstance(raw, dict):
+            return
+        q_text = (raw.get("question") or raw.get("question_text") or raw.get("blocker") or "").strip()
+        if not q_text:
+            return
+        norm = _normalize_question_text(q_text)
+        if not norm:
+            return
+        for other in seen_norms:
+            if norm == other or SequenceMatcher(None, norm, other).ratio() >= 0.82:
+                return  # duplicate across the two lists — keep the first (higher-priority) one
+        priority = forced_priority or _norm_enum(raw.get("priority"), _VALID_PRIORITIES, "clarifying")
+        default = (raw.get("default_assumption") or "").strip()
+        default_risk = _norm_enum(raw.get("default_assumption_risk"), _VALID_RISK, "medium")
+        # GUARANTEE: a blocking question must be answerable in one click — synthesize a
+        # default if the model omitted one (flagged high-risk so the user knows it's a guess).
+        if priority == "blocking" and not default:
+            default = ("Assume the most common industry-standard approach here; "
+                       "flagged for confirmation before build.")
+            default_risk = "high"
+        curated.append({
+            "priority": priority,
+            "theme": _norm_enum(raw.get("theme"), _VALID_THEMES, "other"),
+            "respondent_role": _norm_enum(raw.get("respondent_role"), _VALID_ROLES, "business"),
+            "question_text": q_text,
+            "title": (raw.get("blocker") or raw.get("question") or q_text).strip(),
+            "why": (raw.get("why_it_matters") or raw.get("why_critical") or "").strip(),
+            "impact_if_unknown": (raw.get("impact_if_unknown") or "").strip(),
+            "estimate_impact": (raw.get("estimate_impact") or "").strip(),
+            "default_assumption": default,
+            "default_assumption_risk": default_risk,
+            "category": (raw.get("area") or raw.get("category") or "").strip(),
+            "source_type": source_type,
+        })
+        seen_norms.append(norm)
+
+    for p1 in (p1_blockers or []):
+        _add(p1, "p1", forced_priority="blocking")   # P1 blockers are blocking by definition
+    for ks in (kickstart_questions or []):
+        _add(ks, "kickstart")
+
+    # Blocking-first, then clarifying, then optional; stable within a bucket so the LLM's
+    # own most-consequential-first ordering is preserved.
+    curated.sort(key=lambda q: _PRIORITY_RANK.get(q["priority"], 1))
+
+    blocking = [q for q in curated if q["priority"] == "blocking"]
+    nonblocking = [q for q in curated if q["priority"] != "blocking"]
+    if len(blocking) > _MAX_BLOCKING_QUESTIONS:
+        overflow = blocking[_MAX_BLOCKING_QUESTIONS:]
+        for q in overflow:
+            q["priority"] = "clarifying"  # demote, keep its (already-assigned) default
+        blocking = blocking[:_MAX_BLOCKING_QUESTIONS]
+        nonblocking = overflow + nonblocking
+    nonblocking = nonblocking[:_MAX_NONBLOCKING_QUESTIONS]
+    return blocking + nonblocking
+
+
 async def create_presales_questions(
     presales_id: str,
     user_id: str,
@@ -2386,64 +2482,64 @@ async def create_presales_questions(
     """
     Create question records from presales analysis results.
 
-    Args:
-        presales_id: The presales analysis ID
-        user_id: The user ID
-        p1_blockers: List of P1 blocker dicts from blind spot detector
-        kickstart_questions: List of kickstart question dicts
-        db: Database session
+    The raw p1_blockers + kickstart lists are first run through consolidate_questions()
+    (dedupe, prioritize, role-tag, guarantee defaults, cap) so what lands in the DB is the
+    curated, enterprise-grade set — not the LLM's raw two-list dump. Blocking questions
+    keep the P1-* numbering + P1_BLOCKER type (so the CRD/chat/invalidation semantics that
+    key off those are preserved); everything else becomes Q*.
 
     Returns:
         Dict with counts of created questions
     """
     try:
+        curated = consolidate_questions(p1_blockers, kickstart_questions)
         questions_created = []
-        display_order = 0
+        p1_n = 0
+        q_n = 0
 
-        # Create P1 blocker questions
-        for idx, p1 in enumerate(p1_blockers or []):
+        for display_order, cq in enumerate(curated):
+            is_blocking = cq["priority"] == "blocking"
+            if is_blocking:
+                p1_n += 1
+                q_type = models.QuestionType.P1_BLOCKER
+                q_number = f"P1-{p1_n}"
+            else:
+                q_n += 1
+                q_type = models.QuestionType.KICKSTART
+                q_number = f"Q{q_n}"
+
             question = models.PresalesQuestion(
                 presales_id=presales_id,
                 user_id=user_id,
-                question_type=models.QuestionType.P1_BLOCKER,
-                question_number=f"P1-{idx + 1}",
+                question_type=q_type,
+                question_number=q_number,
                 display_order=display_order,
-                area_or_category=p1.get("area", ""),
-                title=p1.get("blocker", ""),
-                description=p1.get("why_it_matters", ""),
-                question_text=p1.get("question", ""),
+                area_or_category=cq.get("category") or cq.get("theme") or "",
+                title=cq.get("title", ""),
+                description=cq.get("why", ""),
+                impact_description=cq.get("impact_if_unknown", ""),
+                question_text=cq.get("question_text", ""),
+                priority=cq.get("priority"),
+                theme=cq.get("theme"),
+                respondent_role=cq.get("respondent_role"),
+                estimate_impact=cq.get("estimate_impact", ""),
+                default_assumption=cq.get("default_assumption", ""),
+                default_assumption_risk=cq.get("default_assumption_risk"),
                 status=models.QuestionStatus.PENDING
             )
             db.add(question)
             questions_created.append(question)
-            display_order += 1
-
-        # Create kickstart questions
-        for idx, ks in enumerate(kickstart_questions or []):
-            question = models.PresalesQuestion(
-                presales_id=presales_id,
-                user_id=user_id,
-                question_type=models.QuestionType.KICKSTART,
-                question_number=f"Q{idx + 1}",
-                display_order=display_order,
-                area_or_category=ks.get("category", ""),
-                title=ks.get("question", ""),
-                description=ks.get("why_critical", ""),
-                impact_description=ks.get("impact_if_unknown", ""),
-                question_text=ks.get("question", ""),
-                status=models.QuestionStatus.PENDING
-            )
-            db.add(question)
-            questions_created.append(question)
-            display_order += 1
 
         db.commit()
 
-        logger.info(f"Created {len(questions_created)} questions for presales: {presales_id}")
+        logger.info(
+            f"Created {len(questions_created)} curated questions ({p1_n} blocking) "
+            f"for presales: {presales_id}"
+        )
 
         return {
-            "p1_count": len(p1_blockers or []),
-            "kickstart_count": len(kickstart_questions or []),
+            "p1_count": p1_n,
+            "kickstart_count": q_n,
             "total_count": len(questions_created)
         }
 
@@ -2526,6 +2622,15 @@ async def create_followup_questions(
                 if text:
                     logger.info(f"Skipped duplicate follow-up for presales {presales_id}: {text[:80]!r}")
                 continue
+            # A follow-up is a risk an answer surfaced — default it to blocking and
+            # guarantee a default so it's answerable in one click, same as A2 curation.
+            fu_priority = _norm_enum(fu.get("priority"), _VALID_PRIORITIES, "blocking")
+            fu_default = (fu.get("default_assumption") or "").strip()
+            fu_default_risk = _norm_enum(fu.get("default_assumption_risk"), _VALID_RISK, "high")
+            if fu_priority == "blocking" and not fu_default:
+                fu_default = ("Assume the most common industry-standard approach here; "
+                              "flagged for confirmation before build.")
+                fu_default_risk = "high"
             question = models.PresalesQuestion(
                 presales_id=presales_id,
                 user_id=user_id,
@@ -2539,6 +2644,12 @@ async def create_followup_questions(
                     f"Triggered by your answer to {fu['based_on']}" if fu.get("based_on") else ""
                 ),
                 question_text=text,
+                priority=fu_priority,
+                theme=_norm_enum(fu.get("theme"), _VALID_THEMES, "other"),
+                respondent_role=_norm_enum(fu.get("respondent_role"), _VALID_ROLES, "business"),
+                estimate_impact=(fu.get("estimate_impact") or "").strip(),
+                default_assumption=fu_default,
+                default_assumption_risk=fu_default_risk,
                 status=models.QuestionStatus.PENDING,
             )
             db.add(question)
@@ -2610,6 +2721,12 @@ async def get_presales_questions(
                 "description": q.description,
                 "impact_description": q.impact_description,
                 "question_text": q.question_text,
+                "priority": q.priority,
+                "theme": q.theme,
+                "respondent_role": q.respondent_role,
+                "estimate_impact": q.estimate_impact,
+                "default_assumption": q.default_assumption,
+                "default_assumption_risk": q.default_assumption_risk,
                 "answer": q.answer,
                 "answer_quality": q.answer_quality,
                 "answer_feedback": q.answer_feedback,
@@ -2629,6 +2746,29 @@ async def get_presales_questions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error retrieving questions: {str(e)}"
         )
+
+
+def set_presales_additional_context(presales_id: str, user_id: str, text, db: Session) -> None:
+    """Persist the durable free-text client/team context on the analysis (owner-scoped;
+    no-op on None so a caller that didn't send it never clobbers an existing value)."""
+    if text is None:
+        return
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+        models.PresalesAnalysis.user_id == user_id,
+    ).first()
+    if row is not None:
+        row.additional_context = (text.strip() or None)
+        db.commit()
+
+
+def get_presales_additional_context(presales_id: str, db: Session) -> str:
+    """Read the durable additional_context (empty string if none). No user scope — callers
+    that already loaded/authorized the analysis (analyzer, CRD builder) use this."""
+    row = db.query(models.PresalesAnalysis).filter(
+        models.PresalesAnalysis.presales_id == presales_id,
+    ).first()
+    return (row.additional_context or "") if row else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2869,12 +3009,15 @@ async def build_structured_crd(
 
     confirmed = [
         {"question": q["question_text"], "answer": q["answer"],
-         "source": q["question_number"], "category": q.get("area_or_category") or ""}
+         "source": q["question_number"], "category": q.get("theme") or q.get("area_or_category") or "",
+         "role": q.get("respondent_role") or ""}
         for q in questions if q.get("answer") and q.get("status") == "answered"
     ]
     open_questions = [
         {"question": q["question_text"], "source": q["question_number"],
-         "severity_hint": "blocker" if q.get("question_type") == "p1_blocker" else "high"}
+         "severity_hint": "blocker" if (q.get("priority") == "blocking" or q.get("question_type") == "p1_blocker") else "high",
+         "estimate_impact": q.get("estimate_impact") or "",
+         "default_assumption": q.get("default_assumption") or ""}
         for q in questions if not q.get("answer")
     ]
     assumptions = [
@@ -2884,6 +3027,7 @@ async def build_structured_crd(
         for a in (presales.get("assumptions_list") or [])
         if isinstance(a, dict) and a.get("assumption")
     ]
+    extra_context = get_presales_additional_context(presales_id, db)
     parts = [
         "## CONFIRMED Q&A (settled facts — copy each into client_qa with its `source` id)",
         json.dumps(confirmed, indent=2, ensure_ascii=False) if confirmed else "(none — no questions answered yet)",
@@ -2891,8 +3035,11 @@ async def build_structured_crd(
         "## ACCEPTED ASSUMPTIONS (resolved facts with provenance — inherit into global_assumptions as 'Assumption (accepted): ...'; do NOT re-open as questions)",
         json.dumps(assumptions, indent=2, ensure_ascii=False) if assumptions else "(none)",
         "",
-        "## OPEN / UNANSWERED QUESTIONS (unresolved — fold into open_questions_for_client; never invent answers)",
+        "## OPEN / UNANSWERED QUESTIONS (unresolved — fold into open_questions_for_client; if a default_assumption is given, you MAY proceed on it but flag it; never invent answers)",
         json.dumps(open_questions, indent=2, ensure_ascii=False) if open_questions else "(none — everything was answered)",
+        "",
+        "## ADDITIONAL CONTEXT (free-text notes from the client/team — treat as settled facts; weave into the problem statement and assumptions, do NOT re-ask)",
+        extra_context or "(none)",
         "",
         "## APPROVED PRESALES BRIEF (human-reviewed markdown)",
         presales_brief_text or "(brief not available)",
@@ -3172,7 +3319,8 @@ async def update_presales_readiness(
     assumptions_list: list,
     contradictions_list: list,
     vague_answers_list: list,
-    db: Session
+    db: Session,
+    readiness_breakdown: dict = None,
 ) -> dict:
     """
     Update presales analysis with readiness information.
@@ -3206,6 +3354,9 @@ async def update_presales_readiness(
         presales.contradictions_list = contradictions_list
         presales.vague_answers_list = vague_answers_list
         presales.iteration_count = (presales.iteration_count or 1) + 1
+        if readiness_breakdown is not None:
+            presales.readiness_breakdown = readiness_breakdown
+            flag_modified(presales, "readiness_breakdown")
 
         flag_modified(presales, "assumptions_list")
         flag_modified(presales, "contradictions_list")

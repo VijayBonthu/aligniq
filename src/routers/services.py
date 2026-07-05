@@ -575,12 +575,16 @@ async def _run_presales_analysis(
             except Exception as e:
                 logger.error(f"_run_presales_analysis: firm_context lookup failed for {user_id}: {e}")
 
+        # Gate question-generation model on the subscription tier (plus/pro → frontier).
+        _presales_model_tier = get_model_tier(user_id, db)
+
         with use_recorder(_presales_recorder):
             # Run the pre-sales pipeline
             result = await run_presales_pipeline(
                 document=raw_requirements,
                 timeout=180,
                 firm_context=firm_context_block,
+                model_tier=_presales_model_tier,
             )
 
         # Bet 2.A — pre-flight classifier rejected the upload. Surface a 422
@@ -794,6 +798,11 @@ async def generate_presales_report(
             except json.JSONDecodeError as e:
                 logger.warning(f"Invalid user_answers JSON: {e}")
 
+        # Persist the durable free-text context so it survives independent of report gen
+        # and is available to the analyzer + CRD.
+        from database_scripts import set_presales_additional_context, get_presales_additional_context
+        set_presales_additional_context(presales_id, user_id, additional_context, db)
+
         assumptions_list = []
         if assumptions:
             try:
@@ -820,7 +829,7 @@ async def generate_presales_report(
                 scanned_requirements=presales.get("extracted_requirements", {}),
                 confirmed_answers=questions,
                 assumptions_list=assumptions_list,
-                additional_context=additional_context,
+                additional_context=additional_context or get_presales_additional_context(presales_id, db),
                 blind_spots=presales.get("blind_spots") or {},
                 timeout=180,
             )
@@ -1813,6 +1822,7 @@ async def get_presales_questions_endpoint(
 async def save_question_answers(
     presales_id: str,
     answers: str = Form(...),
+    additional_context: Optional[str] = Form(None),
     current_token: dict = Depends(token_validator),
     db: Session = Depends(get_db)
 ):
@@ -1912,6 +1922,11 @@ async def save_question_answers(
 
     logger.info(f"Mapped {len(mapped_answers)} answers to question_ids")
 
+    # Persist the durable free-text context alongside the answers so it's available to the
+    # analyzer and the CRD (previously it only rode on report generation and was often lost).
+    from database_scripts import set_presales_additional_context
+    set_presales_additional_context(presales_id, user_id, additional_context, db)
+
     if not mapped_answers:
         return {
             "presales_id": presales_id,
@@ -1971,11 +1986,16 @@ async def analyze_presales_answers(
         if presales.get("extracted_requirements"):
             document = json.dumps(presales["extracted_requirements"])
 
+        # Durable free-text context (answers + context are analyzed together).
+        from database_scripts import get_presales_additional_context
+        extra_context = get_presales_additional_context(presales_id, db)
+
         # Run full analysis
         analysis_result = await analyze_answers(
             document=document,
             scanned_requirements=presales.get("extracted_requirements", {}),
             questions=questions,
+            additional_context=extra_context,
             timeout=120
         )
 
@@ -2034,7 +2054,7 @@ async def analyze_presales_answers(
                     q_record.answer_feedback = vague.get("issue", "")
                     db.commit()
 
-        # Update presales readiness
+        # Update presales readiness (incl. the per-theme "what's lacking" breakdown)
         await update_presales_readiness(
             presales_id=presales_id,
             readiness_score=analysis_result.readiness_score,
@@ -2042,7 +2062,8 @@ async def analyze_presales_answers(
             assumptions_list=analysis_result.assumptions,
             contradictions_list=analysis_result.contradictions,
             vague_answers_list=analysis_result.vague_answers,
-            db=db
+            db=db,
+            readiness_breakdown=analysis_result.readiness_breakdown or None,
         )
 
         # Save analysis history
@@ -2072,7 +2093,9 @@ async def analyze_presales_answers(
             "readiness": {
                 "score": analysis_result.readiness_score,
                 "status": analysis_result.readiness_status,
-                "summary": analysis_result.readiness.get("summary", "")
+                "summary": analysis_result.readiness.get("summary", ""),
+                "themes": analysis_result.readiness.get("themes", []),
+                "top_gaps": analysis_result.readiness.get("top_gaps", []),
             },
             "contradictions": analysis_result.contradictions,
             "vague_answers": analysis_result.vague_answers,
@@ -5838,11 +5861,19 @@ async def public_questionnaire(token: str, db: Session = Depends(get_db)):
     # Client-safe fields ONLY — question text + category + any existing answer.
     # `prefilled` flags answers the firm seeded as a starting point: the client can
     # STILL edit them (the firm's control is revoking the link), it's just a UI hint.
+    # Client-safe enriched fields: priority/theme/role help the client understand what
+    # matters and who should answer; default_assumption lets them accept a sensible default
+    # in one click. estimate_impact + why/impact stay internal (firm's estimate reasoning).
     questions = [{
         "question_id": q.question_id,
         "question_number": q.question_number,
         "area_or_category": q.area_or_category,
         "question_text": q.question_text,
+        "priority": q.priority,
+        "theme": q.theme,
+        "respondent_role": q.respondent_role,
+        "default_assumption": q.default_assumption,
+        "default_assumption_risk": q.default_assumption_risk,
         "answer": q.answer or "",
         "prefilled": bool((q.answer or "").strip()) and q.status == models.QuestionStatus.ANSWERED and (q.answered_by or "") != "client",
     } for q in qs]

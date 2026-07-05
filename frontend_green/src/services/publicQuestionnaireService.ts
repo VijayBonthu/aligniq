@@ -5,6 +5,11 @@ export interface PublicQuestion {
   question_number: string;
   area_or_category: string | null;
   question_text: string;
+  priority?: string | null;
+  theme?: string | null;
+  respondent_role?: string | null;
+  default_assumption?: string | null;
+  default_assumption_risk?: string | null;
   answer: string;
   prefilled?: boolean;  // firm seeded a starting answer — still editable by the client
 }

@@ -396,6 +396,13 @@ class PresalesAnalysis(Base):
     assumptions_list = Column(JSON, default=list)          # Assumptions to be made
     contradictions_list = Column(JSON, default=list)       # Contradictions found
     vague_answers_list = Column(JSON, default=list)        # Vague answers needing clarification
+    # Durable free-text client/team context (migration 0021). Was previously only a
+    # transient form param on report generation — now persisted, analyzed, and threaded
+    # into the CRD.
+    additional_context = Column(Text, nullable=True)
+    # Per-theme readiness + top-gaps breakdown from the answer analyzer (migration 0021).
+    # Shape: {"themes": [{"theme", "answered", "total", "status"}], "top_gaps": [...]}.
+    readiness_breakdown = Column(JSON, nullable=True)
 
     created_at = Column(TIMESTAMP(timezone=True), nullable=False,
                         server_default=text("now()"))
@@ -529,6 +536,16 @@ class PresalesQuestion(Base):
     description = Column(Text, nullable=True)              # why_it_matters or why_critical
     impact_description = Column(Text, nullable=True)       # impact_if_unknown
     question_text = Column(Text, nullable=False)           # The actual question to ask
+
+    # Enterprise curation (migration 0021) — turns a flat checklist into prioritized,
+    # routed, defaulted intelligence. All nullable for back-compat; `priority` is the
+    # real driver going forward (question_type kept only for legacy).
+    priority = Column(String(20), nullable=True)           # 'blocking' | 'clarifying' | 'optional'
+    theme = Column(String(40), nullable=True)              # normalized group: systems_data, identity_access, payments, integration, compliance_security, scale_ops, delivery, commercial, other
+    respondent_role = Column(String(20), nullable=True)    # 'business' | 'technical' | 'security' | 'procurement'
+    estimate_impact = Column(Text, nullable=True)          # what the answer swings in cost/timeline/architecture
+    default_assumption = Column(Text, nullable=True)       # smart default so the question is answerable in one click
+    default_assumption_risk = Column(String(20), nullable=True)  # 'low' | 'medium' | 'high'
 
     # Answer tracking
     answer = Column(Text, nullable=True)

@@ -82,6 +82,27 @@ llm_reasoning = ChatOpenAI(
     request_timeout=90  # 90 second timeout for reasoning agent
 )
 
+# Frontier "smart" model for the blind-spot detector on paid tiers. Question quality is
+# exactly what enterprise buyers judge us on, so plus/pro (model_tier='frontier') get the
+# frontier SMART_MODEL for question GENERATION — same gating rationale as reports. free/basic
+# keep the cheap reasoning model to stay margin-safe on the fast path. Scanner + brief stay
+# cheap regardless (they don't produce the questions).
+llm_reasoning_smart = ChatOpenAI(
+    api_key=settings.OPENAI_CHATGPT,
+    model=settings.SMART_MODEL_NAME,
+    temperature=0,
+    request_timeout=120,
+)
+
+
+def _resolve_blindspot_llm(model_tier: str):
+    """Return (llm, model_name) for the blind-spot detector. 'frontier' (plus/pro) →
+    SMART_MODEL_NAME; anything else ('lite'/None) → the cheap reasoning model. The model
+    name is returned so llm_call_log tags the real COGS."""
+    if model_tier == "frontier":
+        return llm_reasoning_smart, settings.SMART_MODEL_NAME
+    return llm_reasoning, settings.GENERATING_REPORT_MODEL
+
 # Parser for JSON responses
 llm_parser = ChatOpenAI(
     api_key=settings.OPENAI_CHATGPT,
@@ -140,6 +161,9 @@ class PresalesState(TypedDict, total=False):
     # Bet 3 — markdown <firm_context> block injected into brief_generator.
     # Empty string when ENABLE_FIRM_CONTEXT is off or firm has no loaded context.
     firm_context: Optional[str]
+    # Subscription model tier ('frontier' plus/pro | 'lite' free/basic). Gates the
+    # blind-spot detector's model so paid tiers get frontier-quality questions.
+    model_tier: Optional[str]
 
 
 # =============================================================================
@@ -353,16 +377,21 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
         logger.warning("Skipping blindspot_node due to previous error")
         return state
 
+    # Question generation is the enterprise-judged output — gate its model on the tier.
+    blindspot_llm, blindspot_model = _resolve_blindspot_llm(state.get("model_tier"))
+    blindspot_timeout = 120 if state.get("model_tier") == "frontier" else 90
+
     try:
         if parallel_mode:
             # Parallel-safe path: read only the document. No scanner dependency.
             prompt = ChatPromptTemplate.from_template(BLINDSPOT_DETECTOR_PROMPT)
-            chain = prompt | llm_reasoning | fixed_parser
+            chain = prompt | blindspot_llm | fixed_parser
             response = await invoke_presales_agent(
                 chain=chain,
                 input_dict={"document": state["document"]},
-                timeout=90,
+                timeout=blindspot_timeout,
                 agent_name="presales_blindspot",
+                model=blindspot_model,
                 prompt_hash=_PRESALES_HASHES["presales_blindspot"],
             )
         else:
@@ -372,7 +401,7 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
                 technologies = state["scanned_requirements"].get("technologies_mentioned", [])
 
             prompt = ChatPromptTemplate.from_template(BLINDSPOT_DETECTOR_PROMPT_LEGACY)
-            chain = prompt | llm_reasoning | fixed_parser
+            chain = prompt | blindspot_llm | fixed_parser
             response = await invoke_presales_agent(
                 chain=chain,
                 input_dict={
@@ -380,8 +409,9 @@ async def blindspot_node(state: PresalesState) -> PresalesState:
                     "scanned_requirements": json.dumps(state.get("scanned_requirements") or {}, indent=2),
                     "technologies": ", ".join(technologies) if technologies else "None specified",
                 },
-                timeout=90,
+                timeout=blindspot_timeout,
                 agent_name="presales_blindspot",
+                model=blindspot_model,
                 prompt_hash=_PRESALES_HASHES["presales_blindspot_legacy"],
             )
 
@@ -540,6 +570,7 @@ async def run_presales_pipeline(
     document: str,
     timeout: int = 180,  # 3 minute default timeout for entire pipeline
     firm_context: str = "",
+    model_tier: str = "lite",
 ) -> dict:
     """
     Run the pre-sales analysis pipeline.
@@ -593,6 +624,7 @@ async def run_presales_pipeline(
         "aborted": False,
         "abort_reason": None,
         "firm_context": firm_context,
+        "model_tier": model_tier,
     }
 
     try:
