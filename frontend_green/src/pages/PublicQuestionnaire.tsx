@@ -42,6 +42,13 @@ export default function PublicQuestionnaire() {
 
   const dirtyRef = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const feedbackRef = useRef<HTMLDivElement | null>(null);
+
+  // The readiness result renders above a long form; after a check, bring it into
+  // view so the user (who just clicked a button at the bottom) actually sees it.
+  useEffect(() => {
+    if (feedback) feedbackRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [feedback]);
 
   const load = useCallback(async () => {
     if (!token) { setPhase('invalid'); return; }
@@ -120,7 +127,16 @@ export default function PublicQuestionnaire() {
       setSaveState('saved');
     } catch (e) {
       const status = (e as { response?: { status?: number } })?.response?.status;
-      setError(status === 429 ? 'You’ve checked a lot recently — give it a moment and try again.' : 'Could not check readiness right now. Please try again.');
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      // Surface the backend's real message (e.g. the lifetime-cap 429 that never resets,
+      // or the cooldown with a wait time) instead of a generic override.
+      setError(
+        typeof detail === 'string' && detail
+          ? detail
+          : status === 429
+          ? 'You’ve checked a lot recently — give it a moment and try again.'
+          : 'Could not check readiness right now. Please try again.',
+      );
     } finally {
       setChecking(false);
     }
@@ -189,7 +205,7 @@ export default function PublicQuestionnaire() {
       </p>
 
       {feedback && rl && (
-        <div style={{ ...readinessBox, borderColor: accent }}>
+        <div ref={feedbackRef} style={{ ...readinessBox, borderColor: accent }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <strong style={{ fontSize: 14 }}>{rl.text}</strong>
             <span style={{ fontSize: 12, color: '#6b7280' }}>{Math.round((feedback.readiness_score || 0) * 100)}% ready</span>
