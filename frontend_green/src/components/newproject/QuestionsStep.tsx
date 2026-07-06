@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import * as presalesService from '../../services/presalesService';
 import type { AnalysisAssumption } from './AnalysisStep';
+import { PriorityPill, RoleChip, ThemeChip, EstimateImpact, DefaultAssumption } from '../ui/QuestionMeta';
 
 export interface PresalesQuestion {
   question_id?: string;
@@ -23,6 +24,12 @@ export interface PresalesQuestion {
   area_or_category?: string;
   impact_description?: string;
   status?: string;
+  // Enterprise curation (A2)
+  theme?: string | null;
+  respondent_role?: string | null;
+  estimate_impact?: string | null;
+  default_assumption?: string | null;
+  default_assumption_risk?: string | null;
 }
 
 interface QuestionsStepProps {
@@ -100,8 +107,11 @@ export default function QuestionsStep({
   const [shareOpen, setShareOpen] = useState(false);
   const [shareLink, setShareLink] = useState<string | null>(null);
   const [clientEmail, setClientEmail] = useState('');
-  const [sharing, setSharing] = useState<null | 'send' | 'remind' | 'revoke' | 'copy' | 'mark'>(null);
+  const [sharing, setSharing] = useState<null | 'send' | 'remind' | 'revoke' | 'copy' | 'mark' | 'reopen'>(null);
   const [markedShared, setMarkedShared] = useState(false);
+  // Locally track an "unlock" so the firm can let a client who submitted by mistake
+  // continue on the same link (clears the parent-provided clientSubmittedAt for display).
+  const [reopened, setReopened] = useState(false);
   const linkInputRef = useRef<HTMLInputElement | null>(null);
 
   // Pre-mint the link as soon as the panel opens so the Copy button can write to the
@@ -202,6 +212,22 @@ export default function QuestionsStep({
       toast.success('Client link revoked');
     } catch {
       toast.error('Could not revoke the link');
+    } finally {
+      setSharing(null);
+    }
+  };
+
+  const reopenForClient = async () => {
+    if (!window.confirm('Reopen this questionnaire for the client? They can continue and re-submit on the same link. Their current answers are kept.')) return;
+    setSharing('reopen');
+    try {
+      const { token } = await presalesService.reopenClientLink(presalesId);
+      setShareLink(`${window.location.origin}/q/${token}`);
+      setReopened(true);
+      setShareOpen(true);  // surface the share panel so they can remind/copy the link
+      toast.success('Reopened — your client can continue on the same link. Send a reminder or copy it below.');
+    } catch {
+      toast.error('Could not reopen the questionnaire');
     } finally {
       setSharing(null);
     }
@@ -347,8 +373,10 @@ export default function QuestionsStep({
       pushFor(kickstart, 'question');
       pushFor(followUps, 'followup');
 
-      if (payload.length > 0) {
-        await presalesService.saveAnswers(presalesId, payload);
+      // Always persist when there are answers OR free-text context, so the durable
+      // additional_context reaches the analyzer + CRD (it used to only ride on report gen).
+      if (payload.length > 0 || additionalContext.trim()) {
+        await presalesService.saveAnswers(presalesId, payload, additionalContext);
       }
       onComplete();
     } catch (err) {
@@ -430,9 +458,21 @@ export default function QuestionsStep({
           Answer what you can — the more precise your answers to the critical blockers, the tighter the
           estimate. Anything left blank becomes an explicit, reviewable assumption in the next step.
         </p>
-        {clientSubmittedAt ? (
-          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--ok-soft)', border: '1px solid var(--border)', color: 'var(--ok)', fontSize: 13 }}>
-            ✓ Client submitted {clientAnswered} answer{clientAnswered === 1 ? '' : 's'} on {new Date(clientSubmittedAt).toLocaleString()} — review them below, then run the readiness analysis.
+        {clientSubmittedAt && !reopened ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--ok-soft)', border: '1px solid var(--border)', color: 'var(--ok)', fontSize: 13, display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+            <span>✓ Client submitted {clientAnswered} answer{clientAnswered === 1 ? '' : 's'} on {new Date(clientSubmittedAt).toLocaleString()} — review them below, then run the readiness analysis.</span>
+            <button
+              onClick={reopenForClient}
+              disabled={!!sharing}
+              title="Submitted by mistake? Reopen so the client can continue and re-submit on the same link."
+              style={{ flexShrink: 0, background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 8, color: 'var(--fg-dim)', fontSize: 12, padding: '6px 11px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              {sharing === 'reopen' ? 'Reopening…' : '↩ Reopen for client'}
+            </button>
+          </div>
+        ) : reopened ? (
+          <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: 13 }}>
+            ↩ Reopened — your client can continue and re-submit on the same link. Use “Send to client” below to remind them or copy the link.
           </div>
         ) : clientAnswered > 0 ? (
           <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: 13 }}>
@@ -488,8 +528,8 @@ export default function QuestionsStep({
         <main style={{ minWidth: 0 }}>
           {p1.length > 0 && (
             <QuestionGroup
-              eyebrow={`P1 BLOCKERS · ${p1.length} CRITICAL`}
-              note="Must answer before report generation"
+              eyebrow={`BLOCKING · ${p1.length} CRITICAL`}
+              note="Answer or accept a default before generating — these move the estimate most"
               accent="var(--danger)"
               questions={p1}
               numberPrefix="P1"
@@ -520,8 +560,8 @@ export default function QuestionsStep({
           )}
           {kickstart.length > 0 && (
             <QuestionGroup
-              eyebrow={`KICKSTART QUESTIONS · ${kickstart.length} ITEMS`}
-              note="Sharpen the plan — optional but valuable"
+              eyebrow={`CLARIFYING · ${kickstart.length} ITEMS`}
+              note="Sharpen the plan — each has a smart default you can accept"
               accent="var(--accent)"
               questions={kickstart}
               numberPrefix="Q"
@@ -901,6 +941,7 @@ function QuestionCard({
               {why}
             </p>
           )}
+          <EstimateImpact text={q.estimate_impact} />
           {showImpact && (
             <div
               style={{
@@ -934,8 +975,10 @@ function QuestionCard({
               </p>
             </div>
           )}
-          <div style={{ display: 'flex', gap: 5, marginTop: 9, flexWrap: 'wrap' }}>
-            {category && <MetaTag>{category}</MetaTag>}
+          <div style={{ display: 'flex', gap: 5, marginTop: 9, flexWrap: 'wrap', alignItems: 'center' }}>
+            <PriorityPill priority={q.priority || (isBlocker ? 'blocking' : 'clarifying')} />
+            {q.theme ? <ThemeChip theme={q.theme} /> : (category ? <MetaTag>{category}</MetaTag> : null)}
+            <RoleChip role={q.respondent_role} />
             {hasAssumption && (
               <span
                 style={{
@@ -1025,6 +1068,17 @@ function QuestionCard({
           >
             {skippedNoAnswer ? '✓ Will be assumed — undo' : 'I can’t answer this — assume for me'}
           </button>
+        )}
+        {state === 'empty' && !assumption && q.default_assumption && (
+          <DefaultAssumption
+            text={q.default_assumption}
+            risk={q.default_assumption_risk}
+            onAccept={() => setAnswers((p) => ({ ...p, [answerKey]: q.default_assumption || '' }))}
+            onOverride={() => {
+              const el = document.getElementById(anchorId)?.querySelector('textarea') as HTMLTextAreaElement | null;
+              el?.focus();
+            }}
+          />
         )}
         {state === 'empty' && assumption && (
           <div

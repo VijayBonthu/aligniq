@@ -10,18 +10,45 @@ export interface AnswerSubmission {
   answer: string;
 }
 
+/** Enriched question shape (A1/A2). Older rows may leave the new fields null. */
+export type QuestionPriority = 'blocking' | 'clarifying' | 'optional';
+export type QuestionRole = 'business' | 'technical' | 'security' | 'procurement';
+
+export interface PresalesQuestion {
+  question_id: string;
+  question_type: string;
+  question_number: string;
+  display_order: number;
+  area_or_category?: string | null;
+  title?: string | null;
+  description?: string | null;
+  impact_description?: string | null;
+  question_text: string;
+  priority?: QuestionPriority | null;
+  theme?: string | null;
+  respondent_role?: QuestionRole | null;
+  estimate_impact?: string | null;
+  default_assumption?: string | null;
+  default_assumption_risk?: 'low' | 'medium' | 'high' | null;
+  answer?: string | null;
+  answer_quality?: string | null;
+  status?: string | null;
+}
+
 /**
  * Submit answers keyed by `question_id` (F6). Backend validates every id
- * belongs to this presales_id and 422s on unknown ids. The previous
- * positional-key shape (`p1_0`, `question_0`) is still accepted server-side
- * during one deploy cycle for safety, but new callers must use this shape.
+ * belongs to this presales_id and 422s on unknown ids. `additionalContext`
+ * (when provided) is persisted durably on the analysis so the analyzer and
+ * the CRD both see it — previously it only rode on report generation.
  */
 export async function saveAnswers(
   presalesId: string,
   answers: AnswerSubmission[],
+  additionalContext?: string,
 ) {
   const form = new FormData();
   form.append('answers', JSON.stringify(answers));
+  if (additionalContext !== undefined) form.append('additional_context', additionalContext);
   const { data } = await api.post(
     `/presales/${presalesId}/questions/answers`,
     form,
@@ -48,6 +75,12 @@ export async function createShareLink(presalesId: string): Promise<{ token: stri
 
 export async function revokeShareLink(presalesId: string) {
   const { data } = await api.delete(`/presales/${presalesId}/share-link`);
+  return data;
+}
+
+/** Undo an accidental client submission so they can continue on the same link. */
+export async function reopenClientLink(presalesId: string): Promise<{ token: string; reopened: boolean }> {
+  const { data } = await api.post(`/presales/${presalesId}/reopen-client-link`);
   return data;
 }
 

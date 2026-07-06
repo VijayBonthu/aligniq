@@ -70,6 +70,15 @@ class AnalysisResult:
         self.processing_time_ms = raw_result.get("processing_time_ms", 0)
 
     @property
+    def readiness_breakdown(self) -> Dict[str, Any]:
+        """Per-theme readiness + top gaps (what's lacking). Empty dict on older payloads."""
+        themes = self.readiness.get("themes") or []
+        top_gaps = self.readiness.get("top_gaps") or []
+        if not themes and not top_gaps:
+            return {}
+        return {"themes": themes, "top_gaps": top_gaps}
+
+    @property
     def readiness_score(self) -> float:
         return self.readiness.get("score", 0.0)
 
@@ -124,11 +133,14 @@ def format_questions_for_analysis(questions: List[Dict]) -> str:
         answer = q.get("answer", "")
         status = q.get("status", "pending")
 
+        theme = q.get("theme") or q.get("area_or_category", "")
+        priority = q.get("priority") or ("blocking" if q_type == "p1_blocker" else "clarifying")
+
         if q_type == "p1_blocker":
             title = q.get("title", "")
             why = q.get("description", "")
             formatted.append(f"""
-### {q_num} (P1 Blocker) - {status.upper()}
+### {q_num} (P1 Blocker · {theme} · {priority}) - {status.upper()}
 **Issue:** {title}
 **Why it matters:** {why}
 **Question:** {q_text}
@@ -138,7 +150,7 @@ def format_questions_for_analysis(questions: List[Dict]) -> str:
             category = q.get("area_or_category", "")
             why = q.get("description", "")
             formatted.append(f"""
-### {q_num} (Kickstart - {category}) - {status.upper()}
+### {q_num} ({q_type} · {theme} · {priority}) - {status.upper()}
 **Question:** {q_text}
 **Why critical:** {why}
 **Answer:** {answer if answer else "[NOT ANSWERED]"}
@@ -171,6 +183,7 @@ async def analyze_answers(
     document: str,
     scanned_requirements: Dict[str, Any],
     questions: List[Dict[str, Any]],
+    additional_context: str = "",
     timeout: int = 120
 ) -> AnalysisResult:
     """
@@ -208,7 +221,8 @@ async def analyze_answers(
             chain.ainvoke({
                 "document": document[:15000],  # Limit document size
                 "scanned_requirements": json.dumps(scanned_requirements, indent=2)[:5000],
-                "questions_with_answers": questions_formatted
+                "questions_with_answers": questions_formatted,
+                "additional_context": (additional_context or "None provided.")[:6000],
             }),
             timeout=timeout
         )

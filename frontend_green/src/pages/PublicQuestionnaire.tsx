@@ -8,6 +8,13 @@ import {
   type PublicQuestion,
   type ReadinessFeedback,
 } from '../services/publicQuestionnaireService';
+import { themeLabel } from '../components/ui/QuestionMeta';
+
+const roleHint = (role?: string | null): string =>
+  role === 'technical' ? 'For your IT team'
+  : role === 'security' ? 'For security / compliance'
+  : role === 'procurement' ? 'For procurement'
+  : '';
 
 type Phase = 'loading' | 'ready' | 'invalid' | 'done';
 type SaveState = 'idle' | 'saving' | 'saved' | 'error';
@@ -35,6 +42,13 @@ export default function PublicQuestionnaire() {
 
   const dirtyRef = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const feedbackRef = useRef<HTMLDivElement | null>(null);
+
+  // The readiness result renders above a long form; after a check, bring it into
+  // view so the user (who just clicked a button at the bottom) actually sees it.
+  useEffect(() => {
+    if (feedback) feedbackRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [feedback]);
 
   const load = useCallback(async () => {
     if (!token) { setPhase('invalid'); return; }
@@ -113,7 +127,16 @@ export default function PublicQuestionnaire() {
       setSaveState('saved');
     } catch (e) {
       const status = (e as { response?: { status?: number } })?.response?.status;
-      setError(status === 429 ? 'You’ve checked a lot recently — give it a moment and try again.' : 'Could not check readiness right now. Please try again.');
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      // Surface the backend's real message (e.g. the lifetime-cap 429 that never resets,
+      // or the cooldown with a wait time) instead of a generic override.
+      setError(
+        typeof detail === 'string' && detail
+          ? detail
+          : status === 429
+          ? 'You’ve checked a lot recently — give it a moment and try again.'
+          : 'Could not check readiness right now. Please try again.',
+      );
     } finally {
       setChecking(false);
     }
@@ -182,7 +205,7 @@ export default function PublicQuestionnaire() {
       </p>
 
       {feedback && rl && (
-        <div style={{ ...readinessBox, borderColor: accent }}>
+        <div ref={feedbackRef} style={{ ...readinessBox, borderColor: accent }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <strong style={{ fontSize: 14 }}>{rl.text}</strong>
             <span style={{ fontSize: 12, color: '#6b7280' }}>{Math.round((feedback.readiness_score || 0) * 100)}% ready</span>
@@ -216,7 +239,9 @@ export default function PublicQuestionnaire() {
             <div key={q.question_id} style={card}>
               <div style={qHead}>
                 <span style={{ ...qNum, background: accent }}>{i + 1}</span>
-                {q.area_or_category && <span style={qCat}>{q.area_or_category}</span>}
+                {q.priority === 'blocking' && <span style={impBadge}>Important</span>}
+                {q.theme ? <span style={qCat}>{themeLabel(q.theme)}</span> : (q.area_or_category && <span style={qCat}>{q.area_or_category}</span>)}
+                {roleHint(q.respondent_role) && <span style={roleBadge}>{roleHint(q.respondent_role)}</span>}
                 {isPrefilled && <span style={prefillTag}>✎ your team started this — edit if needed</span>}
               </div>
               <p style={qText}>{q.question_text}</p>
@@ -228,7 +253,22 @@ export default function PublicQuestionnaire() {
                 rows={3}
               />
               {note && <p style={nudge}>💡 {note}</p>}
+              {/* A dynamic readiness assumption (asm) takes precedence over the static default. */}
               {!answers[q.question_id]?.trim() && asm && <p style={nudge}>If left blank: we’ll assume “{asm.assumption}”</p>}
+              {!answers[q.question_id]?.trim() && !asm && q.default_assumption && (
+                <div style={defaultBox}>
+                  <p style={{ margin: 0, fontSize: 12.5, color: '#374151', lineHeight: 1.45 }}>
+                    <strong>Not sure?</strong> We can assume: “{q.default_assumption}”
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => onAnswerChange(q.question_id, q.default_assumption || '')}
+                    style={{ ...acceptBtn, color: accent, borderColor: accent }}
+                  >
+                    Use this
+                  </button>
+                </div>
+              )}
             </div>
           );
         })}
@@ -320,6 +360,10 @@ const card: React.CSSProperties = { border: '1px solid #e5e7eb', borderRadius: 1
 const qHead: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' };
 const qNum: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 999, color: '#fff', fontSize: 12, fontWeight: 700, flexShrink: 0 };
 const qCat: React.CSSProperties = { fontSize: 11, textTransform: 'uppercase', letterSpacing: '.06em', color: '#9ca3af', fontWeight: 600 };
+const impBadge: React.CSSProperties = { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '.05em', fontWeight: 700, color: '#b91c1c', background: '#fee2e2', border: '1px solid #fecaca', borderRadius: 5, padding: '2px 7px' };
+const roleBadge: React.CSSProperties = { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '.05em', color: '#6b7280', background: '#f3f4f6', border: '1px solid #e5e7eb', borderRadius: 5, padding: '2px 7px' };
+const defaultBox: React.CSSProperties = { marginTop: 10, padding: '10px 12px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' };
+const acceptBtn: React.CSSProperties = { background: '#fff', border: '1px solid', borderRadius: 8, padding: '6px 12px', fontSize: 12.5, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' };
 const prefillTag: React.CSSProperties = { fontSize: 11, color: '#6b7280', fontStyle: 'italic' };
 const qText: React.CSSProperties = { fontSize: 15.5, fontWeight: 500, margin: '0 0 10px', lineHeight: 1.45, color: '#1f2937' };
 const textarea: React.CSSProperties = { width: '100%', boxSizing: 'border-box', border: '1px solid #d1d5db', borderRadius: 8, padding: '10px 12px', fontSize: 14.5, fontFamily: 'inherit', resize: 'vertical', outlineColor: '#4f46e5' };
