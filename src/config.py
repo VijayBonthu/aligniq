@@ -258,3 +258,27 @@ class Settings:
 
 
 settings = Settings()
+
+
+# Local-dev CORS fallback, used only when CORS_ORIGINS is unset (staging/prod set it
+# via SSM). Lives here, not in main.py, so the CORS middleware and the OAuth
+# return-origin check (routers/authentication.py) read one allow-list.
+DEFAULT_LOCAL_CORS_ORIGINS = [
+    "http://localhost",
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+    "http://192.168.2.26:3001",
+    "http://192.168.2.26:3002",
+    "https://staging.grounded-iq.com",
+]
+
+
+def cors_origins() -> list:
+    """Allowed browser origins: CORS_ORIGINS (comma-separated), read at call time, or the
+    local-dev defaults when it is unset."""
+    raw = os.getenv("CORS_ORIGINS", "")
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return list(DEFAULT_LOCAL_CORS_ORIGINS)

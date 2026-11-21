@@ -2,7 +2,7 @@ import os
 import secrets
 
 from oauth import flow, auth_callback, JiraOAuth, GitHubOAuth, MicrosoftOAuth
-from config import settings
+from config import settings, cors_origins
 from fastapi import Depends, HTTPException, Request, Response, APIRouter, status, Header
 from sqlalchemy.orm import Session
 from models import get_db, User, LoginDetails
@@ -16,6 +16,7 @@ from p_model_type import Registration_login_password, login_details, PasswordRes
 import logging
 from jira_logic.jira_components import get_jira_user_info
 from typing import Dict, Optional
+from urllib.parse import urlsplit
 from datetime import datetime, timezone, timedelta
 from jose import jwt as jose_jwt
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
@@ -29,9 +30,73 @@ security = HTTPBearer()
 
 auth_states = {}
 
-# Fallback frontend origin for OAuth callback redirects when the SPA didn't pass its
-# own origin. Set FRONTEND_URL via env (SSM in staging/prod).
+# Fallback frontend origin for OAuth callback redirects when the login did not start
+# from an allowed origin. Set FRONTEND_URL via env (SSM in staging/prod).
 FRONTEND_ORIGIN = settings.FRONTEND_URL or os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(value) -> Optional[str]:
+    """Reduce a URL or origin to lowercase `scheme://host[:port]` (default port dropped),
+    or None when it is not a plain http(s) URL with a host. Matching on this key is exact:
+    no prefix or suffix matching, so `https://grounded-iq.com.evil.com` never matches
+    `https://grounded-iq.com`. URLs with credentials or backslashes are refused outright."""
+    if not value or not isinstance(value, str) or "\\" in value:
+        return None
+    try:
+        parts = urlsplit(value.strip())
+        port = parts.port  # ValueError on a malformed port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if scheme not in _DEFAULT_PORTS or not host or parts.username is not None or parts.password is not None:
+        return None
+    if ":" in host:  # IPv6 literal: keep the brackets a browser origin has
+        host = f"[{host}]"
+    if port and port != _DEFAULT_PORTS[scheme]:
+        return f"{scheme}://{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _allowed_frontend_origins() -> Dict[str, str]:
+    """Origins an OAuth popup may hand the access token back to: every CORS_ORIGINS entry
+    (the list the CORS middleware uses, read at call time) plus FRONTEND_URL. A '*' entry
+    is skipped by _origin_key, so it can never widen where a token is posted."""
+    allowed: Dict[str, str] = {}
+    for entry in [*cors_origins(), FRONTEND_ORIGIN]:
+        key = _origin_key(entry)
+        if key:
+            allowed[key] = key
+    return allowed
+
+
+def _resolve_frontend_origin(*candidates: Optional[str]) -> str:
+    """The postMessage target for the OAuth popup: the first candidate that is an allowed
+    origin, else FRONTEND_URL. The return value always comes from configuration, never
+    from the caller's string, because it is written into the popup page's JavaScript.
+    Both hosts work during the move to aligniq.grounded-iq.com (founder, 2026-11-20):
+    a login started on either allowed host returns there."""
+    allowed = _allowed_frontend_origins()
+    for candidate in candidates:
+        key = _origin_key(candidate)
+        if key and key in allowed:
+            return allowed[key]
+    return FRONTEND_ORIGIN
+
+
+def _login_start_origin(request: Request) -> str:
+    """Which allowed frontend origin started this social login. The SPA opens the login
+    endpoint with window.open, so the navigation carries the SPA's origin as Referer (the
+    browser default strict-origin-when-cross-origin policy; the live site sets no
+    Referrer-Policy, checked 2026-11-20), which lets today's frontend build work on both
+    hosts with no frontend change. An explicit `?origin=` query parameter wins when it is
+    allowed. Either one only selects among allowed origins."""
+    return _resolve_frontend_origin(
+        request.query_params.get("origin"),
+        request.headers.get("referer"),
+    )
 
 
 def _make_oauth_state(user_id: str) -> str:
@@ -159,11 +224,12 @@ async def _send_verification_email(user) -> None:
 # ---------------------------------------------------------------------------
 # Social-login OAuth state + popup result pages (GitHub, Microsoft, Google)
 # ---------------------------------------------------------------------------
-def _make_login_state(provider: str):
+def _make_login_state(provider: str, origin: Optional[str] = None):
     """Signed, short-lived CSRF state for a social-login round-trip. No user exists yet
     (unlike the Jira link flow), so it just proves the callback came from a flow WE
-    started. Also carries a nonce we bind into the Microsoft id_token. Returns
-    (state_token, nonce)."""
+    started. Also carries a nonce we bind into the Microsoft id_token, and the allowed
+    frontend origin that started the login (signed, so it cannot be swapped in transit).
+    Returns (state_token, nonce)."""
     nonce = secrets.token_urlsafe(16)
     payload = {
         "purpose": "oauth_login",
@@ -171,6 +237,8 @@ def _make_login_state(provider: str):
         "nonce": nonce,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=10),
     }
+    if origin:
+        payload["origin"] = origin
     return jose_jwt.encode(payload, settings.SECRET_KEY_J, algorithm=settings.ALGORITHM), nonce
 
 
@@ -186,11 +254,27 @@ def _read_login_state(state: str, provider: str) -> dict:
     return data
 
 
-def _oauth_success_html_body(provider: str, access_token: str) -> str:
+def _state_return_origin(state: Optional[str], provider: str) -> str:
+    """Return origin for a social-login callback, read only from a state that verifies,
+    then re-checked against the current allow-list. A state that fails verification, or
+    one minted before this change (no origin claim), gives FRONTEND_URL. Never raises, so
+    error pages can use it before the main state check."""
+    if not state:
+        return FRONTEND_ORIGIN
+    try:
+        data = _read_login_state(state, provider)
+    except HTTPException:
+        return FRONTEND_ORIGIN
+    return _resolve_frontend_origin(data.get("origin"))
+
+
+def _oauth_success_html_body(provider: str, access_token: str, origin: Optional[str] = None) -> str:
     """Popup page that hands the access token back to the SPA via postMessage. The
     refresh token is NOT here — it's already set as an httpOnly cookie on this response.
     `provider` drives the message type the frontend hook listens for
-    (e.g. 'google_auth_success', 'github_auth_success')."""
+    (e.g. 'google_auth_success', 'github_auth_success'). `origin` must come from
+    _resolve_frontend_origin (an allowed origin); it defaults to FRONTEND_URL."""
+    target_origin = origin or FRONTEND_ORIGIN
     return f"""
     <html>
     <head><title>Authentication Complete</title></head>
@@ -204,7 +288,7 @@ def _oauth_success_html_body(provider: str, access_token: str) -> str:
                         type: '{provider}_auth_success',
                         access_token: '{access_token}'
                     }},
-                    '{FRONTEND_ORIGIN}'
+                    '{target_origin}'
                 );
                 setTimeout(() => window.close(), 1500);
             }}
@@ -214,9 +298,11 @@ def _oauth_success_html_body(provider: str, access_token: str) -> str:
     """
 
 
-def _oauth_error_html(provider: str, message: str) -> HTMLResponse:
+def _oauth_error_html(provider: str, message: str, origin: Optional[str] = None) -> HTMLResponse:
     """Popup page for a failed social login. postMessages an error so the SPA can show a
-    real message instead of the generic 'cancelled' it infers from a closed popup."""
+    real message instead of the generic 'cancelled' it infers from a closed popup.
+    `origin` must come from _resolve_frontend_origin; it defaults to FRONTEND_URL."""
+    target_origin = origin or FRONTEND_ORIGIN
     safe = (message or "Sign-in failed").replace("'", "").replace("\\", "").replace("<", "")[:200]
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Sign-in failed</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#1b1b20;color:#e8ecf2;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
@@ -225,7 +311,7 @@ def _oauth_error_html(provider: str, message: str) -> HTMLResponse:
 <p style="margin:0;color:#9aa3b2;font-size:14px;line-height:1.5">{safe}</p>
 </div>
 <script>
-if (window.opener) {{ window.opener.postMessage({{ type: '{provider}_auth_error', message: '{safe}' }}, '{FRONTEND_ORIGIN}'); }}
+if (window.opener) {{ window.opener.postMessage({{ type: '{provider}_auth_error', message: '{safe}' }}, '{target_origin}'); }}
 setTimeout(function(){{try{{window.close();}}catch(e){{}}}}, 2500);
 </script>
 </body></html>"""
@@ -233,14 +319,16 @@ setTimeout(function(){{try{{window.close();}}catch(e){{}}}}, 2500);
 
 
 @router.get("/auth/login")
-async def login():
+async def login(request: Request):
     result= flow.authorization_url(prompt="consent")
 
     auth_url = result[0] if isinstance(result, tuple) else result
     state = result[1] if isinstance(result, tuple) else None
 
     if state:
-        auth_states[state] = True
+        # Google's state is random and kept server-side; the value records which allowed
+        # frontend origin started this login, so the callback posts the token back there.
+        auth_states[state] = _login_start_origin(request)
     logger.debug("Generated Google OAuth authorization URL")
     return RedirectResponse(url=auth_url)
 
@@ -266,13 +354,16 @@ async def callback(request: Request, db:Session=Depends(get_db)):
             user_data, provider=response['provider'], db=db,
             ip=await get_client_ip(request), user_agent=request.headers.get("user-agent"),
         )
-        auth_states.pop(state,None)
+        # Re-checked against the allow-list: a value stored before this change is True,
+        # and CORS_ORIGINS may have changed since the login started.
+        stored_origin = auth_states.pop(state, None)
+        return_origin = _resolve_frontend_origin(stored_origin if isinstance(stored_origin, str) else None)
         #add logging here to save it
     except UserCreationError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Something went wrong, it is not you, Please try after sometime")
     
     access_token, raw_refresh = _issue_session(user, db, login_provider="Google")
-    resp = HTMLResponse(content=_oauth_success_html_body("google", access_token))
+    resp = HTMLResponse(content=_oauth_success_html_body("google", access_token, return_origin))
     set_refresh_cookie(resp, raw_refresh)
     return resp
 
@@ -573,10 +664,11 @@ async def jira_callback(request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/auth/github/login")
-async def github_login():
+async def github_login(request: Request):
     """Start 'Sign in with GitHub'. The SPA opens this in a popup; we redirect to
-    GitHub's consent screen with a signed CSRF state."""
-    state, _ = _make_login_state("github")
+    GitHub's consent screen with a signed CSRF state that also carries the allowed
+    frontend origin that started the login."""
+    state, _ = _make_login_state("github", _login_start_origin(request))
     auth_url, _ = await GitHubOAuth().get_authorization_url(state)
     return RedirectResponse(url=auth_url)
 
@@ -589,10 +681,11 @@ async def github_callback(request: Request, db: Session = Depends(get_db)):
     error = request.query_params.get("error")
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+    return_origin = _state_return_origin(state, "github")
     if error:
-        return _oauth_error_html("github", request.query_params.get("error_description") or error)
+        return _oauth_error_html("github", request.query_params.get("error_description") or error, return_origin)
     if not code or not state:
-        return _oauth_error_html("github", "Missing code or state")
+        return _oauth_error_html("github", "Missing code or state", return_origin)
     try:
         _read_login_state(state, "github")
         gh = GitHubOAuth()
@@ -603,21 +696,22 @@ async def github_callback(request: Request, db: Session = Depends(get_db)):
             ip=await get_client_ip(request), user_agent=request.headers.get("user-agent"),
         )
         access_token, raw_refresh = _issue_session(user, db, login_provider="GitHub")
-        resp = HTMLResponse(content=_oauth_success_html_body("github", access_token))
+        resp = HTMLResponse(content=_oauth_success_html_body("github", access_token, return_origin))
         set_refresh_cookie(resp, raw_refresh)
         return resp
     except HTTPException as he:
-        return _oauth_error_html("github", str(he.detail))
+        return _oauth_error_html("github", str(he.detail), return_origin)
     except Exception as e:
         logger.error(f"GitHub callback error: {e}")
-        return _oauth_error_html("github", "Could not complete GitHub sign-in")
+        return _oauth_error_html("github", "Could not complete GitHub sign-in", return_origin)
 
 
 @router.get("/auth/microsoft/login")
-async def microsoft_login():
+async def microsoft_login(request: Request):
     """Start 'Sign in with Microsoft' (Microsoft identity platform / Entra ID). The
-    nonce is bound into the state and later checked against the id_token."""
-    state, nonce = _make_login_state("microsoft")
+    nonce is bound into the state and later checked against the id_token; the state
+    also carries the allowed frontend origin that started the login."""
+    state, nonce = _make_login_state("microsoft", _login_start_origin(request))
     auth_url, _ = await MicrosoftOAuth().get_authorization_url(state, nonce)
     return RedirectResponse(url=auth_url)
 
@@ -629,10 +723,11 @@ async def microsoft_callback(request: Request, db: Session = Depends(get_db)):
     error = request.query_params.get("error")
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+    return_origin = _state_return_origin(state, "microsoft")
     if error:
-        return _oauth_error_html("microsoft", request.query_params.get("error_description") or error)
+        return _oauth_error_html("microsoft", request.query_params.get("error_description") or error, return_origin)
     if not code or not state:
-        return _oauth_error_html("microsoft", "Missing code or state")
+        return _oauth_error_html("microsoft", "Missing code or state", return_origin)
     try:
         state_data = _read_login_state(state, "microsoft")
         ms = MicrosoftOAuth()
@@ -643,14 +738,14 @@ async def microsoft_callback(request: Request, db: Session = Depends(get_db)):
             ip=await get_client_ip(request), user_agent=request.headers.get("user-agent"),
         )
         access_token, raw_refresh = _issue_session(user, db, login_provider="Microsoft")
-        resp = HTMLResponse(content=_oauth_success_html_body("microsoft", access_token))
+        resp = HTMLResponse(content=_oauth_success_html_body("microsoft", access_token, return_origin))
         set_refresh_cookie(resp, raw_refresh)
         return resp
     except HTTPException as he:
-        return _oauth_error_html("microsoft", str(he.detail))
+        return _oauth_error_html("microsoft", str(he.detail), return_origin)
     except Exception as e:
         logger.error(f"Microsoft callback error: {e}")
-        return _oauth_error_html("microsoft", "Could not complete Microsoft sign-in")
+        return _oauth_error_html("microsoft", "Could not complete Microsoft sign-in", return_origin)
 
 
 @router.post("/auth/refresh", status_code=status.HTTP_200_OK)
