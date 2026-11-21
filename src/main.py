@@ -1,4 +1,3 @@
-import os
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -7,7 +6,7 @@ import uvicorn
 from dotenv import load_dotenv
 import models
 from models import engine
-from config import settings
+from config import settings, cors_origins
 from fastapi.middleware.cors import CORSMiddleware
 from routers import authentication, services, third_party_integrations, billing, firm_admin, admin_ops, support
 from utils.logger import setup_logger
@@ -129,23 +128,9 @@ app = FastAPI(lifespan=lifespan)
 # app = FastAPI()
 
 # Origins come from CORS_ORIGINS env var (comma-separated). In staging/prod this
-# is set via SSM to the real frontend URL(s). Falls back to local dev defaults.
-_default_local_origins = [
-    "http://localhost",
-    "http://localhost:8080",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:5173",
-    "http://192.168.2.26:3001",
-    "http://192.168.2.26:3002",
-    "https://staging.grounded-iq.com",
-]
-_env_origins = os.getenv("CORS_ORIGINS", "")
-origins = (
-    [o.strip() for o in _env_origins.split(",") if o.strip()]
-    if _env_origins
-    else _default_local_origins
-)
+# is set via SSM to the real frontend URL(s). Falls back to local dev defaults
+# (config.DEFAULT_LOCAL_CORS_ORIGINS). The OAuth return-origin check reads the same list.
+origins = cors_origins()
 # Middleware order: Starlette wraps last-added on the outside, so request flow is
 # CORS -> Maintenance -> CSRF -> RateLimit -> handler. CORS is outermost so rejected
 # responses (503 maintenance, 429 rate-limit, 403 CSRF) still carry Access-Control-*
