@@ -45,9 +45,11 @@ jobs:
       # so vite/rollup fail with "Cannot find module". The bundled npm (10.8) has
       # the bug; npm 10.9+ fixed it. So: upgrade npm, wipe any partial state, and
       # do a clean install that resolves the correct native binary for the runner.
+      # Pinned to the 10.x line, not @latest: npm 12 requires Node 22+, so @latest
+      # broke this Node 20 job at install (run 44849794782, 2026-11-21).
       - name: Install dependencies
         run: |
-          npm install -g npm@latest
+          npm install -g npm@10
           rm -rf node_modules package-lock.json
           npm install --no-audit --no-fund
 
