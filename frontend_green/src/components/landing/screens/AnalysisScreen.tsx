@@ -47,7 +47,7 @@ export const AnalysisScreen: React.FC = () => {
         <p className="mono" style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', color: 'var(--accent)', margin: '0 0 4px' }}>STEP 3 OF 4</p>
         <h3 style={{ fontFamily: 'var(--font-display)', fontSize: 20, margin: '0 0 4px', letterSpacing: '-.02em' }}>Readiness analysis</h3>
         <p style={{ fontSize: 11.5, color: 'var(--fg-muted)', margin: '0 0 16px' }}>
-          GroundedIQ cross-checks every answer — hunting contradictions, flagging vagueness, scoring readiness.
+          AlignIQ cross-checks every answer — hunting contradictions, flagging vagueness, scoring readiness.
         </p>
 
         {/* Hero ring + stats */}

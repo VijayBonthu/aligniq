@@ -12,7 +12,7 @@ const ChangelogPage: React.FC = () => (
   <LegalPage
     title="What's new"
     path="/changelog"
-    description="What's new in GroundedIQ — a running log of shipped, user-visible product updates and improvements."
+    description="What's new in AlignIQ — a running log of shipped, user-visible product updates and improvements."
     note={note}
   >
     <p className="legal-lead">
@@ -31,7 +31,7 @@ const ChangelogPage: React.FC = () => (
     <ul>
       <li><strong>Version compare.</strong> Diff and rank report versions side by side to see how a scope evolved.</li>
       <li><strong>Deliverable builder.</strong> Assemble client-ready documents from your alignment report.</li>
-      <li><strong>Jira workspace.</strong> Two-way Jira integration — push a scope into tickets and manage them from GroundedIQ.</li>
+      <li><strong>Jira workspace.</strong> Two-way Jira integration — push a scope into tickets and manage them from AlignIQ.</li>
       <li><strong>White-label exports.</strong> Put your own logo and colours on every export on the Plus plan.</li>
       <li><strong>Frontier-model reports.</strong> Sharper analysis on Plus and Pro using our most capable models.</li>
     </ul>

@@ -49,7 +49,7 @@ export const UploadScreen: React.FC = () => {
           Upload your project brief
         </h3>
         <p style={{ fontSize: 12.5, color: 'var(--fg-dim)', margin: '0 0 18px', lineHeight: 1.55 }}>
-          GroundedIQ scans it for ambiguities, risks, and critical unknowns in under 2 minutes.
+          AlignIQ scans it for ambiguities, risks, and critical unknowns in under 2 minutes.
         </p>
 
         {/* Uploaded file chip */}

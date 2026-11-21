@@ -9,7 +9,7 @@
 // descriptions, canonicals, structured data, and the sitemap all derived from here
 // so raw-HTML meta can never drift from what the app sets at runtime.
 
-export const SITE = 'https://grounded-iq.com';
+export const SITE = 'https://aligniq.grounded-iq.com';
 
 // ── Shared JSON-LD entities (referenced across pages by @id) ──
 const organization = {
@@ -35,7 +35,7 @@ const organization = {
 const website = {
   '@type': 'WebSite',
   '@id': `${SITE}/#website`,
-  name: 'GroundedIQ',
+  name: 'AlignIQ',
   url: `${SITE}/`,
   publisher: { '@id': `${SITE}/#organization` },
   inLanguage: 'en-US',
@@ -46,12 +46,12 @@ const website = {
 const softwareApplication = {
   '@type': 'SoftwareApplication',
   '@id': `${SITE}/#software`,
-  name: 'GroundedIQ',
+  name: 'AlignIQ',
   applicationCategory: 'BusinessApplication',
   operatingSystem: 'Web',
   url: `${SITE}/`,
   description:
-    'GroundedIQ reads a project brief like a senior solution architect — surfacing risks, raising clarifying questions, and producing an evidence-grounded alignment report with architecture, timeline and resourcing before kickoff.',
+    'AlignIQ reads a project brief like a senior solution architect — surfacing risks, raising clarifying questions, and producing an evidence-grounded alignment report with architecture, timeline and resourcing before kickoff.',
   publisher: { '@id': `${SITE}/#organization` },
   offers: [
     { '@type': 'Offer', name: 'Free', price: '0', priceCurrency: 'USD' },
@@ -65,7 +65,7 @@ const softwareApplication = {
 export const FAQS = [
   {
     q: 'How is this different from an RFP tool?',
-    a: 'RFP tools capture requirements. GroundedIQ interrogates them — it flags ambiguity, proposes architecture, and produces a doc clients actually sign off on before kickoff.',
+    a: 'RFP tools capture requirements. AlignIQ interrogates them — it flags ambiguity, proposes architecture, and produces a doc clients actually sign off on before kickoff.',
   },
   {
     q: 'Does it replace discovery workshops?',
@@ -112,7 +112,7 @@ const faqPage = {
 
 const pricingProduct = {
   '@type': 'Product',
-  name: 'GroundedIQ',
+  name: 'AlignIQ',
   description:
     'AI scoping that turns a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff.',
   brand: { '@id': `${SITE}/#organization` },
@@ -138,9 +138,9 @@ const base = [organization, website];
 export const ROUTES = [
   {
     path: '/',
-    title: 'GroundedIQ — AI scoping & alignment reports for teams',
+    title: 'AlignIQ — AI scoping & alignment reports for teams',
     description:
-      'Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect.',
+      'Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. AlignIQ reads a brief like your sharpest architect.',
     lastmod: '2026-07-04',
     changefreq: 'weekly',
     priority: 1.0,
@@ -148,9 +148,9 @@ export const ROUTES = [
   },
   {
     path: '/pricing',
-    title: 'Pricing — GroundedIQ',
+    title: 'Pricing — AlignIQ',
     description:
-      'GroundedIQ pricing — start free, then Basic $30/mo or Plus $70/mo with white-label exports. Turn a raw brief into an evidence-grounded scope clients sign before kickoff.',
+      'AlignIQ pricing — start free, then Basic $30/mo or Plus $70/mo with white-label exports. Turn a raw brief into an evidence-grounded scope clients sign before kickoff.',
     lastmod: '2026-07-04',
     changefreq: 'monthly',
     priority: 0.9,
@@ -158,9 +158,9 @@ export const ROUTES = [
   },
   {
     path: '/contact',
-    title: 'Contact — GroundedIQ',
+    title: 'Contact — AlignIQ',
     description:
-      'Contact GroundedIQ about sales, pricing, your account, or a bug. Reach the team via the form or email — a real person replies, usually within one business day.',
+      'Contact AlignIQ about sales, pricing, your account, or a bug. Reach the team via the form or email — a real person replies, usually within one business day.',
     lastmod: '2026-07-04',
     changefreq: 'monthly',
     priority: 0.8,
@@ -168,9 +168,9 @@ export const ROUTES = [
   },
   {
     path: '/about',
-    title: 'About GroundedIQ — why we built it',
+    title: 'About AlignIQ — why we built it',
     description:
-      'Why GroundedIQ exists — closing the gap between what clients ask for and what teams build, by turning a raw brief into an evidence-grounded alignment report before kickoff.',
+      'Why AlignIQ exists — closing the gap between what clients ask for and what teams build, by turning a raw brief into an evidence-grounded alignment report before kickoff.',
     lastmod: '2026-07-04',
     changefreq: 'monthly',
     priority: 0.6,
@@ -178,9 +178,9 @@ export const ROUTES = [
   },
   {
     path: '/security',
-    title: 'Security & data privacy — GroundedIQ',
+    title: 'Security & data privacy — AlignIQ',
     description:
-      'How GroundedIQ protects your data — encryption in transit and at rest, least-privilege access, and a commitment to never use your documents to train AI models.',
+      'How AlignIQ protects your data — encryption in transit and at rest, least-privilege access, and a commitment to never use your documents to train AI models.',
     lastmod: '2026-06-28',
     changefreq: 'monthly',
     priority: 0.6,
@@ -188,9 +188,9 @@ export const ROUTES = [
   },
   {
     path: '/changelog',
-    title: "What's new — GroundedIQ",
+    title: "What's new — AlignIQ",
     description:
-      "What's new in GroundedIQ — a running log of shipped, user-visible product updates and improvements.",
+      "What's new in AlignIQ — a running log of shipped, user-visible product updates and improvements.",
     lastmod: '2026-07-04',
     changefreq: 'weekly',
     priority: 0.5,
@@ -198,9 +198,9 @@ export const ROUTES = [
   },
   {
     path: '/careers',
-    title: 'Careers — GroundedIQ',
+    title: 'Careers — AlignIQ',
     description:
-      'Careers at GroundedIQ — join a small, focused team building the alignment layer between what clients ask for and what gets built.',
+      'Careers at AlignIQ — join a small, focused team building the alignment layer between what clients ask for and what gets built.',
     lastmod: '2026-07-04',
     changefreq: 'monthly',
     priority: 0.4,
@@ -208,9 +208,9 @@ export const ROUTES = [
   },
   {
     path: '/privacy',
-    title: 'Privacy Policy — GroundedIQ',
+    title: 'Privacy Policy — AlignIQ',
     description:
-      'GroundedIQ Privacy Policy — what we collect, why, your rights, and our commitment to never use your documents to train AI models.',
+      'AlignIQ Privacy Policy — what we collect, why, your rights, and our commitment to never use your documents to train AI models.',
     lastmod: '2026-06-09',
     changefreq: 'yearly',
     priority: 0.3,
@@ -218,9 +218,9 @@ export const ROUTES = [
   },
   {
     path: '/terms',
-    title: 'Terms of Service — GroundedIQ',
+    title: 'Terms of Service — AlignIQ',
     description:
-      'GroundedIQ Terms of Service — the terms that govern your access to and use of the GroundedIQ websites, applications, and services.',
+      'AlignIQ Terms of Service — the terms that govern your access to and use of the AlignIQ websites, applications, and services.',
     lastmod: '2026-06-09',
     changefreq: 'yearly',
     priority: 0.3,

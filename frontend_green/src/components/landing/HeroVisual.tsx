@@ -45,7 +45,7 @@ export const HeroVisual: React.FC = () => {
 
       <div className="hv-panel">
         <div className="hv-panel-top">
-          <span className="mono hv-panel-label">GroundedIQ · Readiness</span>
+          <span className="mono hv-panel-label">AlignIQ · Readiness</span>
           <span className="hv-panel-live"><span className="hv-live-dot" />ANALYZING</span>
         </div>
 

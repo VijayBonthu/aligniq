@@ -112,7 +112,7 @@ function OpsTab() {
             <label style={labelStyle}>Message</label>
             <EmojiInsert targetRef={maintMsgRef} value={m.message} onChange={(v) => set({ maintenance: { ...m, message: v } })} />
           </div>
-          <textarea ref={maintMsgRef} className="input" rows={3} value={m.message} placeholder="GroundedIQ is down for brief maintenance…"
+          <textarea ref={maintMsgRef} className="input" rows={3} value={m.message} placeholder="AlignIQ is down for brief maintenance…"
                     onChange={(e) => set({maintenance: { ...m, message: e.target.value } })} />
         </div>
         <div style={fieldWrap}>
@@ -531,8 +531,8 @@ function EmailTemplatesTab() {
       <div style={card}>
         <h3 style={{ margin: '0 0 6px', fontSize: 16 }}>Client email templates</h3>
         <p style={{ color: 'var(--fg-dim)', fontSize: 13, margin: '0 0 14px' }}>
-          Customize the questionnaire emails per organization. Leave a field blank to use the GroundedIQ default.
-          The GroundedIQ brand and the email layout are always applied — you're only editing the copy.
+          Customize the questionnaire emails per organization. Leave a field blank to use the AlignIQ default.
+          The AlignIQ brand and the email layout are always applied — you're only editing the copy.
         </p>
         <input className="input" style={{ width: '100%' }} placeholder="Search organizations…"
                value={search} onChange={(e) => setSearch(e.target.value)} />

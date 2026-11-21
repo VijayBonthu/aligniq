@@ -343,7 +343,7 @@ function Shell({
         </div>
         <div style={{ padding: '20px 28px 28px' }}>{children}</div>
         <div style={footer}>
-          <span>Powered by <strong style={{ color: '#111827' }}>Grounded<span style={{ color: '#34a37b' }}>IQ</span></strong></span>
+          <span>Powered by <strong style={{ color: '#111827' }}>Align<span style={{ color: '#34a37b' }}>IQ</span></strong></span>
           <span style={{ color: '#cbd5e1' }}>·</span>
           <span>Your answers are shared only with the team that sent you this link.</span>
         </div>

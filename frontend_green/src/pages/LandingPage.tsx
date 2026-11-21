@@ -88,7 +88,7 @@ const LandingPage: React.FC = () => {
                 Every estimate, <i>grounded</i> in the brief.
               </h1>
               <p className="hero-sub">
-                GroundedIQ reads a raw brief like your sharpest architect — surfacing the buried risks, raising the questions that move the estimate, and grounding every assumption in evidence. The alignment report your client signs before a line of code is written.
+                AlignIQ reads a raw brief like your sharpest architect — surfacing the buried risks, raising the questions that move the estimate, and grounding every assumption in evidence. The alignment report your client signs before a line of code is written.
               </p>
               <div className="hero-cta">
                 <Link to="/signup" className="btn btn-primary btn-lg">Scope a brief, free →</Link>
@@ -155,7 +155,7 @@ const LandingPage: React.FC = () => {
               {PLANS.map(plan => {
                 const ctaTo =
                   plan.ctaKind === 'contact'
-                    ? `mailto:${PRO_CONTACT_EMAIL}?subject=GroundedIQ Pro Plan`
+                    ? `mailto:${PRO_CONTACT_EMAIL}?subject=AlignIQ Pro Plan`
                     : plan.ctaKind === 'free'
                     ? '/signup'
                     : `/signup?intent=upgrade&tier=${plan.id}`;

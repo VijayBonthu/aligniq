@@ -40,7 +40,7 @@ export class ErrorBoundary extends React.Component<{ children: React.ReactNode }
         >
           <div style={{ maxWidth: 420 }}>
             <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: '-.02em', marginBottom: 20 }}>
-              Grounded<span style={{ color: '#34a37b' }}>IQ</span>
+              Align<span style={{ color: '#34a37b' }}>IQ</span>
             </div>
             <h1 style={{ fontSize: 22, margin: '0 0 12px' }}>Something went wrong.</h1>
             <p style={{ color: '#a39d8e', fontSize: 14, lineHeight: 1.6, margin: '0 0 22px' }}>

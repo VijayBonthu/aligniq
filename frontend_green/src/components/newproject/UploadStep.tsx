@@ -152,7 +152,7 @@ export default function UploadStep({ onComplete, onBeforeUpload }: UploadStepPro
           Add your project brief
         </h1>
         <p style={{ fontSize: 14, color: 'var(--fg-dim)', lineHeight: 1.6, maxWidth: 540, margin: '0 auto' }}>
-          Upload a document — or write it out here. GroundedIQ scans it for ambiguities, risks, and
+          Upload a document — or write it out here. AlignIQ scans it for ambiguities, risks, and
           critical unknowns in under 2 minutes.
         </p>
       </div>

@@ -8,13 +8,13 @@ const note = (
 
 const AboutPage: React.FC = () => (
   <LegalPage
-    title="About GroundedIQ"
+    title="About AlignIQ"
     path="/about"
-    description="Why GroundedIQ exists — closing the gap between what clients ask for and what teams build, by turning a raw brief into an evidence-grounded alignment report before kickoff."
+    description="Why AlignIQ exists — closing the gap between what clients ask for and what teams build, by turning a raw brief into an evidence-grounded alignment report before kickoff."
     note={note}
   >
     <p className="legal-lead">
-      GroundedIQ exists to close the gap between what a client asks for and what actually gets built.
+      AlignIQ exists to close the gap between what a client asks for and what actually gets built.
       That gap is where projects bleed — in change orders, blown timelines, and the slow erosion of
       trust between a consulting team and the people who hired them.
     </p>
@@ -29,7 +29,7 @@ const AboutPage: React.FC = () => (
 
     <h2>What we do about it</h2>
     <p>
-      GroundedIQ reads a raw brief the way a sharp solution architect would — interrogating it instead
+      AlignIQ reads a raw brief the way a sharp solution architect would — interrogating it instead
       of just filing it. It surfaces the ambiguities, raises the questions that move the estimate,
       proposes a first-pass architecture and timeline, and grounds every assumption in evidence from
       the source documents. The result is one alignment report the client and the delivery team can

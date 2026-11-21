@@ -44,6 +44,6 @@ export const AuthAside: React.FC = () => (
 
   {/* Shown only on narrow screens (the editorial aside is hidden there); keeps the
       brand + a route home reachable. See the ≤860px rule in globals.css. */}
-  <Link to="/" className="auth-mobile-brand" aria-label="GroundedIQ home"><Logo /></Link>
+  <Link to="/" className="auth-mobile-brand" aria-label="AlignIQ home"><Logo /></Link>
   </>
 );

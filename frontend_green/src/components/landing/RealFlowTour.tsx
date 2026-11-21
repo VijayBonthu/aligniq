@@ -71,7 +71,7 @@ export const RealFlowTour: React.FC = () => (
             See a brief get <i>grounded</i> — step by step.
           </h2>
           <p className="section-sub" style={{ maxWidth: 640, margin: '14px auto 0' }}>
-            Not a mockup. These are the real GroundedIQ screens — upload, interrogate, score, ship — each one running live.
+            Not a mockup. These are the real AlignIQ screens — upload, interrogate, score, ship — each one running live.
           </p>
         </Reveal>
       </div>
@@ -80,7 +80,7 @@ export const RealFlowTour: React.FC = () => (
     <FlowSection
       stepLabel="STEP 01 · UPLOAD"
       title="Drop in the brief."
-      lede="An RFP, a discovery deck, a Slack thread, a transcript — any fidelity. GroundedIQ runs five passes in under two minutes: extract, detect blind spots, identify P1 blockers, generate kickstart questions."
+      lede="An RFP, a discovery deck, a Slack thread, a transcript — any fidelity. AlignIQ runs five passes in under two minutes: extract, detect blind spots, identify P1 blockers, generate kickstart questions."
       bullets={[
         { h: 'PDF · DOCX · PPTX · TXT · MD · CSV', t: 'attach the brief in whatever shape it arrived in.' },
         { h: 'Five-pass analysis pipeline', t: 'each stage live on the upload screen.' },
@@ -94,7 +94,7 @@ export const RealFlowTour: React.FC = () => (
       reverse
       stepLabel="STEP 02 · QUESTIONS"
       title="Answer the P1 blockers. Defer the rest."
-      lede="GroundedIQ separates the questions that must be answered from the ones that can wait. P1 blockers carry ‘why it matters’ — kickstart questions can be filled with proposed assumptions."
+      lede="AlignIQ separates the questions that must be answered from the ones that can wait. P1 blockers carry ‘why it matters’ — kickstart questions can be filled with proposed assumptions."
       bullets={[
         { h: 'P1 blockers', t: 'critical and must-answer before report generation.' },
         { h: 'Kickstart questions', t: 'leave blank and the analysis step proposes assumptions.' },

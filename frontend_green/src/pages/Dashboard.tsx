@@ -169,7 +169,7 @@ const Sidebar: React.FC<{
             <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <div style={{ width: 28, height: 28, borderRadius: 6, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 800, color: 'var(--accent-ink)', flexShrink: 0 }}>A</div>
-                <span style={{ fontFamily: '"Fraunces", serif', fontWeight: 600, fontSize: 15, color: 'var(--fg)', whiteSpace: 'nowrap' }}>GroundedIQ</span>
+                <span style={{ fontFamily: '"Fraunces", serif', fontWeight: 600, fontSize: 15, color: 'var(--fg)', whiteSpace: 'nowrap' }}>AlignIQ</span>
               </div>
               <button onClick={toggle} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--fg-muted)', padding: 4, borderRadius: 4, lineHeight: 0 }}>
                 <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M15 19l-7-7 7-7" strokeWidth="2" strokeLinecap="round"/></svg>
