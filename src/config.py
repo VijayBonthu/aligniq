@@ -173,7 +173,7 @@ class Settings:
     # unset, utils/email logs the message (including any reset link) at WARNING and
     # does NOT send, so the flow stays testable locally without provisioning email.
     RESEND_API_KEY         = os.getenv("RESEND_API_KEY", "")
-    EMAIL_FROM             = os.getenv("EMAIL_FROM", "GroundedIQ <noreply@grounded-iq.com>")
+    EMAIL_FROM             = os.getenv("EMAIL_FROM", "AlignIQ <noreply@grounded-iq.com>")
     # Inbox that in-app Help & Support requests are emailed to. The notification is
     # sent with reply_to set to the requester, so the team can reply straight from
     # their inbox.

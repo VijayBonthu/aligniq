@@ -80,11 +80,11 @@ def password_reset_email_html(name: str, reset_url: str) -> str:
   <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
     <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
       <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
-        Grounded<span style="color:#34a37b;">IQ</span>
+        Align<span style="color:#34a37b;">IQ</span>
       </div>
       <h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;">Reset your password</h1>
       <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 24px;">
-        Hi {safe_name}, we got a request to reset your GroundedIQ password.
+        Hi {safe_name}, we got a request to reset your AlignIQ password.
         Click below to choose a new one. This link expires in 15 minutes and can
         be used once.
       </p>
@@ -116,11 +116,11 @@ def email_verification_email_html(name: str, verify_url: str) -> str:
   <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
     <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
       <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
-        Grounded<span style="color:#34a37b;">IQ</span>
+        Align<span style="color:#34a37b;">IQ</span>
       </div>
       <h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;">Confirm your email</h1>
       <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 24px;">
-        Hi {safe_name}, welcome to GroundedIQ. Confirm this is your email to
+        Hi {safe_name}, welcome to AlignIQ. Confirm this is your email to
         secure your account. This link expires in 24 hours.
       </p>
       <a href="{safe_url}" target="_blank" rel="noopener noreferrer"
@@ -133,7 +133,7 @@ def email_verification_email_html(name: str, verify_url: str) -> str:
         <a href="{safe_url}" target="_blank" rel="noopener noreferrer" style="color:#5fc69a;word-break:break-all;">{safe_url}</a>
       </p>
       <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
-        Didn't create a GroundedIQ account? You can safely ignore this email.
+        Didn't create a AlignIQ account? You can safely ignore this email.
       </p>
     </div>
   </body>
@@ -147,15 +147,15 @@ def _branded_email_shell(
     *, sender_label: str, preheader: str, heading: str, body_html: str,
     cta_label: str, cta_url: str, accent: str = _GIQ_GREEN, footer_reason: str = "",
 ) -> str:
-    """One professional, deliverability-friendly, GroundedIQ-branded HTML shell for
+    """One professional, deliverability-friendly, AlignIQ-branded HTML shell for
     all transactional client/firm emails. Table-based layout (renders across Outlook/
     Gmail/Apple Mail), a hidden preheader for the inbox preview, a clear single CTA,
-    a plain-text fallback link, and a footer that ALWAYS carries the GroundedIQ mark +
+    a plain-text fallback link, and a footer that ALWAYS carries the AlignIQ mark +
     a 'why you got this' line (legitimacy → fewer spam flags). Content is pre-escaped
     by callers; `body_html` may contain safe markup we generate."""
     safe_cta_url = _html.escape(cta_url, quote=True)
-    sender = _html.escape(sender_label or "GroundedIQ")
-    reason = footer_reason or "You received this because a project team is working with you via GroundedIQ."
+    sender = _html.escape(sender_label or "AlignIQ")
+    reason = footer_reason or "You received this because a project team is working with you via AlignIQ."
     return f"""\
 <!doctype html>
 <html lang="en">
@@ -190,7 +190,7 @@ def _branded_email_shell(
           </td></tr>
           <tr><td style="padding:16px 32px;background:#fbfcfe;border-top:1px solid #f1f5f9;">
             <p style="margin:0;font-size:12px;line-height:1.6;color:#9ca3af;">
-              Sent with <strong style="color:#111827;">Grounded<span style="color:{_GIQ_GREEN};">IQ</span></strong> — scoping intelligence for software teams.<br/>
+              Sent with <strong style="color:#111827;">Align<span style="color:{_GIQ_GREEN};">IQ</span></strong> — scoping intelligence for software teams.<br/>
               {_html.escape(reason)}
             </p>
           </td></tr>
@@ -202,7 +202,7 @@ def _branded_email_shell(
 
 
 # Default copy for the client questionnaire emails. Admins can override the text
-# fields per-firm (firms.email_templates JSON); GroundedIQ branding + the shell are
+# fields per-firm (firms.email_templates JSON); AlignIQ branding + the shell are
 # never overridable. `{firm}` is interpolated with the firm name.
 DEFAULT_QUESTIONNAIRE_FIELDS = {
     "questionnaire_invite": {
@@ -227,7 +227,7 @@ def render_questionnaire_email(
 ) -> tuple[str, str]:
     """Render the client questionnaire invite/reminder → (subject, html). Merges the
     per-firm admin overrides (`fields`) over the defaults; empty/missing overrides fall
-    back. GroundedIQ branding is always present (shell)."""
+    back. AlignIQ branding is always present (shell)."""
     key = "questionnaire_reminder" if is_reminder else "questionnaire_invite"
     base = dict(DEFAULT_QUESTIONNAIRE_FIELDS[key])
     for k, v in (fields or {}).items():
@@ -290,13 +290,13 @@ def client_submission_notice_email_html(project_title: str, review_url: str, res
         f'{who}'
     )
     return _branded_email_shell(
-        sender_label="GroundedIQ",
+        sender_label="AlignIQ",
         preheader=f"Your client submitted answers for {safe_title}.",
         heading="Your client submitted their answers",
         body_html=body,
         cta_label="Review the answers",
         cta_url=review_url,
-        footer_reason="You received this because you're scoping this project in GroundedIQ.",
+        footer_reason="You received this because you're scoping this project in AlignIQ.",
     )
 
 
@@ -337,7 +337,7 @@ def support_request_internal_html(
   <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
     <div style="max-width:560px;margin:0 auto;padding:36px 28px;">
       <div style="font-size:16px;font-weight:700;letter-spacing:-.02em;margin-bottom:8px;">
-        Grounded<span style="color:#34a37b;">IQ</span> · Support
+        Align<span style="color:#34a37b;">IQ</span> · Support
       </div>
       <h1 style="font-size:20px;line-height:1.3;margin:0 0 4px;">New support request</h1>
       <p style="font-size:13px;color:#6e6a5e;margin:0 0 22px;font-family:monospace;">{safe_ref}</p>
@@ -369,7 +369,7 @@ def support_confirmation_html(name: str, ref_code: str, subject: str) -> str:
   <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
     <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
       <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
-        Grounded<span style="color:#34a37b;">IQ</span>
+        Align<span style="color:#34a37b;">IQ</span>
       </div>
       <h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;">We got your request</h1>
       <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 16px;">
@@ -382,7 +382,7 @@ def support_confirmation_html(name: str, ref_code: str, subject: str) -> str:
         mention it if you follow up.
       </p>
       <p style="font-size:13px;line-height:1.6;color:#6e6a5e;margin:24px 0 0;">
-        You're receiving this because you submitted a support request in GroundedIQ.
+        You're receiving this because you submitted a support request in AlignIQ.
       </p>
     </div>
   </body>
@@ -401,7 +401,7 @@ def support_reply_html(name: str, ref_code: str, staff_message: str) -> str:
   <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;">
     <div style="max-width:480px;margin:0 auto;padding:40px 28px;">
       <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-bottom:28px;">
-        Grounded<span style="color:#34a37b;">IQ</span> <span style="color:#6e6a5e;font-weight:400;">· Support</span>
+        Align<span style="color:#34a37b;">IQ</span> <span style="color:#6e6a5e;font-weight:400;">· Support</span>
       </div>
       <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 16px;">Hi {safe_name},</p>
       <div style="font-size:15px;line-height:1.65;color:#ece7dc;margin:0 0 24px;">
