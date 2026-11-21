@@ -125,6 +125,34 @@ def test_google_login_records_origin_and_callback_posts_there(monkeypatch):
     assert "g-state-1" not in auth.auth_states  # still single-use
 
 
+def test_microsoft_round_trip_keeps_nonce_binding_and_returns_to_new_host(monkeypatch):
+    seen = {}
+
+    class FakeMicrosoft:
+        async def get_authorization_url(self, state, nonce):
+            seen["state"], seen["nonce"] = state, nonce
+            return "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", state
+
+        async def get_access_token(self, code):
+            return {"access_token": "ms-token", "id_token": "x"}
+
+        async def get_user_info(self, token_response, expected_nonce=None):
+            seen["expected_nonce"] = expected_nonce
+            return {"id": "1", "email": "ada@acme.com", "verified_email": True}
+
+    monkeypatch.setattr(auth, "MicrosoftOAuth", FakeMicrosoft)
+    run_async(auth.microsoft_login(
+        make_request("/api/v1/auth/microsoft/login", headers={"Referer": NEW + "/login"})))
+    claims = jwt.decode(seen["state"], "unit-test-secret-key", algorithms=["HS256"])
+    assert claims["origin"] == NEW and claims["nonce"] == seen["nonce"]
+
+    resp = run_async(auth.microsoft_callback(
+        make_request("/api/v1/auth/microsoft/callback", f"code=c1&state={seen['state']}"), db=None))
+    html = resp.body.decode()
+    assert "microsoft_auth_success" in html and posted_origin(html) == NEW
+    assert seen["expected_nonce"] == seen["nonce"]  # id_token replay guard unchanged
+
+
 def test_explicit_origin_param_wins_and_old_host_still_works(monkeypatch):
     req = make_request("/api/v1/auth/login", f"origin={NEW}", headers={"Referer": OLD + "/"})
     assert auth._login_start_origin(req) == NEW
