@@ -145,7 +145,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
       >
         <button
           onClick={() => navigate('/projects')}
-          title="GroundedIQ"
+          title="AlignIQ"
           style={{
             width: 30, height: 30, borderRadius: 7,
             background: 'var(--accent)',

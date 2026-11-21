@@ -32,7 +32,7 @@ const MaintenanceScreen: React.FC<{ title: string; message: string; eta: string;
         {title || "We'll be right back"}
       </h1>
       <p style={{ color: 'var(--fg-dim, #a39d8e)', fontSize: 'clamp(14px, 3.6vw, 16px)', lineHeight: 1.65, margin: '0 0 18px', whiteSpace: 'pre-wrap', overflowWrap: 'break-word' }}>
-        {message || 'GroundedIQ is down for brief maintenance. Your data is safe and we’ll be back shortly.'}
+        {message || 'AlignIQ is down for brief maintenance. Your data is safe and we’ll be back shortly.'}
       </p>
       {isHttpUrl(media) && (
         <img

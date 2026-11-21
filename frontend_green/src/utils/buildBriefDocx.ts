@@ -147,7 +147,7 @@ export async function buildBriefDocx(draft: BriefDraft): Promise<File> {
   }
 
   const doc = new d.Document({
-    creator: 'GroundedIQ',
+    creator: 'AlignIQ',
     title,
     sections: [{ properties: {}, children }],
   });

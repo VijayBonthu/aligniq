@@ -10,11 +10,11 @@ const CareersPage: React.FC = () => (
   <LegalPage
     title="Careers"
     path="/careers"
-    description="Careers at GroundedIQ — join a small, focused team building the alignment layer between what clients ask for and what gets built."
+    description="Careers at AlignIQ — join a small, focused team building the alignment layer between what clients ask for and what gets built."
     note={note}
   >
     <p className="legal-lead">
-      We're a small, focused team building GroundedIQ — the alignment layer between what clients ask for
+      We're a small, focused team building AlignIQ — the alignment layer between what clients ask for
       and what gets built.
     </p>
 

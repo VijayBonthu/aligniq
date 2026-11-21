@@ -23,27 +23,27 @@
         }
       })();
     </script>
-    <title>GroundedIQ — AI scoping & alignment reports for teams</title>
+    <title>AlignIQ — AI scoping & alignment reports for teams</title>
 
     <!-- ── SEO: primary meta ──
          title / description / canonical / og:* / twitter:* below are the HOMEPAGE
          defaults. The build-time prerender (scripts/prerender-meta.mjs) rewrites them
          per route from src/seo/routes.mjs; each field is kept on a single line so the
          injection regex stays robust. Do not reformat to multi-line. -->
-    <meta name="description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
-    <link rel="canonical" href="https://grounded-iq.com/" />
+    <meta name="description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. AlignIQ reads a brief like your sharpest architect." />
+    <link rel="canonical" href="https://aligniq.grounded-iq.com/" />
     <meta id="robots-tag" name="robots" content="index, follow" />
     <meta name="theme-color" content="#0d0d11" />
     <meta name="author" content="GroundedIQ" />
 
     <!-- Keep non-production hosts (e.g. staging.grounded-iq.com, www, S3 endpoints)
-         out of search indexes. Production canonical host is grounded-iq.com; any
+         out of search indexes. Production canonical host is aligniq.grounded-iq.com; any
          other host flips robots to noindex. Belt-and-suspenders with the preferred
          Cloudflare `X-Robots-Tag: noindex` rule on the staging zone. -->
     <script>
       (function () {
         try {
-          if (location.hostname !== 'grounded-iq.com') {
+          if (location.hostname !== 'aligniq.grounded-iq.com') {
             var m = document.getElementById('robots-tag');
             if (m) m.setAttribute('content', 'noindex, nofollow');
           }
@@ -53,21 +53,21 @@
 
     <!-- ── Open Graph (LinkedIn / Slack / Facebook) ── -->
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="GroundedIQ" />
-    <meta property="og:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
-    <meta property="og:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
-    <meta property="og:url" content="https://grounded-iq.com/" />
-    <meta property="og:image" content="https://grounded-iq.com/og-image.png" />
+    <meta property="og:site_name" content="AlignIQ" />
+    <meta property="og:title" content="AlignIQ — AI scoping & alignment reports for teams" />
+    <meta property="og:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. AlignIQ reads a brief like your sharpest architect." />
+    <meta property="og:url" content="https://aligniq.grounded-iq.com/" />
+    <meta property="og:image" content="https://aligniq.grounded-iq.com/og-image.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="GroundedIQ — every estimate, grounded in the brief." />
+    <meta property="og:image:alt" content="AlignIQ — every estimate, grounded in the brief." />
     <meta property="og:locale" content="en_US" />
 
     <!-- ── Twitter / X card ── -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="GroundedIQ — AI scoping & alignment reports for teams" />
-    <meta name="twitter:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. GroundedIQ reads a brief like your sharpest architect." />
-    <meta name="twitter:image" content="https://grounded-iq.com/og-image.png" />
+    <meta name="twitter:title" content="AlignIQ — AI scoping & alignment reports for teams" />
+    <meta name="twitter:description" content="Turn a raw brief into an evidence-grounded alignment report — risks, clarifying questions, architecture, timeline and resourcing — before kickoff. AlignIQ reads a brief like your sharpest architect." />
+    <meta name="twitter:image" content="https://aligniq.grounded-iq.com/og-image.png" />
 
     <!-- ── Structured data ──
          Homepage default graph; the prerender replaces this block per route from
@@ -79,10 +79,10 @@
         "@graph": [
           {
             "@type": "Organization",
-            "@id": "https://grounded-iq.com/#organization",
+            "@id": "https://aligniq.grounded-iq.com/#organization",
             "name": "GroundedIQ",
-            "url": "https://grounded-iq.com/",
-            "logo": "https://grounded-iq.com/logo.svg",
+            "url": "https://aligniq.grounded-iq.com/",
+            "logo": "https://aligniq.grounded-iq.com/logo.svg",
             "email": "hello@grounded-iq.com",
             "description": "AI-powered scoping that turns a raw brief into an evidence-grounded alignment report.",
             "sameAs": [
@@ -104,13 +104,13 @@
           },
           {
             "@type": "SoftwareApplication",
-            "@id": "https://grounded-iq.com/#software",
-            "name": "GroundedIQ",
+            "@id": "https://aligniq.grounded-iq.com/#software",
+            "name": "AlignIQ",
             "applicationCategory": "BusinessApplication",
             "operatingSystem": "Web",
-            "url": "https://grounded-iq.com/",
-            "description": "GroundedIQ reads a project brief like a senior solution architect — surfacing risks, raising clarifying questions, and producing an evidence-grounded alignment report with architecture, timeline and resourcing before kickoff.",
-            "publisher": { "@id": "https://grounded-iq.com/#organization" },
+            "url": "https://aligniq.grounded-iq.com/",
+            "description": "AlignIQ reads a project brief like a senior solution architect — surfacing risks, raising clarifying questions, and producing an evidence-grounded alignment report with architecture, timeline and resourcing before kickoff.",
+            "publisher": { "@id": "https://aligniq.grounded-iq.com/#organization" },
             "offers": [
               { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD" },
               { "@type": "Offer", "name": "Basic", "price": "30", "priceCurrency": "USD", "category": "/month" },

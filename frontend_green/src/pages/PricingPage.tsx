@@ -44,7 +44,7 @@ export default function PricingPage() {
   async function handleCta(plan: PlanDescriptor) {
     track('Pricing CTA', { plan: plan.id, kind: plan.ctaKind });
     if (plan.ctaKind === 'contact') {
-      window.location.href = `mailto:${PRO_CONTACT_EMAIL}?subject=GroundedIQ Pro Plan`;
+      window.location.href = `mailto:${PRO_CONTACT_EMAIL}?subject=AlignIQ Pro Plan`;
       return;
     }
     if (plan.ctaKind === 'free') {
@@ -276,7 +276,7 @@ export default function PricingPage() {
 
         {!isAuthenticated && (
           <p style={{ textAlign: 'center', marginTop: 28, fontSize: 14, color: 'var(--fg-dim)' }}>
-            New to GroundedIQ?{' '}
+            New to AlignIQ?{' '}
             <Link to="/signup" style={{ color: 'var(--accent)', fontWeight: 500 }}>
               Create a free account →
             </Link>

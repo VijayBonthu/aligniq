@@ -128,7 +128,7 @@ def _jira_popup_html(ok: bool, message: str) -> HTMLResponse:
     server-side) — it just tells the user the result and tries to auto-close. The SPA
     detects success by polling GET /jira/status."""
     title = "Jira connected" if ok else "Jira sign-in failed"
-    body = "You can close this window and return to GroundedIQ." if ok else message
+    body = "You can close this window and return to AlignIQ." if ok else message
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#1b1b20;color:#e8ecf2;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
 <div style="text-align:center;max-width:360px;padding:24px">
@@ -212,7 +212,7 @@ async def _send_verification_email(user) -> None:
         verify_url = f"{settings.BACKEND_URL.rstrip('/')}/api/v1/auth/verify-email?token={token}"
         await send_email(
             to=user.email_address,
-            subject="Confirm your GroundedIQ email",
+            subject="Confirm your AlignIQ email",
             html=email_verification_email_html(user.first_name or "there", verify_url),
         )
         # Arm the per-user cooldown + hourly count so the next send is throttled.
@@ -463,7 +463,7 @@ async def forgot_password(body: PasswordResetRequest, db: Session = Depends(get_
                 try:
                     await send_email(
                         to=user.email_address,
-                        subject="Reset your GroundedIQ password",
+                        subject="Reset your AlignIQ password",
                         html=password_reset_email_html(user.first_name or "there", reset_url),
                     )
                 except Exception as e:
@@ -524,10 +524,10 @@ def _verify_email_html(ok: bool, message: str) -> HTMLResponse:
     html = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title></head>
 <body style="margin:0;background:#0d0d11;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#ece7dc;display:flex;min-height:100vh;align-items:center;justify-content:center">
 <div style="max-width:440px;padding:40px 28px;text-align:center">
-<div style="font-size:20px;font-weight:700;letter-spacing:-.02em;margin-bottom:24px">Grounded<span style="color:#34a37b">IQ</span></div>
+<div style="font-size:20px;font-weight:700;letter-spacing:-.02em;margin-bottom:24px">Align<span style="color:#34a37b">IQ</span></div>
 <h1 style="font-size:24px;line-height:1.3;margin:0 0 12px;color:{accent}">{title}</h1>
 <p style="font-size:15px;line-height:1.6;color:#a39d8e;margin:0 0 28px">{message}</p>
-<a href="{login_url}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#34a37b;color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 24px;border-radius:10px">Continue to GroundedIQ &rarr;</a>
+<a href="{login_url}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#34a37b;color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 24px;border-radius:10px">Continue to AlignIQ &rarr;</a>
 </div></body></html>"""
     return HTMLResponse(content=html, status_code=status.HTTP_200_OK)
 

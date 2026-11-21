@@ -387,7 +387,7 @@ export async function buildDocxBlob(
   children.push(...walkTokens(docx, tokens, images));
 
   const doc = new docx.Document({
-    creator: 'GroundedIQ',
+    creator: 'AlignIQ',
     title: opts.title || 'Report',
     sections: [{ properties: {}, children }],
   });

@@ -41,7 +41,7 @@ const QUESTIONS: QuestionItem[] = [
 
 const ARCH: ArchItem[] = [
   { area: 'Frontend', choice: 'Next.js 15 + React 19', note: 'Streaming RSC for portal, edge-rendered tracking map.' },
-  { area: 'Backend', choice: 'FastAPI + LangGraph', note: 'Agent pipeline matches GroundedIQ pattern; async carrier fanout.' },
+  { area: 'Backend', choice: 'FastAPI + LangGraph', note: 'Agent pipeline matches AlignIQ pattern; async carrier fanout.' },
   { area: 'DB', choice: 'Postgres + Chroma', note: 'Transactional + vector search for shipment docs.' },
   { area: 'Queue', choice: 'SQS + EventBridge', note: 'Carrier webhook ingestion, retry on 5xx.' },
   { area: 'Mobile', choice: 'React Native (pending)', note: 'Awaiting confirmation on app store requirement.' },

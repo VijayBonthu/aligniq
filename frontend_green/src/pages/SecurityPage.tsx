@@ -14,7 +14,7 @@ const SecurityPage: React.FC = () => (
   <LegalPage
     title="Security & data privacy"
     path="/security"
-    description="How GroundedIQ protects your data — encryption in transit and at rest, least-privilege access, and a commitment to never use your documents to train AI models."
+    description="How AlignIQ protects your data — encryption in transit and at rest, least-privilege access, and a commitment to never use your documents to train AI models."
     updated="June 28, 2026"
     note={note}
   >

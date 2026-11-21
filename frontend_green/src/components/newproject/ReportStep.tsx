@@ -317,7 +317,7 @@ export default function ReportStep({
                 color: 'var(--fg-muted)',
               }}
             >
-              <span>GroundedIQ</span>
+              <span>AlignIQ</span>
               <Dot />
               <span>{today}</span>
               <Dot />

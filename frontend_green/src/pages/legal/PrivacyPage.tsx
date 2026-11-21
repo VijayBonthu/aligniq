@@ -5,7 +5,7 @@ const PrivacyPage: React.FC = () => (
   <LegalPage
     title="Privacy Policy"
     path="/privacy"
-    description="GroundedIQ Privacy Policy — what we collect, why, your rights, and our commitment to never use your documents to train AI models."
+    description="AlignIQ Privacy Policy — what we collect, why, your rights, and our commitment to never use your documents to train AI models."
     updated="June 9, 2026"
   >
     <p className="legal-lead">
@@ -63,7 +63,7 @@ const PrivacyPage: React.FC = () => (
     <h2>5. How we share information</h2>
     <p>
       We do not sell your personal information. We share it only with service providers
-      ("subprocessors") that help us run GroundedIQ, under contracts that limit their use of it:
+      ("subprocessors") that help us run AlignIQ, under contracts that limit their use of it:
     </p>
     <ul>
       <li><strong>OpenAI</strong> — AI model inference;</li>
@@ -112,7 +112,7 @@ const PrivacyPage: React.FC = () => (
 
     <h2>10. Children</h2>
     <p>
-      GroundedIQ is not intended for individuals under 18, and we do not knowingly collect personal
+      AlignIQ is not intended for individuals under 18, and we do not knowingly collect personal
       information from children.
     </p>
 

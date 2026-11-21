@@ -5,11 +5,11 @@ const TermsPage: React.FC = () => (
   <LegalPage
     title="Terms of Service"
     path="/terms"
-    description="GroundedIQ Terms of Service — the terms that govern your access to and use of the GroundedIQ websites, applications, and services."
+    description="AlignIQ Terms of Service — the terms that govern your access to and use of the AlignIQ websites, applications, and services."
     updated="June 9, 2026"
   >
     <p className="legal-lead">
-      These Terms of Service ("Terms") govern your access to and use of GroundedIQ — the
+      These Terms of Service ("Terms") govern your access to and use of AlignIQ — the
       websites, applications, and services operated by <strong>GroundedIQ, Inc.</strong> ("GroundedIQ",
       "we", "us"). By creating an account or using the service, you agree to these Terms. If you do
       not agree, do not use the service.
@@ -17,7 +17,7 @@ const TermsPage: React.FC = () => (
 
     <h2>1. The service</h2>
     <p>
-      GroundedIQ is an AI-assisted scoping tool. You provide a project brief or documents, and the
+      AlignIQ is an AI-assisted scoping tool. You provide a project brief or documents, and the
       service produces analysis such as risks, clarifying questions, a first-pass architecture,
       timelines, and resourcing. Outputs are generated with the assistance of large language models
       and are intended as a <strong>starting point for your professional judgment</strong> — not as
@@ -86,7 +86,7 @@ const TermsPage: React.FC = () => (
 
     <h2>9. Intellectual property</h2>
     <p>
-      The GroundedIQ platform, including its software, design, and trademarks, is owned by GroundedIQ
+      The AlignIQ platform, including its software, design, and trademarks, is owned by GroundedIQ
       and protected by law. These Terms do not grant you any right in our intellectual property other
       than the limited right to use the service.
     </p>

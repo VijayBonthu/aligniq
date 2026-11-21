@@ -4,7 +4,7 @@ export const Logo: React.FC<{ size?: number; wordmark?: boolean }> = ({ size = 2
   return (
     <span className="logo">
       <span style={{ width: size, height: size, display: 'inline-block', position: 'relative' }}>
-        {/* GroundedIQ surveyor's mark — calibrated horizon + plumb stem + intelligence dot */}
+        {/* AlignIQ surveyor's mark — calibrated horizon + plumb stem + intelligence dot */}
         <svg viewBox="0 0 32 32" width={size} height={size} fill="none" aria-hidden>
           <line x1="4" y1="19" x2="4" y2="25" stroke="currentColor" strokeWidth="1" opacity="0.4" />
           <line x1="28" y1="19" x2="28" y2="25" stroke="currentColor" strokeWidth="1" opacity="0.4" />
@@ -15,7 +15,7 @@ export const Logo: React.FC<{ size?: number; wordmark?: boolean }> = ({ size = 2
       </span>
       {wordmark && (
         <span>
-          Grounded<i>IQ</i>
+          Align<i>IQ</i>
         </span>
       )}
     </span>

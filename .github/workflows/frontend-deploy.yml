@@ -81,7 +81,8 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # FRONTEND_BUCKET is an environment variable (staging.grounded-iq.com /
-      # grounded-iq.com). Hashed JS/CSS/image assets get a 1-year immutable cache.
+      # aligniq.grounded-iq.com since 2026-11-20; the grounded-iq.com bucket is no longer
+      # deployed to). Hashed JS/CSS/image assets get a 1-year immutable cache.
       # HTML + sitemap/robots are handled in the next step (they must not be immutable
       # and the per-route HTML needs extensionless keys). --delete prunes stale assets;
       # it also prunes the extensionless route keys (they're not in dist/), which the
