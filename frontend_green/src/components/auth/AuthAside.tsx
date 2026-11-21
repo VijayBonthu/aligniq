@@ -18,7 +18,7 @@ export const AuthAside: React.FC = () => (
 
       <div className="auth-preview">
         <div className="auth-preview-head">
-          <span>groundedIQ / sample scope</span>
+          <span>alignIQ / sample scope</span>
           <span>0.24s</span>
         </div>
         <div className="auth-preview-row">
